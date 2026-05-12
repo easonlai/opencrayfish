@@ -1,0 +1,11 @@
+# OpenCrayFish runtime dependencies (Python 3.11+)
+PyYAML>=6.0.1
+psutil>=5.9.8
+httpx>=0.27.0
+python-telegram-bot>=21.0
+streamlit>=1.32.0
+# NPU access is via the hailo-ollama REST service (port 8000) — pure HTTP, no
+# native bindings required on the application side. hailo-ollama itself must
+# be installed/running on the Raspberry Pi 5 with the Raspberry Pi AI HAT+ 2
+# (Hailo-10H NPU). Earlier Hailo-8 / Hailo-8L based HATs are vision-only and
+# cannot run the qwen2.5-instruct:1.5b LLM workload OpenCrayFish targets.

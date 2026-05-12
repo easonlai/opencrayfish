@@ -1,0 +1,197 @@
+system:
+  # Agent name (single source of truth). Injected at runtime by SoulHandler
+  # into the IDENTITY block of soul.md — soul.md no longer carries a
+  # `- **Designation**:` line of its own. Every prompt, dashboard, log,
+  # and chat header uses the value set here.
+  individual_designation: "Dave Minion"
+  timezone: "Asia/Hong_Kong"
+  duty_start: "06:00"
+  sleep_start: "02:00"
+  # Display name of the human Architect for THIS deployment. The agent will
+  # address you by this name in every reply. (The project Creator — Eason Lai
+  # — is immutable in soul.md and is a separate concept.)
+  architect_name: "Eason"
+  # How the agent verbally addresses you. Combined with `architect_name` to
+  # form salutations like "Boss Eason". The agent will NEVER call you
+  # "Architect" in user-facing replies — that term is reserved for internal
+  # framework concepts. Set to "" to use just the name (e.g. "Eason,").
+  architect_honorific: "Boss"
+  # Heartbeat tuning — see HEARTBEAT_LOGIC.md §1.
+  pulse_interval_seconds: 30
+  idle_proactive_minutes: 5
+  # Deferred STM journal write: turns sit in a RAM pending buffer during
+  # active conversation, then drain to disk after this many seconds of idle.
+  # Avoids per-turn SD-card thrashing on the Pi5. Pending data is also auto-
+  # flushed on sleep metabolism / shutdown so the normal lifecycle never
+  # loses data; only sudden power loss mid-conversation can cost the
+  # un-flushed turns. Set to 0 to flush every pulse.
+  # The RAM deque itself is never released during idle — STM stays warm
+  # across pauses and is only purged once nightly by Sleep Metabolism.
+  idle_journal_flush_seconds: 30
+  # When true, every disk flush also calls os.fsync() — strict durability
+  # at the cost of an SD-card sync. Default false: the OS write-back is
+  # usually fast enough on Linux. Shutdown flush always uses fsync regardless.
+  journal_fsync_on_flush: false
+
+hardware:
+  # Set to true ONLY on the Raspberry Pi 5 with hailo-ollama running on port 8000.
+  # On a dev box without the NPU service, leave this false — the agent will use
+  # the CPU fallback (stock Ollama) directly without per-pulse failover noise.
+  npu_acceleration: false
+  # Primary inference path: hailo-ollama REST service on the Pi 5 + Raspberry Pi
+  # AI HAT+ 2 (Hailo-10H NPU, 40 TOPS, 8 GB on-board RAM — the gen-AI-capable HAT).
+  # Same /api/chat contract as upstream Ollama, but model is served from the NPU.
+  hailo_ollama_url: "http://localhost:8000"
+  hailo_model: "qwen2.5-instruct:1.5b"
+  # CPU fallback: stock Ollama daemon.
+  cpu_fallback_url: "http://localhost:11434"
+  cpu_fallback_model: "qwen2:1.5b"
+  thermal_limit_celsius: 75.0
+  # ---- v2 vitals tuning -------------------------------------------------
+  # RAM stress ENTER threshold (percent). Crossing this OR thermal_limit
+  # flips the agent into "exhausted" mode (terse replies, cognitive loop
+  # bypassed). Default 85% leaves headroom for the SLM working set on Pi 5.
+  ram_limit_pct: 85.0
+  # Hysteresis: once stress fires, BOTH temp AND ram must drop below their
+  # respective release thresholds before stress clears. Prevents persona
+  # flap when readings hover at the limit. Set to 0.0 to auto-derive
+  # (limit - 5°C / -5%) — recommended for first-time operators.
+  thermal_release_celsius: 0.0
+  ram_release_pct: 0.0
+  # Brain re-uses the heartbeat's vitals reading if it's fresher than this
+  # many seconds. Saves the 100 ms `psutil.cpu_percent` block on every user
+  # turn. Set to 0 to always sample fresh (debug only).
+  vitals_cache_ttl_seconds: 5.0
+
+api_keys:
+  # Bot token from @BotFather. Format: "<digits>:<35-char-secret>".
+  # NEVER commit the real value — config.yaml is gitignored; copy this
+  # file to config.yaml locally and fill in your own credentials.
+  telegram_token: "REPLACE_WITH_YOUR_TELEGRAM_BOT_TOKEN"
+  # Telegram numeric user id of the human operator (the Architect at the Soul layer).
+  # Get it from @userinfobot.
+  telegram_user_id: "REPLACE_WITH_YOUR_TELEGRAM_USER_ID"
+
+tools:
+  searxng_url: "http://localhost:8080"
+  # When true, the brain runs a 1-shot SLM triage on each user message and
+  # auto-searches when it isn't confident it knows the answer. Adds latency
+  # but eliminates hallucinated answers about unknown entities.
+  web_search_triage_enabled: true
+  # LTM short-circuit: when archive.md already contains a strong match for
+  # the user's query, skip BOTH the SLM triage call AND the SearXNG round-
+  # trip — answer from memory instead. Saves latency, bandwidth, and tokens.
+  # Trade-off: stale archive entries may be preferred over fresh web data
+  # for time-sensitive questions. Explicit user search requests ("search
+  # for ...", "搜尋 ...") always bypass this short-circuit.
+  ltm_short_circuit_enabled: true
+  # Minimum keyword-overlap score (number of >3-char query terms appearing
+  # in the top archive line) required before the short-circuit fires.
+  # 1 = trigger-happy, 2 = balanced default, 3+ = only on very strong hits.
+  ltm_short_circuit_min_score: 2
+
+memory:
+  stm_max_turns: 12
+  archive_path: "./memory/archive.md"
+  log_path: "./logs/daily"
+
+reflection:
+  # After every interaction (user or proactive), the agent self-critiques its
+  # own reply with a short SLM call and writes a structured entry to
+  # state/reflection.jsonl. During Sleep Metabolism, recurring interests are
+  # promoted to LEARNED_PREFERENCES — closing the self-learning loop.
+  enabled: true
+  reflect_on_user_turn: true
+  reflect_on_proactive: true
+
+proactive:
+  # Idle-time research source selection. The agent picks topics in this order:
+  #   1. STM-gap extraction — concepts mentioned in recent conversation that
+  #      the SLM admits it doesn't already know (and aren't already in LTM).
+  #   2. LEARNED_PREFERENCES fallback — the operator's stored interests.
+  #   3. Skip — if both sources are empty, the cycle stays silent.
+  # This makes idle research about closing real knowledge gaps from your
+  # actual conversations, not relearning what the SLM already knows.
+  stm_gap_extraction_enabled: true
+  # Max candidate concepts to extract per cycle. Each candidate costs one
+  # extra SLM triage call. Keep small on Pi5.
+  max_candidates_per_cycle: 3
+  # When STM yields no genuine gap, fall back to LEARNED_PREFERENCES.
+  # Set false to keep the agent silent on quiet days.
+  fallback_to_preferences: true
+  # Single token the triage SLM must emit to mark a topic as KNOWN.
+  triage_known_token: "YES"
+
+cognition:
+  # Cognitive Loop: THINK → PLAN → ACT → REFINE deliberation in front of
+  # the final synthesize call. The agent decomposes the user's message into
+  # atomic sub-questions, picks ONE verb (RECALL / SEARCH / ANSWER) per
+  # sub-question, executes them concurrently, then optionally does ONE
+  # bounded refine round if a concrete gap remains.
+  #
+  # Bypassed automatically for: chitchat, explicit search keywords, stressed
+  # vitals, and LTM short-circuit (high-confidence archive match). Set
+  # `enabled: false` to fall back to the legacy single-shot triage path.
+  enabled: true
+  # Maximum sub-questions THINK is allowed to emit. More = more thorough,
+  # more = more ACT calls. 3 is the Pi 5 sweet spot.
+  max_subquestions: 3
+  # Total ACT rounds permitted (1 = no refine; 2 = one refine round
+  # allowed after the first ACT). Capped to 3 in code regardless.
+  max_act_rounds: 2
+  # When false, REFINE is skipped even if max_act_rounds >= 2. Use this for
+  # initial rollout: prove THINK + PLAN + ACT are stable on your hardware,
+  # then flip to true to enable refinement.
+  refine_enabled: true
+
+web_chat:
+  # Local browser chat channel — a tiny aiohttp server runs in-process
+  # next to the Telegram connector and exposes /chat (POST) + /state (GET)
+  # + /history (GET). The Streamlit app `ui/web_chat.py` is its frontend.
+  # Use it for fast manual testing of the SAME live agent without needing
+  # Telegram round-trips.
+  enabled: true
+  # IMPORTANT: 127.0.0.1 ONLY by default. Loopback bind keeps it off the
+  # LAN entirely. If you change to 0.0.0.0, also set `auth_token` below.
+  host: "127.0.0.1"
+  port: 8765
+  # Optional shared secret. Empty = no auth (safe only on loopback bind).
+  # When set, Streamlit must send `X-OCF-Token: <token>` per request.
+  auth_token: ""
+  # When true, Sleep Metabolism (02-06) gates non-emergency web messages
+  # the same way it gates Telegram. Web emergencies use a `/emergency`
+  # message prefix, identical to the Telegram convention.
+  respect_sleep_metabolism: true
+
+tasks:
+  # Recurring research-task scheduler. Operator creates tasks via plain
+  # chat (e.g. "check the Microsoft stock price and news every hour and
+  # give me an insight summary report"). The agent confirms with a task
+  # id, then fires the task on its own cadence — running SearXNG on the
+  # generated queries, analyzing the results with the SLM, and pushing
+  # the report back through whichever connector created it (telegram or
+  # web-chat).
+  #
+  # Tasks PAUSE during Sleep Metabolism (02:00-06:00). On wakeup, any
+  # task whose next_run slid past in the night fires ONCE as a catch-up,
+  # then resumes its normal cadence.
+  #
+  # Operational commands (both connectors):
+  #   /tasks                — list active tasks with id, topic, cadence
+  #   /cancel <id>          — remove a task
+  #   /pause <id>           — pause without removing
+  #   /resume <id>          — resume a paused task
+  enabled: true
+  state_path: "state/tasks.yaml"
+  # Hard cap on concurrently active tasks. Plenty of headroom — the cost
+  # is sequential-fire SLM time per fire, not registry size.
+  max_active_tasks: 16
+  # SearXNG results per query (per fire). 5 keeps the brief small enough
+  # for the SLM to digest in one synthesis call without truncation.
+  results_per_query: 5
+  # Floor on interval. Below 5 minutes the agent + SearXNG would be under
+  # constant load with no real signal change. Lower for testing only.
+  min_interval_seconds: 300
+  # How often the scheduler wakes to check for due tasks. Aligned with
+  # heartbeat for cache friendliness; lower = more responsive add_task.
+  tick_seconds: 30
