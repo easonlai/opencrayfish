@@ -1,0 +1,76 @@
+name: Feature Request
+description: Propose a new feature, subsystem, or capability
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a feature.
+
+        For larger features (anything touching `Brain._cycle()`, the Cognitive Loop, the Heartbeat, or adding a new runtime dependency) please **open a [Discussion](https://github.com/easonlai/opencrayfish/discussions) first** to scope the design before writing code.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What user-visible problem does this solve?
+      description: Describe the operator pain or capability gap, not the proposed solution.
+      placeholder: When my agent reads a temperature sensor, there's no way to surface it as a vital sign — so the SLM can't reason about ambient temperature affecting its mood.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you build it? File paths, new config keys, new dataclasses, etc.
+      placeholder: |
+        - Add `ambient_temp_c: float | None = None` to `VitalSigns`
+        - Add `BME680Reader` to `core/sensors/bme680.py` behind `pip install bme680` (optional dep)
+        - Wire it into `Monitor.sample()` when `hardware.bme680_enabled: true`
+        - Add a MoodTuning entry: `ambient_uncomfortable: anger +0.05, calm -0.05`
+        - Render `"Ambient temperature is X°C"` in `vitals.describe()`
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What else did you think of? Why is this better?
+      placeholder: I considered exposing it as a Tool plugin, but a vital sign is the right abstraction because the SLM should reason about it implicitly, not call it on demand.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope check
+      description: Be honest about the answers — this saves both of us time.
+      value: |
+        - **Does it require a new runtime dependency?** (yes / no — if yes, name + size)
+        - **Does it add an SLM call to the user-visible hot path?** (yes / no — if yes, justify)
+        - **Does it touch `soul.md` IMMUTABLE_CORE handling?** (yes / no)
+        - **Does it require any outbound third-party network call?** (yes / no — yes is almost always a rejection)
+        - **Estimated impact on Pi 5 latency budget:** (none / +X ms per turn / +X ms per pulse)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contributing
+    attributes:
+      label: Are you willing to implement this?
+      options:
+        - "Yes — I'll open a PR"
+        - "Yes — but I'd like guidance / pairing first"
+        - "No — proposing for someone else to pick up"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have read [CONTRIBUTING.md § Project Conventions](https://github.com/easonlai/opencrayfish/blob/main/CONTRIBUTING.md#project-conventions-read-before-coding) and this proposal does not violate them (or I've explained why an exception is warranted).
+          required: true
+        - label: I agree to follow the project's [Code of Conduct](https://github.com/easonlai/opencrayfish/blob/main/CODE_OF_CONDUCT.md).
+          required: true

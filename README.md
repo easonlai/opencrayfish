@@ -2,6 +2,12 @@
 
 > **An edge-native, biologically-inspired AI companion that lives on a single Raspberry Pi 5 — fully offline, powered by a 1.5B-parameter local SLM, with a heart that beats, a brain that sleeps, and a soul you can read.**
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Code of Conduct](https://img.shields.io/badge/code%20of%20conduct-Contributor%20Covenant%202.1-blueviolet.svg)](CODE_OF_CONDUCT.md)
+[![Platform: Raspberry Pi 5](https://img.shields.io/badge/platform-Raspberry%20Pi%205%20%2B%20AI%20HAT%2B%202-c51a4a.svg)](https://www.raspberrypi.com/news/introducing-the-raspberry-pi-ai-hat-plus-2-generative-ai-on-raspberry-pi-5/)
+
 ---
 
 ## Table of Contents
@@ -37,6 +43,7 @@
 - [Operational Commands](#operational-commands)
 - [Development Notes](#development-notes)
 - [Roadmap](#roadmap)
+- [Community & Contributing](#community--contributing)
 - [License & Attribution](#license--attribution)
 
 ---
@@ -269,8 +276,8 @@ OpenCrayFish/
 
 ```bash
 # 1. Clone & venv
-git clone https://github.com/<your-fork>/OpenCrayFish
-cd OpenCrayFish
+git clone https://github.com/easonlai/opencrayfish
+cd opencrayfish
 python3.13 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -1219,13 +1226,59 @@ The current codebase is a **complete v1**: every subsystem in this README is imp
 
 ---
 
+## Community & Contributing
+
+OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passionate developer, architect, hardware hacker, and AI tinkerer is welcome to co-develop. The crayfish is small, but the pond is deep — there is plenty of room.
+
+### Where to start
+
+| If you want to… | Go here |
+|---|---|
+| **Ask a question or share a deployment** | [GitHub Discussions](https://github.com/easonlai/opencrayfish/discussions) |
+| **Report a bug** | [Bug Report template](https://github.com/easonlai/opencrayfish/issues/new?template=bug_report.yml) |
+| **Propose a feature** | [Feature Request template](https://github.com/easonlai/opencrayfish/issues/new?template=feature_request.yml) (open a Discussion first for larger ideas) |
+| **Submit code** | Read [CONTRIBUTING.md](CONTRIBUTING.md), then open a PR using the [PR template](.github/PULL_REQUEST_TEMPLATE.md) |
+| **Report a security vulnerability** | [Private security advisory](https://github.com/easonlai/opencrayfish/security/advisories/new) — see [SECURITY.md](SECURITY.md). **Do NOT open a public Issue.** |
+
+### Good first contributions
+
+Look for the [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue) label. Concrete areas where help is especially appreciated:
+
+- **Pytest suite** — the project currently has only smoke checks. Adding real tests for `Emotions`, `PositiveFilter`, `CognitiveLoop` parsing, and the task pre-filter chain would be high-impact.
+- **Hardware port reports** — try OpenCrayFish on a Pi 4, an Orange Pi, a Jetson Nano, or an x86 mini-PC and file an Issue tagged `hardware-port` with your `state/vitals.json` and notable latency numbers.
+- **New `Tool` plugins** — implement the `Tool` protocol from [tools/base.py](tools/base.py) for local file ops, GPIO control, sensor reads, MCP servers, etc.
+- **New `Connector`s** — Discord, Slack, Matrix, IRC, MCP server. Use [connectors/web_chat.py](connectors/web_chat.py) as a template.
+- **Persona / soul.md presets** — share interesting personalities (with the secrets stripped) so others can fork them.
+- **Translations of the EmpathyEngine lexicon** — currently English + Chinese; Japanese, Korean, Spanish, French, German, Hindi, Arabic all welcome.
+- **Documentation** — worked examples, deployment guides (systemd unit, Docker compose for the local stack), screen recordings of the dashboard.
+
+### Project conventions (the short version)
+
+Before opening a PR, please read [CONTRIBUTING.md § Project Conventions](CONTRIBUTING.md#project-conventions-read-before-coding). The non-negotiable rules:
+
+1. **Pylance-clean, type-annotated everywhere.**
+2. **Frozen dataclasses for cross-subsystem snapshots.**
+3. **Atomic writes (`tmp + os.replace`) for every state file the dashboard reads.**
+4. **Asyncio-only, fine-grained locks. No threads. No `multiprocessing`.**
+5. **Failures degrade — they do not raise into the heartbeat loop.**
+6. **Pi 5 latency budget is real — 2–4 s wall-clock per engaged user turn on NPU.**
+7. **Edge / Lite / Offline by mandate — no outbound third-party network calls, no "just call OpenAI".**
+8. **Don't modify `soul.md` IMMUTABLE_CORE programmatically.**
+9. **Don't commit secrets** — `config.yaml` is gitignored; use [config_sample.yaml](config_sample.yaml) as the template.
+
+### Code of Conduct
+
+This project follows the [Contributor Covenant 2.1](CODE_OF_CONDUCT.md). Be excellent to each other. Hostility, harassment, and condescension will get you removed.
+
+---
+
 ## License & Attribution
 
-- **Author**: Eason Lai (Hong Kong) — author of the OpenCrayFish project (immutable across deployments).
+- **License**: [MIT](LICENSE) — use, fork, modify, redistribute freely; just keep the copyright notice.
+- **Author**: Eason Lai (Hong Kong) — original author of the OpenCrayFish project.
 - **Codename**: OpenCrayFish (小龍蝦)
 - **Inspirations**: biological neural systems, the Minions, every edge-AI hacker who refused to wait for the cloud.
-
-Released under the MIT License. See `LICENSE` for full text.
+- **Contributors**: see the [contributors graph](https://github.com/easonlai/opencrayfish/graphs/contributors). Every PR, bug report, and Discussion makes the crayfish stronger.
 
 > *OpenCrayFish lives where the cloud can't go.*
 

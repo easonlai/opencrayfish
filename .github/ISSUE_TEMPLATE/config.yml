@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & Discussion
+    url: https://github.com/easonlai/opencrayfish/discussions
+    about: Ask a question, share a deployment, or propose a design before opening an Issue.
+  - name: 🔒 Security Vulnerability
+    url: https://github.com/easonlai/opencrayfish/security/advisories/new
+    about: Report a security issue privately. DO NOT open a public Issue.

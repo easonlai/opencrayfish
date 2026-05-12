@@ -1,0 +1,118 @@
+name: Bug Report
+description: Report a reproducible bug in OpenCrayFish
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Before submitting**, please:
+        - Search [existing issues](https://github.com/easonlai/opencrayfish/issues?q=is%3Aissue) — your bug may already be tracked.
+        - **Do NOT include** your `config.yaml`, Telegram token, or any contents of `state/stm_journal.jsonl` (that is your conversation history).
+        - For security vulnerabilities, **stop here** and use the [private security advisory flow](https://github.com/easonlai/opencrayfish/security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+      placeholder: When I run `python main.py`, the heartbeat task dies after ~30 seconds with…
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      placeholder: Heartbeat should pulse forever; if a vital sign read fails it should log WARN and continue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic steps. The shorter the repro, the faster the fix.
+      placeholder: |
+        1. `cp config_sample.yaml config.yaml` (no edits)
+        2. `python main.py`
+        3. Wait ~60 seconds
+        4. Observe traceback in stdout
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Paste the last ~50 lines of `state/logs/agent.log` and (if cognition-related) the last ~10 entries of `state/deliberation.jsonl`.
+        **Redact any secrets** (Telegram tokens, user IDs, personal conversation content).
+      render: text
+
+  - type: textarea
+    id: vitals
+    attributes:
+      label: state/vitals.json snapshot (if relevant)
+      description: Paste the contents of `state/vitals.json` at time of failure if the bug is related to heartbeat / vitals / mood.
+      render: json
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.13.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - Raspberry Pi 5 + AI HAT+ 2 (Hailo-10H)
+        - Raspberry Pi 5 (no NPU)
+        - Raspberry Pi 4
+        - macOS dev box
+        - Linux dev box (x86_64)
+        - Linux dev box (ARM64)
+        - Other (describe in "What happened?")
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Active SLM backend at time of failure
+      options:
+        - hailo-ollama (NPU primary)
+        - ollama (CPU primary)
+        - ollama (CPU fallback after NPU failure)
+        - offline (both backends down)
+        - unknown
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit SHA or tag
+      description: Output of `git rev-parse --short HEAD`
+      placeholder: "abc1234"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have searched existing issues and confirmed this is not a duplicate.
+          required: true
+        - label: I have NOT included secrets, tokens, or personal conversation history in this report.
+          required: true
+        - label: I agree to follow the project's [Code of Conduct](https://github.com/easonlai/opencrayfish/blob/main/CODE_OF_CONDUCT.md).
+          required: true
