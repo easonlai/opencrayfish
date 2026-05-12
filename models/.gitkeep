@@ -1,0 +1,6 @@
+# Reserved directory.
+#
+# OpenCrayFish currently reaches the Hailo-10H NPU through the `hailo-ollama`
+# REST service (port 8000) — no local model files are required by the agent.
+# This directory is kept as a placeholder in case a future native-HEF runtime
+# is added (which would load .hef binaries here directly via hailort).

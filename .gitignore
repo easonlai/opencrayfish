@@ -1,0 +1,54 @@
+# --- Secrets / local config ------------------------------------------------
+# Real config holds Telegram bot token + Architect user id. Use
+# config_sample.yaml as the committed template; copy to config.yaml locally.
+config.yaml
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# --- Runtime state / logs --------------------------------------------------
+# Live agent state, daily logs, reflection journal, task registry, STM
+# pending buffer, etc. — all generated at runtime, never committed.
+logs/
+state/
+memory/archive.md
+memory/*.jsonl
+
+# --- Editor / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Models (optional native HEF binaries) ---------------------------------
+# Reserved directory; ignore any actual model artifacts placed here.
+models/*.hef
+models/*.bin
+models/*.gguf
