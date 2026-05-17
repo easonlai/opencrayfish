@@ -13,9 +13,11 @@
 ## Table of Contents
 
 - [What OpenCrayFish Is](#what-opencrayfish-is)
+- [60-Second Mental Model (Restaurant Analogy)](#60-second-mental-model-restaurant-analogy)
 - [Why This Project Exists](#why-this-project-exists)
 - [Design Pillars](#design-pillars)
 - [System Architecture at a Glance](#system-architecture-at-a-glance)
+- [A Day in the Life of a Message](#a-day-in-the-life-of-a-message)
 - [Hardware & Software Stack](#hardware--software-stack)
 - [Repository Layout](#repository-layout)
 - [Quick Start](#quick-start)
@@ -31,12 +33,14 @@
   - [9. Proactiveness — Idle Time as Growth Time](#9-proactiveness--idle-time-as-growth-time)
   - [10. Self-Reflection — The Self-Learning Loop](#10-self-reflection--the-self-learning-loop)
   - [11. Recurring Tasks — The Background Worker](#11-recurring-tasks--the-background-worker)
-  - [12. Tools — SearXNG and the Tool Registry](#12-tools--searxng-and-the-tool-registry)
+  - [12. Skills & Tools — The Two-Tier Capability Stack](#12-skills--tools--the-two-tier-capability-stack)
+    - [Hello-World Skill — Step by Step](#hello-world-skill--step-by-step)
   - [13. Connectors — Telegram & Web Chat](#13-connectors--telegram--web-chat)
   - [14. Observability — Dashboard & State Files](#14-observability--dashboard--state-files)
 - [Cross-Cutting Concerns](#cross-cutting-concerns)
   - [Concurrency Model](#concurrency-model)
   - [Atomic Writes Everywhere](#atomic-writes-everywhere)
+  - [JSONL Rotation & Retention](#jsonl-rotation--retention)
   - [Failure-Mode Matrix](#failure-mode-matrix)
   - [Pi 5 Latency Budget](#pi-5-latency-budget)
 - [Configuration Reference](#configuration-reference)
@@ -61,13 +65,37 @@ OpenCrayFish (小龍蝦) is **not a chatbot, not a SaaS wrapper, and not a cloud
 | 🧠 **Working memory** | A 12-turn RAM `deque` fed to the SLM |
 | 🧠 **Hippocampus** | An on-disk JSONL journal that survives crashes |
 | 🧠 **Cortex (LTM)** | `memory/archive.md` — distilled long-term facts |
+| 🛠️ **Habits / Skills** | A pluggable `SkillRegistry` of capabilities (`identity`, `recall`, `research`, `direct_answer`, `self_reflect`, `proactive_learning`, `recurring_research`) — the Cognitive Loop picks from this menu instead of hardcoding verbs |
 | 😊 **Mood** | A 5-channel emotion vector (joy / anger / sorrow / excitement / calm) with exponential decay |
 | 💞 **Empathy** | Sentiment + urgency analysis of every Architect message |
 | 🌙 **REM sleep** | A nightly Sleep Metabolism cycle (02:00–06:00) that distills the day |
 | 🤔 **Curiosity** | Idle-time Proactive Research that closes real STM knowledge gaps |
-| 🪞 **Reflection** | A self-critique pass on every reply, persisted to `state/reflection.jsonl` |
+| 🪞 **Reflection** | A self-critique pass on every reply, persisted to `state/reflection-YYYY-MM-DD.jsonl` (date-rotated, bounded retention) |
 
 The agent serves a single human — **the Architect** — over Telegram and a local browser chat (Streamlit). The Architect's name, salutation, and the agent's own designation are all configured in `config.yaml`; the agent addresses the Architect by name in every reply (default: `"Boss <name>"`).
+
+---
+
+## 60-Second Mental Model (Restaurant Analogy)
+
+If the system architecture diagram below looks intimidating, here's the friendly version:
+
+> **OpenCrayFish is a small, family-run restaurant that never closes.**
+
+| Restaurant role | OpenCrayFish part | What it actually is |
+|---|---|---|
+| 🧑‍🍳 **The chef** | `Brain` + the SLM (`qwen2.5-instruct:1.5b`) | The thinker that turns an order into a plated reply. Small but quick. |
+| 📖 **The menu** | `SkillRegistry.plan_menu()` | The short, curated list of dishes the chef can prepare *right now* (filtered by what's in stock and how stressed the kitchen is). |
+| 🍽️ **The dishes** | Skills — `recall`, `research`, `direct_answer`, `identity`, `self_reflect`, `proactive_learning`, `recurring_research` | Capabilities the chef can decide to prepare. Each has a cost label (cheap / expensive). |
+| 🔪 **The kitchen equipment** | Tools — `web_search` (SearXNG), `archive_read` (LTM) | The mechanical primitives a dish uses. The customer never sees them. |
+| 📋 **The order ticket** | `CognitiveTrace` (THINK → PLAN → ACT → REFINE) | The structured plan the chef writes before cooking: "table 4 wants X, I'll prep with dish A + dish B". |
+| 💗 **The chef's pulse** | `Heartbeat.pulse_loop()` | Even with no orders, the chef breathes, blinks, sips water — and notices if the stove is overheating. |
+| 🌙 **Closing time** | `Heartbeat.metabolism()` (02:00 nightly) | After the last customer leaves, the chef writes down what was learned today and tapes it inside the recipe book. |
+| 📓 **The recipe book** | `soul.md` (immutable laws) + `memory/archive.md` (learned facts) | Two notebooks: one the chef can never edit (the constitution), one the chef adds to every night. |
+| 🌡️ **The kitchen thermometer** | `Monitor` (CPU/RAM/temp + brain availability as a vital sign) | When the kitchen gets too hot, the chef skips the fancy garnish and serves faster, simpler plates. |
+| 🚪 **The waiters** | Connectors (`telegram`, `web_chat`) | Front-of-house staff who carry the order in and the plate out. The chef doesn't care which waiter is on duty. |
+
+**Why this matters for contributors:** want to add a new "dish"? Write a new Skill. Want to add a new "kitchen appliance"? Write a new Tool. Want to open a new "dining room"? Write a new Connector. The chef (Brain), the menu builder (SkillRegistry), and the order book (CognitiveLoop) all keep working with **zero edits** — your new thing just appears on the menu the next time the chef looks at it. See [§ 12 Skills & Tools](#12-skills--tools--the-two-tier-capability-stack) for the step-by-step recipe.
 
 ---
 
@@ -144,14 +172,21 @@ The agent does not stop between user turns. Driven entirely from `config.yaml`:
         ┌─────────────────────────── BRAIN ───────────────────────────┐
         │  Identity short-circuit → STM context → Cognition Loop      │
         │  (THINK → PLAN → ACT → REFINE) → SLM synth → PositiveFilter │
-        └────┬───────┬───────┬───────┬───────┬───────┬────────┬──────┘
+        │                                                             │
+        │  PLAN menu + ACT dispatch routed through ──┐                │
+        └────┬───────┬───────┬───────┬───────┬───────┼────────┬──────┘
              │       │       │       │       │       │        │
              ▼       ▼       ▼       ▼       ▼       ▼        ▼
-          Soul   Monitor  Emotions Empathy  STM  Provider  Reflection
-          .md    (vitals)  (mood)  (sent.) (RAM (SLM       Engine
-                                          +disk) circuit)
-                                              │
-                                              ▼
+          Soul   Monitor  Emotions Empathy  STM  SkillRegistry  Reflection
+          .md    (vitals)  (mood)  (sent.) (RAM  ─┬─ identity   Engine
+                                          +disk)  ├─ recall
+                                              │   ├─ direct_answer
+                                              │   ├─ research ──► SearXNG
+                                              │   ├─ self_reflect       Tool
+                                              │   ├─ proactive_learning
+                                              │   └─ recurring_research
+                                              │       (every invoke →
+                                              ▼        state/skills-*.jsonl)
                                     ┌──────────────────┐
                                     │    HEARTBEAT     │
                                     │  pulse_loop()    │
@@ -166,17 +201,151 @@ The agent does not stop between user turns. Driven entirely from `config.yaml`:
                                     └──────────────────┘
 
   Side artifacts (read by ui/dashboard.py):
-    state/vitals.json          ← live rolling pulse snapshot
-    state/vitals_events.jsonl  ← stress ENTER/EXIT timeline
-    state/proactive.jsonl      ← every proactive thought + audit trail
-    state/reflection.jsonl     ← every self-critique
-    state/deliberation.jsonl   ← every cognitive trace (THINK/PLAN/ACT)
-    state/stm_journal.jsonl    ← durable conversation backstop
-    state/tasks.yaml           ← persistent recurring task registry
-    state/tools.json           ← live tool inventory snapshot
-    memory/archive.md          ← long-term distilled facts
-    logs/daily/YYYY-MM-DD.log  ← per-day heartbeat telemetry (path = memory.log_path)
+    state/vitals.json                       ← live rolling pulse snapshot
+    state/vitals_events.jsonl               ← stress ENTER/EXIT timeline
+    state/proactive.jsonl                   ← every proactive thought + audit trail
+    state/reflection-YYYY-MM-DD.jsonl       ← every self-critique (date-rotated)
+    state/reflection_dropped-YYYY-MM-DD.jsonl ← unparseable critique sidecar
+    state/deliberation-YYYY-MM-DD.jsonl     ← every cognitive trace (date-rotated)
+    state/skills-YYYY-MM-DD.jsonl           ← every Skill invocation audit (date-rotated)
+    state/skills.json                       ← live skill inventory snapshot
+    state/stm_journal.jsonl                 ← durable conversation backstop
+    state/tasks.yaml                        ← persistent recurring task registry
+    state/tools.json                        ← live tool inventory snapshot
+    memory/archive.md                       ← long-term distilled facts
+    logs/daily/YYYY-MM-DD.log               ← per-day heartbeat telemetry (path = memory.log_path)
 ```
+
+---
+
+## A Day in the Life of a Message
+
+Reading 14 subsystem sections back-to-back is a lot. Here's the same story told as a single concrete example: **what happens when the Architect types `"How does the Hailo-10H compare to the Hailo-8 for running 1.5B-parameter LLMs?"` into Telegram at 14:32 on a Tuesday.** Every arrow is a real line of code; every state file write is real.
+
+```text
+T+0 ms     Telegram → connectors/telegram.py
+           ├─ validate sender == cfg.api_keys.telegram_user_id     ✓
+           ├─ not a slash command, not a task request               → Brain.think(user_input)
+           └─ pre-filter: looks_like_task_request()?                ✗ (no "every X minutes")
+
+T+2 ms     Brain._cycle() begins
+           ├─ soul.render_identity_block()       (cached, <1 ms)
+           ├─ monitor.sample()                   (cached <1 ms — 100ms only if stale)
+           ├─ emotions.snapshot()                → calm dominant, joy=0.2
+           ├─ empathy.analyze(user_input)        → sentiment=neutral, urgency=False
+           └─ identity regex match?              ✗ (not asking for name/creator)
+
+T+5 ms     LTM short-circuit check
+           ├─ keyword scan over memory/archive.md  → top hit scores 1
+           └─ score < tools.ltm_short_circuit_min_score (2)   → not short-circuited
+                                                              → cognition will run
+
+T+8 ms     CognitiveLoop.deliberate() — THINK stage
+           ├─ Build active PLAN menu via SkillRegistry.plan_menu(cap, exclude_network)
+           │   ├─ vitals.is_stressed? No  → cap stays "expensive"
+           │   ├─ provider.is_tripped?  No → keep network skills
+           │   └─ menu: [ANSWER, RECALL, SEARCH] sorted free→expensive
+           └─ Call provider.generate(THINK prompt, user msg)         ~600 ms (NPU)
+               → INTENT: Compare H10 vs H8 for running 1.5B LLMs.
+               → Q1: What are the H10's headline specs?
+               → Q2: Why was the H8 unsuitable for LLMs?
+               → Q3: Which Pi-class HAT ships the H10?
+
+T+610 ms   PLAN stage
+           └─ Call provider.generate(PLAN prompt with menu, sub-questions)  ~700 ms
+               → Q1: SEARCH "Hailo-10H specs"
+               → Q2: RECALL
+               → Q3: ANSWER
+
+T+1310 ms  ACT stage (3 concurrent skill invocations via asyncio.gather)
+           ├─ skill_registry.invoke("research", ctx, query="Hailo-10H specs")
+           │   └─ ResearchSkill.execute()
+           │       └─ tool_registry.call("web_search", query=..., limit=5)
+           │           └─ httpx GET http://localhost:8080/search       ~300 ms
+           │       → SkillResult(ok=True, evidence=[{title, url, snippet}, …])
+           │   → appended to state/skills-2026-05-17.jsonl
+           │     {ts, skill:"research", ok:true, latency_ms:302, tools_used:["web_search"], …}
+           │
+           ├─ skill_registry.invoke("recall", ctx, query="Why was the H8 unsuitable for LLMs?")
+           │   └─ RecallSkill.execute()
+           │       └─ tool_registry.call("archive_read", query=..., limit=5)   ~12 ms
+           │   → appended to state/skills-2026-05-17.jsonl
+           │
+           └─ ANSWER step:
+               └─ if cfg.cognition.dispatch_answer_via_skill → invoke "direct_answer" (one extra SLM call)
+                  else → marker "(SLM training data only — no retrieval performed)"
+
+T+1620 ms  REFINE stage (if cfg.cognition.refine_enabled)
+           └─ Call provider.generate(REFINE prompt, intent + evidence)  ~250 ms
+               → "OK"  (no gap)  →  one gap fires one extra SEARCH
+
+T+1870 ms  CognitiveLoop._persist() — append full trace to
+           state/deliberation-2026-05-17.jsonl (rotated by local date, 14-day retention)
+
+T+1870 ms  Brain._render_knowledge() → KNOWLEDGE block
+           Brain assembles final prompt: soul + vitals + mood + empathy + KNOWLEDGE
+                                       + STM history (last 12 turns) + current user message
+
+T+1875 ms  provider.generate(synthesize prompt)               ~1200 ms (NPU)
+           → raw SLM output: "The Hailo-10H is the second-generation Pi 5 AI accelerator …"
+
+T+3075 ms  _looks_like_prompt_leak(raw)?  ✗
+           PositiveFilter.apply(raw)
+           ├─ hard reject regex?      ✗
+           ├─ soft rewrites?          ✗ (no "I can't" / "impossible" / etc.)
+           └─ → filtered.text unchanged, filtered.altered=False
+
+T+3078 ms  stm.append("user", user_input)
+           stm.append("agent", filtered.text)
+           ├─ deque (maxlen=12) appended — oldest turn silently dropped if full
+           └─ pending buffer +1 — will flush after 30s idle
+
+T+3080 ms  ReflectionEngine.fire_and_forget(input, response, kind="user", web_searched=True)
+           └─ background asyncio.Task (does NOT add to user-visible latency)
+               └─ provider.generate(critique prompt) ~700 ms
+                  → ReflectionEntry(quality="medium", interest="NPU benchmarks", lesson="...")
+                  → appended to state/reflection-2026-05-17.jsonl
+
+T+3080 ms  ThoughtTrace returned to TelegramConnector
+           └─ bot sends "Boss Eason — The Hailo-10H is … <answer>"   ~150 ms (Telegram API)
+
+T+3230 ms  Architect sees the reply on Telegram.
+
+──── meanwhile, in the background ────
+
+Every 30 s   Heartbeat.pulse_loop() ticks:
+             ├─ Sample vitals → atomic-write state/vitals.json
+             ├─ Decay emotions toward baseline
+             ├─ Detect stress edges → state/vitals_events.jsonl
+             └─ If pending writes ≥1 AND idle ≥30 s → stm.flush_journal()
+
+After 5 min idle  Heartbeat fires _proactive_research():
+                  └─ Picks an STM gap (e.g. "Hailo-10H benchmarks"),
+                     verifies it's not in LTM and the SLM doesn't already know it,
+                     runs one web search + a 2-sentence reflection,
+                     writes to state/proactive.jsonl,
+                     reflects on its own proactive thought.
+
+At 02:00          Heartbeat.metabolism():
+                  ├─ Distill the day's logs + STM journal into archive.md
+                  ├─ Promote top facts to soul.md [CORE_MEMORIES]
+                  ├─ _consolidate_reflections(): mine reflection.jsonl + skills.jsonl
+                  │   ├─ recurring interests → LEARNED_PREFERENCES
+                  │   ├─ recurring lessons   → EMOTIONAL_EVOLUTION
+                  │   └─ chronically failing skills (≥3 invokes, >50% fail) → EMOTIONAL_EVOLUTION
+                  └─ STM.purge() — clean slate for tomorrow.
+
+At 06:00          Pulse loop resumes (no explicit "wake" event — it just notices
+                  the clock has crossed `duty_start`).
+```
+
+**What this walkthrough demonstrates:**
+
+- **Two SLM calls happen before the user sees a word** (THINK + PLAN), and one more (synth) after evidence is gathered. The structure exists because a 1.5B-parameter model is unreliable when asked to do everything in one shot.
+- **The PLAN menu is built fresh per turn.** A stressed Pi or an offline SearXNG silently drops the expensive options — the SLM never gets to pick a verb the agent can't execute.
+- **Every Skill invocation is audited** to `state/skills-YYYY-MM-DD.jsonl`. Tomorrow night's Sleep Metabolism will read that file and decide whether any Skill is chronically broken.
+- **The reflection happens in the background.** The Architect's reply latency budget is ~3 s; reflection costs another ~700 ms but the user never waits for it.
+- **The dashboard sees all of this without IPC** — Streamlit reads the atomically-written state files in a separate process.
 
 ---
 
@@ -232,16 +401,28 @@ OpenCrayFish/
 │   ├── positive_filter.py    ← Pillar 2 hard output filter
 │   ├── provider.py           ← Ollama/Hailo backends + circuit breaker
 │   ├── stm.py                ← short-term memory (RAM + journal)
-│   ├── cognition.py          ← THINK → PLAN → ACT → REFINE loop
+│   ├── cognition.py          ← THINK → PLAN → ACT → REFINE loop (dispatches via SkillRegistry)
 │   ├── brain.py              ← prompt assembly orchestrator
-│   ├── reflection.py         ← self-critique engine
+│   ├── reflection.py         ← self-critique engine (reads skills.jsonl for failure flags)
+│   ├── jsonl_writer.py       ← date-rotating, retention-bounded JSONL appender
 │   ├── heartbeat.py          ← pulse_loop + metabolism + proactive_thought
-│   └── scheduler.py          ← recurring research-task scheduler
+│   ├── scheduler.py          ← recurring research-task scheduler
+│   └── skills/               ← capability layer above Tools (Phase 1–3.1)
+│       ├── base.py           ← Skill protocol + SkillContext + SkillResult
+│       ├── registry.py       ← SkillRegistry + dynamic PLAN menu + audit feed
+│       ├── identity.py       ← soul-templated identity replies (free, no-net)
+│       ├── recall.py         ← LTM keyword retrieval (cheap, no-net)
+│       ├── direct_answer.py  ← SLM-only answer (cheap, no-net)
+│       ├── research.py       ← SearXNG-backed web research (expensive, net)
+│       ├── self_reflect.py   ← post-turn critique (cheap, no-net, background)
+│       ├── proactive_learning.py    ← idle-time curiosity (expensive, net, background)
+│       └── recurring_research.py    ← scheduled topic refresh (expensive, net, background)
 │
-├── tools/                    ← agent-callable skills
+├── tools/                    ← low-level I/O primitives (called BY Skills)
 │   ├── base.py               ← Tool plugin contract
 │   ├── registry.py           ← named tool registry
-│   └── searxng.py            ← self-hosted web search (SearXNG client)
+│   ├── searxng.py            ← self-hosted web search (SearXNG client)
+│   └── archive_read.py       ← long-term memory keyword reader
 │
 ├── connectors/               ← external I/O channels
 │   ├── telegram.py           ← Telegram Bot API connector
@@ -261,9 +442,11 @@ OpenCrayFish/
     ├── vitals.json
     ├── vitals_events.jsonl
     ├── proactive.jsonl
-    ├── reflection.jsonl
-    ├── reflection_dropped.jsonl
-    ├── deliberation.jsonl
+    ├── reflection-YYYY-MM-DD.jsonl          ← date-rotated, 60-day default retention
+    ├── reflection_dropped-YYYY-MM-DD.jsonl  ← date-rotated, sidecar audit
+    ├── deliberation-YYYY-MM-DD.jsonl        ← date-rotated, 14-day default retention
+    ├── skills-YYYY-MM-DD.jsonl              ← date-rotated, 30-day default retention
+    ├── skills.json                          ← live skill inventory snapshot
     ├── stm_journal.jsonl
     ├── tasks.yaml
     ├── tools.json
@@ -389,8 +572,10 @@ metabolism():
   4. Append facts to memory/archive.md (LTM)
   5. Promote the top 2 facts to soul.md [CORE_MEMORIES]  (Soul Evolution)
   6. _consolidate_reflections()
-                              ← scan state/reflection.jsonl for recurring
-                                interest topics + lesson themes
+                              ← scan state/reflection-*.jsonl for recurring
+                                interest topics + lesson themes,
+                                AND state/skills-*.jsonl for chronically
+                                failing Skills (≥3 invokes, >50% fail rate)
                               ← promote into LEARNED_PREFERENCES /
                                 EMOTIONAL_EVOLUTION
   7. stm.purge()               ← wipe RAM deque + pending + journal
@@ -573,6 +758,20 @@ So the SLM only ever *sees* the last 12 turns, but the system *remembers* much m
 | `system.idle_journal_flush_seconds` | 30 | Idle-flush threshold |
 | `system.journal_fsync_on_flush` | false | Strict durability vs SD wear |
 
+#### Related durable feeds (NOT in the STM/LTM tiers)
+
+The agent also writes four high-frequency JSONL audit streams that are *adjacent to* but separate from the memory hierarchy above. Together with `stm_journal.jsonl` they form the five durable on-disk feeds:
+
+| Feed | Owner | Date-rotated? |
+|---|---|---|
+| `state/stm_journal.jsonl` | `STM` | no (nightly purge) |
+| `state/deliberation-YYYY-MM-DD.jsonl` | `CognitiveLoop` | yes (14d) |
+| `state/skills-YYYY-MM-DD.jsonl` | `SkillRegistry` | yes (30d) |
+| `state/reflection-YYYY-MM-DD.jsonl` | `ReflectionEngine` | yes (60d) |
+| `state/reflection_dropped-YYYY-MM-DD.jsonl` | `ReflectionEngine` | yes (60d) |
+
+Rotation + retention details live in [§ JSONL Rotation & Retention](#jsonl-rotation--retention). Reflection mines both `reflection.jsonl` (interest / lesson clusters) and `skills.jsonl` (chronic Skill failures) into `soul.md` during Sleep Metabolism — see [§ 10 Reflection](#10-self-reflection--the-self-learning-loop).
+
 ---
 
 ### 6. The Thinking Process — Brain & Cognitive Loop
@@ -622,6 +821,8 @@ Every reply the agent produces — whether triggered by a user message, a heartb
 
 The qwen2:1.5b model **reliably mishandles** the most basic identity questions ("what is your name", "do you know my name", "how are you", "who created you"). From production logs, "what is your name" used to triage as a SEARCH and pollute the synth with Netflix's "My Name" + the anime "Your Name". Fix: detect a small set of unambiguous identity-class regexes BEFORE any cognition runs, and return a templated reply built from soul.md + config.yaml + live vitals/mood. **Deterministic. Zero round-trip. Zero hallucination.**
 
+Since Phase 3.1, the "what is your name / who created you" branches delegate the actual templating to `IdentitySkill` via `skill_registry.invoke("identity", ctx, kind="name"|"creator")`. The Skill reads the IDENTITY block from `soul.md` and returns a short factual line; Brain wraps it with the live salutation/status sentence. If the registry call fails (no registry, exception, `ok=False`, empty summary), Brain falls back to the previous inline template — strictly additive, zero regression risk. The `who am I` and `how are you` branches stay inline because they need vitals / mood / architect-name that `IdentitySkill` doesn't see.
+
 #### Cognitive Loop — THINK → PLAN → ACT → REFINE
 
 Engaged on real user turns when no bypass condition fires. Each stage is **a single one-job SLM prompt** with hard token caps and regex parsing — *not* one giant chain-of-thought.
@@ -629,11 +830,20 @@ Engaged on real user turns when no bypass condition fires. Each stage is **a sin
 | Stage | What it does | Output cap |
 |---|---|---|
 | **THINK** | Restate user INTENT in one sentence + decompose into ≤ `cognition.max_subquestions` atomic Q1/Q2/Q3 sub-questions. | 120 tokens |
-| **PLAN** | Assign exactly one verb to each sub-question: `RECALL` (hits archive.md), `SEARCH "..."` (hits SearXNG), or `ANSWER` (no retrieval needed). | 120 tokens |
-| **ACT** | Execute all PlanSteps **concurrently**. Collect per-sub-question Evidence. | (executes verbs) |
+| **PLAN** | Assign exactly one verb from the **dynamic, registry-driven menu** to each sub-question. The shipping menu is `RECALL` (hits archive.md via the `recall` Skill), `SEARCH "..."` (hits SearXNG via the `research` Skill), and `ANSWER` (no retrieval needed, dispatched to `direct_answer`). Adding a new Skill with `plan_verb` automatically extends the menu — see [§ 12 Skills & Tools](#12-skills--tools--the-two-tier-capability-stack). | 120 tokens |
+| **ACT** | Execute all PlanSteps **concurrently** via `skill_registry.invoke(name, ctx, **kwargs)`. Collect per-sub-question Evidence. Every invocation is timed, isolated from crashes, and appended to `state/skills-YYYY-MM-DD.jsonl`. | (executes verbs) |
 | **REFINE** | (optional, capped at 1 round) Re-read intent + evidence; emit `OK` or `GAP: SEARCH "..."`; if gap, ACT it. | 40 tokens |
 
-The full trace is appended to `state/deliberation.jsonl` for audit. **Failures never raise** — the loop degrades to whatever evidence it managed to collect.
+The full trace is appended to `state/deliberation-YYYY-MM-DD.jsonl` for audit. **Failures never raise** — the loop degrades to whatever evidence it managed to collect.
+
+##### Dynamic PLAN menu + cost-tier auto-degradation
+
+`SkillRegistry.plan_menu(...)` builds the PLAN-stage menu fresh on every turn, filtered by two runtime signals:
+
+* **`cost_tier_cap`** — the operator baseline from `skills.default_cost_tier_cap`. `_active_plan_entries()` tightens it to `"cheap"` whenever `vitals.is_stressed` is true, so a hot or RAM-pressured Pi automatically stops picking expensive web research.
+* **`exclude_network`** — set when `skills.auto_offline_filter` is true AND the Provider's circuit breaker has tripped OR the brain is otherwise offline. Any Skill with `requires_network=True` (currently `research`) drops out of the menu so the SLM can't pick a verb whose tool we can't reach.
+
+The filtered menu is rendered into the PLAN prompt as `VERB(arg_hint)  —  description` lines sorted free → cheap → expensive, so the SLM is gently biased toward the cheapest adequate Skill. The same `(verb → skill_name)` mapping is reused by ACT's dispatcher, so PLAN and ACT can never disagree about what a verb means.
 
 ##### How the trace becomes a prompt (the `knowledge_block`)
 
@@ -841,12 +1051,13 @@ After every interaction (user-driven or proactive), Brain calls `reflection.fire
 }
 ```
 
-Each entry is appended to `state/reflection.jsonl`. Failed/malformed parses go to `state/reflection_dropped.jsonl` so operators can see *why* a turn produced no reflection (instead of silently disappearing).
+Each entry is appended to `state/reflection-YYYY-MM-DD.jsonl` (date-rotated, see [§ JSONL Rotation & Retention](#jsonl-rotation--retention)). Failed/malformed parses go to `state/reflection_dropped-YYYY-MM-DD.jsonl` so operators can see *why* a turn produced no reflection (instead of silently disappearing).
 
-Sleep Metabolism's `_consolidate_reflections()` then mines this feed:
+Sleep Metabolism's `_consolidate_reflections()` then mines BOTH the reflection feed AND the skill-invocation audit feed:
 
-- **Recurring `interest` topics** → appended to `[LEARNED_PREFERENCES]` (drives tomorrow's proactive research).
-- **Recurring `lesson` themes** → appended to `[EMOTIONAL_EVOLUTION]` (long-term behavioral evolution).
+- **Recurring `interest` topics** (from `reflection.jsonl`) → appended to `[LEARNED_PREFERENCES]` (drives tomorrow's proactive research).
+- **Recurring `lesson` themes** (from `reflection.jsonl`) → appended to `[EMOTIONAL_EVOLUTION]` (long-term behavioral evolution).
+- **Systemic Skill failures** (from `skills.jsonl`) → `ReflectionEngine.summarise_skills_recent(since=24h)` aggregates per-Skill `{total, ok, failed, fail_rate, avg_latency_ms, last_error}`. Any Skill with **≥3 invocations AND >50% fail rate** in the last 24 hours produces an `[EMOTIONAL_EVOLUTION]` entry like *"Sleep Metabolism (2026-05-17): skill 'research' failed 7/12 times in the last 24h (fail_rate=58%) — last error: SearXNG 502"*. Top 3 flagged Skills per cycle. This closes the loop: a chronically broken backend becomes a fact the agent remembers across restarts, not just a buried log line.
 
 This is the **self-learning loop** — the agent learns from itself, deterministically, every night.
 
@@ -898,20 +1109,177 @@ NL list/cancel/pause/resume use cheap regex pre-filters (`looks_like_task_query`
 
 ---
 
-### 12. Tools — SearXNG and the Tool Registry
+### 12. Skills & Tools — The Two-Tier Capability Stack
 
-**Modules:** [tools/base.py](tools/base.py) · [tools/registry.py](tools/registry.py) · [tools/searxng.py](tools/searxng.py)
+**Modules:** [core/skills/](core/skills/) · [core/skills/base.py](core/skills/base.py) · [core/skills/registry.py](core/skills/registry.py) · [tools/base.py](tools/base.py) · [tools/registry.py](tools/registry.py)
 
-OpenCrayFish uses a self-hosted **SearXNG** instance (default `http://localhost:8080`) as its only network-touching tool. The agent never calls Google/Bing/etc. directly — every web fact passes through SearXNG, keeping search history off third-party servers.
+OpenCrayFish separates *what the agent can decide to do* from *what the agent can mechanically poke*:
 
-`SearXNG` exposes two surfaces on the same class:
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│  TIER A — SKILLS  (core/skills/)                                     │
+│  Agent-facing capabilities. The SLM picks these by name in PLAN.     │
+│  Each Skill composes 0..N Tool calls + its own policy + cost label.  │
+│  Returns a uniform SkillResult so callers can degrade-and-continue.  │
+└──────────────────────────────────────────────────────────────────────┘
+                              │ invokes
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  TIER B — TOOLS  (tools/)                                            │
+│  Mechanical I/O primitives. No policy, no SLM, no fallback.          │
+│  Stateless, side-effect-honest, individually testable.               │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-1. **Direct API** — `await searxng.search(query, limit=5) -> list[SearchResult]` used by Brain, CognitiveLoop, Heartbeat, and TaskScheduler.
-2. **Tool plugin contract** — `name="web_search"`, `description`, `args_schema`, `call()`, `aclose()` — registered with `ToolRegistry` for future PLAN-stage tool dispatch by name.
+This split is the single most important architectural change between v1 and Phase 3.1, because it makes **the PLAN-stage menu pluggable** — adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from, without touching `cognition.py`.
 
-`main.py` publishes the live tool inventory to `state/tools.json` (atomic write) so the dashboard can render the catalogue without sharing process state.
+#### Tier A — Skills (the registry)
 
-The Tool plugin contract (`tools/base.py`) is the extension point for future skills — local file ops, GPIO control, sensor reads, MCP servers, etc.
+Every Skill satisfies the `Skill` Protocol from [core/skills/base.py](core/skills/base.py) — purely by shape, no inheritance required. The contract:
+
+```python
+name: str                       # stable identifier, also the PLAN-verb mapping target
+description: str                # one-line purpose, fed into the PLAN prompt
+trigger_hints: list[str]        # WHEN to pick (bullet sub-lines under description)
+args_schema: dict[str, dict]    # JSON-Schema-ish for execute() kwargs
+cost_tier: "free"|"cheap"|"expensive"  # PLAN filter for stressed vitals
+requires_network: bool          # PLAN filter for offline/circuit-tripped state
+side_effects: bool              # actuator gating (writes / sends / toggles)
+requires_confirmation: bool     # Architect-ack-before-call gate
+plan_verb: str | None           # if set, this Skill appears on the PLAN menu
+
+async execute(ctx: SkillContext, **kwargs) -> SkillResult
+async aclose() -> None
+```
+
+The shipping set (7 Skills, all registered in `main.py`):
+
+| Skill | PLAN verb | Cost | Net | Role |
+|---|---|---|---|---|
+| `identity` | — (hidden from menu) | free | ✗ | Soul-templated identity replies (Brain's identity short-circuit) |
+| `recall` | `RECALL` | cheap | ✗ | Keyword scan of `memory/archive.md` |
+| `direct_answer` | `ANSWER` | cheap | ✗ | SLM-only reply when no retrieval is needed |
+| `research` | `SEARCH` | expensive | ✓ | SearXNG-backed web research with snippet de-duplication |
+| `self_reflect` | — (background) | cheap | ✗ | Post-turn critique (invoked by Brain `fire_and_forget`) |
+| `proactive_learning` | — (background) | expensive | ✓ | Idle-time curiosity (invoked by Heartbeat) |
+| `recurring_research` | — (background) | expensive | ✓ | Scheduled topic refresh (invoked by Scheduler) |
+
+`SkillRegistry` provides three call paths:
+
+- **`invoke(name, ctx, **kwargs) -> SkillResult`** — the canonical entry. Wraps `skill.execute(...)` with uniform timing, crash isolation (a misbehaving plugin can never escape), and audit. Every call appends `{ts, skill, ok, latency_ms, tools_used, kwargs_keys, error}` to `state/skills-YYYY-MM-DD.jsonl` via [core/jsonl_writer.py](core/jsonl_writer.py).
+- **`plan_menu(cost_tier_cap, exclude_network)`** — returns the sorted PLAN-menu entries for THIS turn. Consumed by `CognitiveLoop._active_plan_entries()` to render the SLM prompt and by `_run_step()` to map a verb back to a Skill name during ACT.
+- **`has(name)`** — cheap existence check (used by Brain's identity short-circuit and the LTM short-circuit before deciding whether to even try).
+
+`SkillContext` (frozen dataclass) is built once at boot and carries the shared subsystem handles every Skill might need: `tools`, `soul`, `stm`, `monitor`, `provider`, `archive_path`, plus the immutable identity strings (`designation`, `architect_name`, `architect_honorific`). Skills get read access via the proper subsystem APIs — they never touch global state.
+
+#### Tier B — Tools (the I/O primitives)
+
+Two Tools ship today:
+
+| Name | File | Purpose | Network |
+|---|---|---|---|
+| `web_search` | [tools/searxng.py](tools/searxng.py) | self-hosted SearXNG client (default `http://localhost:8080`) — returns `list[SearchResult]` | yes (but only to YOUR SearXNG, never to third parties) |
+| `archive_read` | [tools/archive_read.py](tools/archive_read.py) | keyword-overlap reader for `memory/archive.md` with line numbers + score | no |
+
+Every Tool satisfies the `Tool` Protocol (`name`, `description`, `args_schema`, async `call(**kwargs) -> ToolResult`, async `aclose()`). `main.py` publishes the live inventory to `state/tools.json` (atomic write) for the dashboard.
+
+`SearXNG` is deliberately exposed on TWO surfaces — direct API (`await searxng.search(q, limit)` used by `ResearchSkill`, `ProactiveLearningSkill`, `RecurringResearchSkill`, and `TaskScheduler`) AND the Tool plugin contract (so the registry inventory + future PLAN-stage tool dispatch by name keeps working).
+
+#### Why two tiers (and not one)
+
+A Tool is *what the OS lets us do*. A Skill is *what the agent has decided is worth doing*. Conflating them was the v0 mistake; separating them gives us:
+
+- A Skill can pick between multiple Tools (e.g. a future `ResearchSkill` might fall back from SearXNG → cached Wikipedia → archive.md).
+- A Tool can be reused by multiple Skills (`searxng` is hit by `research`, `proactive_learning`, and `recurring_research`).
+- The PLAN-stage SLM prompt stays short (Skills are coarse-grained, ~7 entries) while Tools (potentially dozens once GPIO / MCP / sensors land) stay invisible to the SLM.
+- Adding a Skill is a one-file change; adding a Tool doesn't change the PLAN menu at all.
+
+#### Hello-World Skill — Step by Step
+
+The fastest way to understand the Skill layer is to add one yourself. Below is a complete, working Skill that returns a personalised greeting. **Three small edits and a restart** — that's the entire ceremony.
+
+**Step 1. Create the Skill file** at `core/skills/hello.py`:
+
+```python
+"""Hello-World Skill — minimal example of the Skill plugin contract."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from core.skills.base import SkillContext, SkillResult
+
+
+class HelloSkill:
+    # ── Skill Protocol fields ──────────────────────────────────────────────
+    name: str = "hello"
+    description: str = "Reply with a friendly greeting to the Architect."
+    trigger_hints: list[str] = [
+        "the user says hi / hello / good morning",
+        "you want to acknowledge presence without doing any research",
+    ]
+    args_schema: dict[str, dict[str, Any]] = {}   # no kwargs
+    cost_tier: str = "free"          # no SLM, no network — purely local
+    requires_network: bool = False
+    side_effects: bool = False
+    requires_confirmation: bool = False
+
+    # ── PLAN-menu wiring (optional) ────────────────────────────────────────
+    # If set, this Skill becomes a verb the cognitive PLAN stage can pick.
+    plan_verb: str | None = "GREET"
+    plan_arg_hint: str | None = None  # GREET takes no args
+
+    # ── Execution ──────────────────────────────────────────────────────────
+    async def execute(self, ctx: SkillContext, **kwargs: Any) -> SkillResult:
+        architect = f"{ctx.architect_honorific} {ctx.architect_name}".strip()
+        summary = f"Hello, {architect}! I am {ctx.designation}, at your service."
+        return SkillResult(
+            ok=True,
+            summary=summary,
+            evidence=[],          # no citations
+            tools_used=[],        # no Tool calls
+        )
+
+    async def aclose(self) -> None:
+        # Nothing to release — Skills only need aclose() when they hold
+        # connections (DB pools, sockets, etc.).
+        return None
+```
+
+**Step 2. Register it in `main.py`.** Find the block where the other Skills are registered (`skill_registry.register(...)` calls) and add one line:
+
+```python
+from core.skills.hello import HelloSkill           # ← top-of-file import
+...
+skill_registry.register(HelloSkill())              # ← in the bootstrap block
+```
+
+**Step 3. Restart the agent.** That's it. The next time the Cognitive Loop runs its PLAN stage, the SLM will see this new line in its menu:
+
+```text
+- GREET — Reply with a friendly greeting to the Architect.
+  • When the Architect says hi / hello / good morning.
+  • When you want to acknowledge presence without doing any research.
+```
+
+Send "hi" on Telegram. In `state/skills-YYYY-MM-DD.jsonl` you'll see:
+
+```json
+{"ts":"2026-05-17T14:32:01+08:00","skill":"hello","ok":true,"latency_ms":1,
+ "tools_used":[],"kwargs_keys":[],"error":null}
+```
+
+And in `state/deliberation-YYYY-MM-DD.jsonl` you'll see `GREET` appear in the PLAN trace. The dashboard's **Skill inventory** panel now lists it; the **Skill activity** panel shows its calls.
+
+**Why this is so short:** there is **no inheritance**, **no decorator**, **no registry-side code change**, **no PLAN-prompt edit**. The `Skill` Protocol is a *structural* contract — any object with the right attribute names and shapes satisfies it. The PLAN menu is built fresh per turn by `SkillRegistry.plan_menu()` from whatever is registered, sorted by cost tier, filtered by stress and network state. Your new Skill simply joins the buffet.
+
+**Where to take this next:**
+
+- Make it consume a Tool: take an `args_schema={"name":{"type":"string"}}`, then call `await ctx.tools.call("archive_read", query=kwargs["name"])` inside `execute()` to look up something about the named person.
+- Make it cost-aware: set `cost_tier="expensive"` and `requires_network=True` so the Loop hides it when the Pi is stressed or SearXNG is down.
+- Make it actuator-style: set `side_effects=True, requires_confirmation=True` for a Skill that, say, toggles a smart bulb — the Loop will refuse to run it without explicit ack scaffolding (a planned actuator hook lives in [core/cognition.py](core/cognition.py)).
+
+See [CONTRIBUTING.md § Ways to Contribute](CONTRIBUTING.md#ways-to-contribute) for the equivalent recipe for both layers.
 
 ---
 
@@ -953,23 +1321,39 @@ The accompanying [ui/web_chat.py](ui/web_chat.py) Streamlit app is a frontend ov
 
 **Module:** [ui/dashboard.py](ui/dashboard.py)
 
-The dashboard runs as a separate Streamlit process on port 8501 and reads the state files the Heartbeat publishes. **Zero IPC**, just atomically-written JSON / JSONL.
+The dashboard runs as a separate Streamlit process on port 8501 and reads the state files the Heartbeat publishes. **Zero IPC**, just atomically-written JSON / JSONL. Auto-refreshes every 5 seconds via `streamlit-autorefresh` (optional dep — falls back to a manual "Refresh now" button when the package isn't installed).
 
-Live panels:
+#### Live panels (top → bottom)
 
-- **Vitals strip**: CPU / RAM / Temp / **Brain** (online + backend) / Mood / STM size / Pending writes
-- **Pulse history sparkline**: rolling ~1 hour at 30s/pulse
-- **Stress timeline**: rendered from `state/vitals_events.jsonl` ENTER/EXIT events
-- **Recent proactive thoughts**: from `state/proactive.jsonl`, with full triage_decisions audit
-- **Recent reflections**: from `state/reflection.jsonl`
-- **Recent deliberations**: from `state/deliberation.jsonl` (THINK → PLAN → ACT trace per turn)
-- **Active recurring tasks**: from `state/tasks.yaml`
-- **Tool inventory**: from `state/tools.json`
+| Panel | Source | What it tells you |
+|---|---|---|
+| **Vitals strip** | `state/vitals.json` | CPU / RAM / Temp / Brain backend (online + variant) / Mood (dominant + active channel) / STM size / Pending writes / liveness chip (ALIVE / STALE / DEAD by snapshot age) |
+| **Pulse history sparkline** | derived from `state/vitals.json` history | Rolling ~1 hour at 30s/pulse — quick visual on whether the Pi is trending hot |
+| **Heartbeat log (today)** | `<memory.log_path>/YYYY-MM-DD.log` | Raw heartbeat telemetry for the current day in the agent's timezone, with a "Notable events" filter expander (PROACTIVE / VITALS / Sleep Metabolism / Awakening) |
+| **💬 Live chat activity (last 30)** | `state/logs/agent.log` filtered to `CHAT / TG / WEB / TASK / TOOL / SKILL` prefixes | Per-turn trail with five summary metrics (Turns / Web-grounded / Triage SEARCH / LTM short-circuit / Search FAILED). Colour-coded lines surface decisions at a glance |
+| **⚠️ Errors & warnings (last 20)** | `state/logs/agent.log` filtered to `[ERROR] / [WARNING] / [CRITICAL]` level prefixes | The operator's "is something broken?" panel. Header badge shows counts; auto-opens when any error or critical is present. Empty state = explicitly green. Catches the failures the structured chat filter would hide (tripped circuit breaker, SearXNG outage, soul-protection rejection) |
+| **Mood vector (5-D)** | `state/vitals.json` | Bar chart of joy / anger / sorrow / excitement / calm + dominant + active-non-baseline channel readout |
+| **⚡ Vitals stress events** | `state/vitals_events.jsonl` | Chronological ENTER / EXIT timeline with peak readings — see when the agent was hot and for how long |
+| **🧬 Mood event log (last 20)** | `state/logs/agent.log` filtered to `MOOD ` prefix | Emitted by `Emotions.nudge_many()` and `decay()` transitions — lets you trace WHY the mood vector moved |
+| **Short-Term Memory** | `state/vitals.json` (last few turns echoed in) | Last few user/agent turns in the RAM deque |
+| **🔬 Autonomous learning feed (last 5)** | `state/proactive.jsonl` | Each proactive thought with its full triage_decisions audit + final draft + delivery status |
+| **🧠 Cognitive deliberations (last 5)** | `state/deliberation-YYYY-MM-DD.jsonl` (rotated, **fanned across all siblings**) | Per-turn THINK → PLAN → ACT → REFINE trace with verbs, evidence summaries, latencies |
+| **⏱️ Scheduled research tasks** | `state/tasks.yaml` | Live recurring-task registry with next-run timestamps + last-report previews |
+| **🔌 Tool registry** | `state/tools.json` | Name / description / args_schema / side-effect flags for every plugged-in Tool |
+| **🎯 Skill registry** | `state/skills.json` + `state/skills-YYYY-MM-DD.jsonl` (rotated, **fanned across all siblings**) | Inventory of registered Skills with their PLAN-menu verb + recent invocations (timing / ok-fail / kwargs keys / last error) |
+| **🪞 Self-reflection feed (last 8)** | `state/reflection-YYYY-MM-DD.jsonl` (rotated, **fanned across all siblings**) | Per-turn critiques + lesson + interest topic that Sleep Metabolism mines at 02:00 |
+| **Soul (read-only)** | `soul.md` | Raw view of the agent's identity + learned growth |
+| **Memory archive (last 2 KB)** | `memory/archive.md` | Tail of the LTM file — see what Sleep Metabolism has been promoting |
 
-Logs:
+#### Rotation fan-out
 
-- `state/logs/agent.log` — rotating console mirror (2 MB × 5 files)
-- `<memory.log_path>/YYYY-MM-DD.log` — per-day heartbeat telemetry (PULSE / PROACTIVE / metabolism). Default `logs/daily/`.
+The three high-frequency feeds — `deliberation`, `skills`, `reflection` — are written by [core/jsonl_writer.py](core/jsonl_writer.py)'s `RotatingJsonlWriter`, which produces a fresh `<feed>-YYYY-MM-DD.jsonl` per local day. The dashboard's `_rotated_jsonl_tail()` / `_rotated_jsonl_all()` helpers discover every sibling matching that pattern, walk newest-last, **and** append the legacy un-rotated `<feed>.jsonl` (if any operator left one behind from a pre-rotation deployment) so the reads survive both midnight crossings and the rotation cutover. The filename regex guard means the readers will never accidentally consume an operator's notes or a foreign file with a similar name. Validated by [scripts/smoke_dashboard_rotation.py](scripts/smoke_dashboard_rotation.py).
+
+#### Logs on disk
+
+- `state/logs/agent.log` — rotating console mirror (`RotatingFileHandler`, 2 MB × 5 files) set up in [main.py](main.py). Every structured event (`CHAT / TG / WEB / TASK / TOOL / SKILL / MOOD / VITALS`) plus all `[INFO] / [WARNING] / [ERROR] / [CRITICAL]` lines land here. This is the single source the dashboard's chat-activity and errors-and-warnings panels tail.
+- `<memory.log_path>/YYYY-MM-DD.log` — per-day heartbeat telemetry (PULSE / PROACTIVE / Sleep Metabolism). Default `logs/daily/`. Written synchronously by [core/heartbeat.py](core/heartbeat.py)'s `_append_log()`.
+- `state/*-YYYY-MM-DD.jsonl` — date-rotated structured audit feeds (see [§ JSONL Rotation & Retention](#jsonl-rotation--retention)).
 
 ---
 
@@ -1014,15 +1398,42 @@ The same pattern is used by:
 |---|---|---|
 | `Heartbeat._publish_state` | `state/vitals.json` | `ui/dashboard.py` |
 | `main._publish_tools_inventory` | `state/tools.json` | `ui/dashboard.py` |
+| `main._publish_skills_inventory` | `state/skills.json` | `ui/dashboard.py` |
 | `TaskScheduler._save` | `state/tasks.yaml` | `ui/dashboard.py` + scheduler bootstrap |
 | `SoulHandler._write` | `soul.md` | every Brain cycle |
 | `STM._fsync_journal` (append-only) | `state/stm_journal.jsonl` | `STM.recover()` at boot |
+| `RotatingJsonlWriter.append` (append-only, date-rotated) | `state/{skills,deliberation,reflection,reflection_dropped}-YYYY-MM-DD.jsonl` | `ReflectionEngine.read_recent*` + `ui/dashboard.py` |
 
-For append-only feeds (`*.jsonl`), atomicity comes from the OS guarantee that a single `write()` of a buffered JSON line is not torn — combined with always emitting one complete record per `write()` call.
+For append-only feeds (`*.jsonl`), atomicity comes from the OS guarantee that a single `write()` of a buffered JSON line is not torn — combined with always emitting one complete record per `write()` call. The high-frequency feeds (skills, deliberation, reflection, reflection_dropped) go one step further and route through [core/jsonl_writer.py](core/jsonl_writer.py)'s `RotatingJsonlWriter` (next subsection).
+
+### JSONL Rotation & Retention
+
+**Module:** [core/jsonl_writer.py](core/jsonl_writer.py)
+
+Three subsystems append at conversational frequency: `SkillRegistry._audit` (one line per Skill invocation), `CognitiveLoop._persist` (one line per cognitive trace), and `ReflectionEngine._persist` / `_persist_dropped` (one line per turn critique + sidecar). On a 24/7 Pi 5 those files would grow without bound and become unreadable. `RotatingJsonlWriter` solves that with three guarantees:
+
+1. **Per-day rotation by filename.** The active file's name embeds the local date — e.g. `state/skills-2026-05-17.jsonl`. A fresh date → a fresh file. We never rename or truncate, so any tail-reader holding a file descriptor never sees a half-written record from a rename race.
+2. **Line-atomic appends.** `os.open(..., O_WRONLY|O_CREAT|O_APPEND)` + a single `os.write(fd, line)` per record. POSIX `O_APPEND` keeps the write atomic at the byte level even under concurrent process writers; a per-instance `asyncio.Lock` further serialises Python-side writers so the executor pool can't race on the same file descriptor.
+3. **Bounded retention.** The first append of each new local day fires a `_sweep_blocking(today)` pass that `unlink()`s any sibling matching `<base>-YYYY-MM-DD.jsonl` older than `retain_days`. Files that don't match the pattern (operator notes, foreign feeds with a different stem) are NEVER touched — the regex guard is the safety wall.
+
+Default retention windows (each owner picks its own — larger feeds get shorter windows):
+
+| Feed | Owner | Retention | Why |
+|---|---|---|---|
+| `skills-*.jsonl` | `SkillRegistry` | 30 days | small rows, useful trail for "is research broken again?" debugging |
+| `deliberation-*.jsonl` | `CognitiveLoop` | 14 days | whole THINK/PLAN/ACT/REFINE payload — biggest rows |
+| `reflection-*.jsonl` | `ReflectionEngine` | 60 days | mined by Sleep Metabolism (24h lookback) — keep a wide window for trend analysis |
+| `reflection_dropped-*.jsonl` | `ReflectionEngine` | 60 days | operator-only forensics for unparseable critiques |
+
+`stm_journal.jsonl`, `vitals_events.jsonl`, and `proactive.jsonl` are NOT rotated — `stm_journal` gets truncated nightly by Sleep Metabolism's `purge()`, and the other two grow slowly enough to be operator-managed. The `RotatingJsonlWriter` is only applied where the per-turn write frequency justifies the rotation cost.
+
+Readers (`ReflectionEngine.read_recent`, `read_recent_skills`, `summarise_skills_recent`) scan all rotated siblings AND any legacy un-rotated file at the base path — backwards compatible with deployments that haven't restarted since the cutover. Sorting is by parsed timestamp inside the record, not filename order, so reading across a date boundary at 00:00 just works.
 
 ### Failure-Mode Matrix
 
 Each subsystem is designed to **degrade, not crash**, when its dependency is broken. The table below is the operator's mental model for "what does the agent do when X dies":
+
+> All failures listed below land in `state/logs/agent.log` at `[WARNING]` / `[ERROR]` / `[CRITICAL]` level and are surfaced in the dashboard's **⚠️ Errors & warnings** panel (auto-expanded when anything but warnings are present). The "Surface to Architect" column describes the user-visible behaviour; the panel is the operator-visible counterpart.
 
 | Failure | Surface to Architect | Recovery |
 |---|---|---|
@@ -1032,7 +1443,7 @@ Each subsystem is designed to **degrade, not crash**, when its dependency is bro
 | **SD card full / write fails** | STM `flush_journal()` logs the exception and continues. The deque + pending buffer keep accumulating in RAM. Sleep Metabolism `_append_archive()` likewise tolerates write failure. | Free disk space; the next idle flush will succeed and the buffered turns are preserved. |
 | **STM journal corrupted** | `STM.recover()` skips malformed lines and continues. Worst case: zero turns rehydrated. | None required — the journal is truncated to zero on the next Sleep Metabolism `purge()`. |
 | **soul.md mutation rejected** | `SoulProtectionError` raised inside `metabolism()` is caught and logged. No partial write occurs (atomic swap). | Architect inspects the proposed Core Memory in `state/proactive.jsonl`; nothing else is required. |
-| **Cognitive Loop fails to parse THINK output** | Loop bails with `engaged=False`, `bypass_reason="think_unparseable"`. Brain falls through to legacy single-shot path. Trace still appended to `state/deliberation.jsonl` for forensics. | None — every cycle is independent. |
+| **Cognitive Loop fails to parse THINK output** | Loop bails with `engaged=False`, `bypass_reason="think_unparseable"`. Brain falls through to legacy single-shot path. Trace still appended to `state/deliberation-YYYY-MM-DD.jsonl` for forensics. | None — every cycle is independent. |
 | **Connector outage (Telegram API rate-limit)** | python-telegram-bot retries internally. Agent state untouched; replies queue and drain when API recovers. | None — wait for rate-limit window. |
 | **Heartbeat coroutine raises** | Exception propagates; Heartbeat task dies; `await pulse_task` in `main.amain()` raises and the process exits non-zero. | Restart the agent (systemd unit recommended). STM rehydrates from journal at boot. |
 
@@ -1040,7 +1451,7 @@ The repeated theme: **per-turn / per-pulse work is independent**, so a single fa
 
 ### Pi 5 Latency Budget
 
-Numbers below are typical-case for the reference deployment (Pi 5 + AI HAT+ 2 / Hailo-10H, qwen2.5-instruct:1.5b NPU primary). Treat them as ballpark; the only authoritative numbers are what your `state/deliberation.jsonl` records on YOUR hardware.
+Numbers below are typical-case for the reference deployment (Pi 5 + AI HAT+ 2 / Hailo-10H, qwen2.5-instruct:1.5b NPU primary). Treat them as ballpark; the only authoritative numbers are what your `state/deliberation-YYYY-MM-DD.jsonl` records on YOUR hardware.
 
 | Stage | Typical (ms) | Notes |
 |---|---|---|
@@ -1049,11 +1460,13 @@ Numbers below are typical-case for the reference deployment (Pi 5 + AI HAT+ 2 / 
 | `Empathy.analyze()` | <5 | dependency-free lexicon scan |
 | `PositiveFilter.apply()` | <2 | regex sweep |
 | `LTM keyword scan` (archive.md ≤ 1000 lines) | 5–20 | linear read; bounded by `archive.md` size |
-| `Identity short-circuit` reply (full) | <10 | zero SLM calls |
+| `Identity short-circuit` reply (full) | <10 | zero SLM calls (delegates to `IdentitySkill`) |
+| `SkillRegistry.invoke()` wrapper overhead | <1 | timing + audit append (executor-offloaded) |
+| `RotatingJsonlWriter.append` | <5 | per-record `os.write()` in executor; sweep ≤1/day |
 | `Cognition THINK` (120 tok cap) | 400–800 | one NPU call |
-| `Cognition PLAN` (120 tok cap) | 400–800 | one NPU call |
-| `Cognition ACT` (per `SEARCH`) | 200–500 | SearXNG round-trip + parse |
-| `Cognition ACT` (per `RECALL`) | <20 | local archive scan |
+| `Cognition PLAN` (120 tok cap) | 400–800 | one NPU call; menu built by `SkillRegistry.plan_menu()` (~<1ms) |
+| `Cognition ACT` (per `SEARCH`) | 200–500 | dispatched via `research` Skill → SearXNG round-trip + parse |
+| `Cognition ACT` (per `RECALL`) | <20 | dispatched via `recall` Skill → local archive scan |
 | `Cognition REFINE` (40 tok cap) | 200–400 | one NPU call (only if a gap remains) |
 | `Brain.synthesize` (final SLM call) | 800–1500 | one NPU call, longer output cap |
 | `Reflection.fire_and_forget` (background) | 600–1000 | doesn't add to user-perceived latency |
@@ -1125,6 +1538,11 @@ cognition:
   max_subquestions: 3
   max_act_rounds: 2                       # 2 = REFINE allowed; 1 = no refine
   refine_enabled: true
+
+skills:
+  default_cost_tier_cap: "expensive"      # free | cheap | expensive
+  auto_offline_filter: true               # drop net-requiring skills when brain offline
+  enabled: {}                             # per-skill override map, e.g. {research: false}
 
 web_chat:
   enabled: true
@@ -1204,7 +1622,19 @@ That's it — the new connector inherits proactive thoughts, task delivery, vita
 
 ### Adding a new tool
 
-Implement the `Tool` protocol from [tools/base.py](tools/base.py) (`name`, `description`, `args_schema`, async `call(**kwargs) -> ToolResult`, async `aclose()`), register it in `main.py` via `tool_registry.register(my_tool)`, and re-publish the inventory snapshot. Future PLAN-stage code will dispatch by `name`.
+Implement the `Tool` protocol from [tools/base.py](tools/base.py) (`name`, `description`, `args_schema`, async `call(**kwargs) -> ToolResult`, async `aclose()`), register it in `main.py` via `tool_registry.register(my_tool)`, and re-publish the inventory snapshot. Tools are mechanical I/O — they do NOT appear on the PLAN menu by themselves; wrap them in a Skill (next subsection) for the SLM to be able to pick them.
+
+### Adding a new skill
+
+A Skill is what the SLM actually picks in PLAN. Implement the `Skill` protocol from [core/skills/base.py](core/skills/base.py):
+
+1. Add a new file under [core/skills/](core/skills/), e.g. `home_control.py`. Use [core/skills/recall.py](core/skills/recall.py) as the canonical small example.
+2. Set the contract fields: `name` (snake_case verb), `description` (≤60 tokens — it lands in the PLAN prompt), `trigger_hints`, `args_schema`, `cost_tier`, `requires_network`, `side_effects`, `requires_confirmation`. Set `plan_verb` ONLY if the SLM should be able to pick it during PLAN — background skills (`self_reflect`, `proactive_learning`, `recurring_research`) leave it `None`.
+3. Implement `async execute(ctx, **kwargs) -> SkillResult`. **NEVER raise** — wrap failures in `SkillResult(ok=False, error=...)`. Use `ctx.tools.get("web_search")`, `ctx.soul.read()`, etc. — don't reach for global state.
+4. Register the instance in `main.py` next to the existing `_maybe_register(...)` lines. The registry's change listener will republish `state/skills.json` automatically.
+5. (Optional) Gate it with `cfg.skills.enabled["home_control"] = false` in `config.yaml` to ship it behind a flag.
+
+That's it — the PLAN menu picks it up on the next turn, ACT dispatches by name, the audit feed gets per-invocation rows, and Sleep Metabolism will flag it if it starts failing. See [CONTRIBUTING.md](CONTRIBUTING.md) for the PR conventions.
 
 ### Adding a new sensor (GPIO / I²C / etc.)
 
@@ -1214,21 +1644,24 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 ## Roadmap
 
-The current codebase is a **complete v1**: every subsystem in this README is implemented, tested with smoke scripts, and Pylance-clean. The natural next directions:
+The current codebase (Phase 3.1) is a **complete v1+**: every subsystem in this README is implemented, tested with smoke scripts, and Pylance-clean. The pluggable Skill layer (Phase 1–3) and the JSONL rotation utility (Phase 3.1) have shipped. The natural next directions:
 
+- **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs), `mcp_bridge` (turn any MCP server into a Skill).
 - **GPIO / I²C sensor library** — temperature/humidity (BME680), motion (PIR), light (TSL2591), gas (CCS811/MQ-2), heart rate (MAX30102), motion (MPU6050) feeding straight into `VitalSigns` and `MoodTuning`.
-- **Local vision** — small VLM on the NPU + CSI camera, Tool-registered as `see()`.
+- **Local vision** — small VLM on the NPU + CSI camera, exposed as a `see` Skill.
 - **Local voice** — Whisper.cpp for in + Piper TTS for out, registered as bidirectional connectors.
-- **Output actuators** — WS2812 LED strip for mood visualization, OLED for facial expression, servos for embodied motion.
-- **Sleep-time soul evolution v2** — instead of rule-based `_consolidate_reflections`, an SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve.
-- **MCP server tools** — register MCP servers as Tool plugins so the agent can call any local MCP-compatible service.
+- **Output actuators** — WS2812 LED strip for mood visualization, OLED for facial expression, servos for embodied motion — these are `side_effects=True, requires_confirmation=False` Skills with policy.
+- **Sleep-time soul evolution v2** — SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve, replacing the current rule-based `_consolidate_reflections`.
 - **Encrypted state at rest** — for deployments in regulated environments (clinical, legal, financial).
+- **Pytest suite** — the project currently has only smoke checks. Coverage of `Emotions`, `PositiveFilter`, `CognitiveLoop` parsing, `SkillRegistry.plan_menu`, and the task pre-filter chain would be high-impact — see [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
 
 ---
 
 ## Community & Contributing
 
 OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passionate developer, architect, hardware hacker, and AI tinkerer is welcome to co-develop. The crayfish is small, but the pond is deep — there is plenty of room.
+
+> 💡 **We especially want you if…** you've ever wanted to wire a sensor, a smart bulb, a CalDAV calendar, a home-grown RAG, or an MCP server into a *living* edge agent and watch it learn from the result overnight. The Skill plugin layer (see [§ 12](#12-skills--tools--the-two-tier-capability-stack) and the [Hello-World Skill tutorial](#hello-world-skill--step-by-step)) is built so a working contribution is one file plus one line in `main.py`. The crayfish gets stronger every time someone adds a new dish to the menu.
 
 ### Where to start
 

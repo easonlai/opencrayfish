@@ -1,7 +1,7 @@
 """core.config — Typed loader for `config.yaml`."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -169,6 +169,14 @@ class CognitionCfg:
     # Useful for first-day rollout: prove THINK + PLAN + ACT are stable,
     # then flip this to true to enable refinement.
     refine_enabled: bool = True
+    # Phase 3: when True, the ANSWER verb actually invokes the
+    # `direct_answer` Skill (one extra SLM call per ANSWER step) and
+    # surfaces the reply as evidence in the synth KNOWLEDGE block.
+    # When False (default, byte-identical to Phase 2), ANSWER is a
+    # no-op marker telling synth "no retrieval needed; lean on SLM
+    # training data". Flip to true once you've measured the latency
+    # impact and decided the extra grounding is worth it.
+    dispatch_answer_via_skill: bool = False
 
 
 @dataclass(frozen=True)
@@ -195,8 +203,40 @@ class WebChatCfg:
 
 
 @dataclass(frozen=True)
+class SkillsCfg:
+    """Skill layer tuning (capability registry above Tools).
+
+    A Skill is the agent-facing capability the Cognitive Loop / Heartbeat /
+    Scheduler dispatches to satisfy one sub-question or fire one autonomous
+    cycle. Each Skill composes 0..N Tool calls plus its own policy. See
+    `core/skills/base.py` for the contract and `core/skills/` for the
+    shipping set.
+
+    Skills are registered at boot, listed in `state/skills.json` for
+    dashboard discoverability, and audited per-invocation in
+    `state/skills.jsonl` (rotated by local date). The knobs below shape
+    the dynamic PLAN-stage menu the SLM picks from each turn.
+    """
+    # Cost-tier cap for the SLM-driven PLAN-stage menu. Skills above
+    # this tier are filtered out. Useful for clamping budget on
+    # stressed vitals (when 'cheap' is enforced the agent stays local).
+    #   free      — only pure-compute skills
+    #   cheap     — free + local-I/O skills (default)
+    #   expensive — all skills allowed
+    default_cost_tier_cap: str = "expensive"
+    # When the Provider's circuit breaker reports offline, auto-drop
+    # skills with requires_network=true from the PLAN menu so the SLM
+    # doesn't waste a turn picking something we can't execute.
+    auto_offline_filter: bool = True
+    # Per-skill enable/disable. Keys are skill names. Omit a key to use
+    # the skill's default registration (i.e. enabled). Set to false to
+    # force-hide a skill (it won't be registered at boot).
+    enabled: dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class TasksCfg:
-    """Recurring research-task scheduler (per core/scheduler.py).
+    """Recurring research-task scheduler (per core/scheduler.py)."
 
     Operator creates tasks via plain chat ("check MSFT every hour"). The
     scheduler then fires each task on its own cadence, runs SearXNG on
@@ -235,6 +275,7 @@ class Config:
     cognition: CognitionCfg = CognitionCfg()
     web_chat: WebChatCfg = WebChatCfg()
     tasks: TasksCfg = TasksCfg()
+    skills: SkillsCfg = SkillsCfg()
 
     @classmethod
     def load(cls, path: str | Path = "config.yaml") -> "Config":
@@ -250,4 +291,5 @@ class Config:
             cognition=CognitionCfg(**raw.get("cognition", {})),
             web_chat=WebChatCfg(**raw.get("web_chat", {})),
             tasks=TasksCfg(**raw.get("tasks", {})),
+            skills=SkillsCfg(**raw.get("skills", {})),
         )

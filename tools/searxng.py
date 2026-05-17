@@ -1,16 +1,18 @@
-"""tools.searxng — Web search skill backed by a self-hosted SearXNG instance.
+"""tools.searxng — Web search tool backed by a self-hosted SearXNG instance.
 
 This module exposes TWO surfaces on the same class:
 
   1. The original `search(query, *, limit=5) -> list[SearchResult]` API
-     used directly by Brain, CognitiveLoop, Heartbeat, and TaskScheduler
-     today. Unchanged — preserves zero-touch behavior for those callers.
+     kept for direct callers (and tests). No production subsystem calls
+     this directly anymore — they all reach SearXNG through
+     `skill_registry.invoke("research", ...)` which routes via
+     `tool_registry.call("web_search", ...)` which calls the `Tool`
+     surface below. The two surfaces share the same httpx client.
 
-  2. The new `Tool` plugin contract (`name`, `description`, `args_schema`,
-     `call`, `aclose`, …) so SearXNG can be registered with
-     `tools.registry.ToolRegistry` and dispatched generically by future
-     tool-routing code (e.g. an SLM-driven PLAN stage that picks tools
-     by name).
+  2. The `Tool` plugin contract (`name`, `description`, `args_schema`,
+     `call`, `aclose`, …) so SearXNG is registered with
+     `tools.registry.ToolRegistry` and dispatched generically by the
+     SkillRegistry / future MCP bridge.
 
 Both surfaces share the same underlying httpx client. There is no
 duplication and no second instance is created when the same SearXNG

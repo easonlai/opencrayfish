@@ -51,10 +51,24 @@ TASKS_FILE = _REPO_ROOT / "state" / "tasks.yaml"
 # Tool registry inventory snapshot. Published once at boot by main.py
 # after registering each Tool with ToolRegistry.
 TOOLS_FILE = _REPO_ROOT / "state" / "tools.json"
+# Skill registry inventory + per-invocation audit feed. Published by
+# main.py after registering each Skill with SkillRegistry; the feed
+# is appended by SkillRegistry.invoke() on every call.
+SKILLS_FILE = _REPO_ROOT / "state" / "skills.json"
+SKILLS_FEED = _REPO_ROOT / "state" / "skills.jsonl"
 SOUL_FILE = _REPO_ROOT / "soul.md"
 # Python-logging rotating file (set up in main.py). Holds the new
 # `CHAT <event> ...` live-chat trail emitted from core.brain + connectors.
 AGENT_LOG = _REPO_ROOT / "state" / "logs" / "agent.log"
+
+# JSONL rotation discovery — mirrors the filename pattern produced by
+# `core.jsonl_writer.RotatingJsonlWriter` (`<stem>-YYYY-MM-DD.jsonl`).
+# The base paths above point to the LEGACY un-rotated filenames; the
+# helpers below transparently fan out to every rotated sibling so the
+# dashboard sees the same data the writers actually produce.
+_ROTATED_FILENAME_RE = re.compile(
+    r"^(?P<base>.+)-(?P<date>\d{4}-\d{2}-\d{2})\.jsonl$"
+)
 
 # Mirrors `_DESIGNATION_RE` in core.brain so the dashboard shows the same
 # name the agent uses when it introduces itself in chat.
@@ -67,6 +81,98 @@ _SOUL_CODENAME_RE = re.compile(
 
 
 # ---------- helpers ----------------------------------------------------------
+
+def _rotated_jsonl_paths(base_path: Path) -> list[Path]:
+    """Return every file the rotating writer might be feeding from this base.
+
+    Newest-first. Includes:
+      * `<stem>-YYYY-MM-DD.jsonl` rotated siblings (the current scheme), and
+      * `base_path` itself if it exists (legacy un-rotated file from
+        deployments that pre-date the rotation cutover).
+
+    Mirrors `core.jsonl_writer.RotatingJsonlWriter.sibling_paths()` so the
+    dashboard sees exactly what the writer produces — without depending
+    on the live writer instance (separate process).
+    """
+    if base_path.name.endswith(".jsonl"):
+        stem = base_path.name[: -len(".jsonl")]
+    else:
+        stem = base_path.name
+    parent = base_path.parent
+    out: list[tuple[str, Path]] = []
+    if parent.exists():
+        for p in parent.iterdir():
+            if not p.is_file():
+                continue
+            m = _ROTATED_FILENAME_RE.match(p.name)
+            if not m or m.group("base") != stem:
+                continue
+            out.append((m.group("date"), p))
+    # Sort newest-last so the concatenated tail keeps chronological order.
+    out.sort(key=lambda t: t[0])
+    paths = [p for _, p in out]
+    # Append the legacy un-rotated path last so its lines (if any) read as
+    # the most recent — covers operators who tail the old name and don't
+    # want their existing data to disappear after upgrading.
+    if base_path.exists() and base_path not in paths:
+        paths.append(base_path)
+    return paths
+
+
+def _rotated_jsonl_tail(base_path: Path, limit: int) -> list[dict]:
+    """Return the most recent `limit` JSONL records across all rotated
+    siblings of `base_path`. Chronological order (newest LAST).
+
+    Walks rotated files newest-last, accumulates lines from the end, and
+    stops once we have at least `limit`. Cheap because we only read whole
+    files (jsonl rows are small) — no seek/tail tricks needed for the
+    sizes these feeds produce on a Pi 5.
+    """
+    paths = _rotated_jsonl_paths(base_path)
+    if not paths:
+        return []
+    collected: list[str] = []
+    # Walk from newest backwards so we can stop early once we have `limit`.
+    for p in reversed(paths):
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        # Prepend this file's lines so chronological order is preserved
+        # in the final list (older files before newer ones).
+        collected = lines + collected
+        if len(collected) >= limit:
+            break
+    if limit > 0:
+        collected = collected[-limit:]
+    out: list[dict] = []
+    for ln in collected:
+        try:
+            out.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _rotated_jsonl_all(base_path: Path) -> list[dict]:
+    """Return every parseable record across all rotated siblings.
+
+    Chronological order (oldest first). Used by callers that need a
+    timestamp-bounded slice (e.g. last-24h) rather than a tail count.
+    """
+    out: list[dict] = []
+    for p in _rotated_jsonl_paths(base_path):
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                out.append(json.loads(ln))
+            except json.JSONDecodeError:
+                continue
+    return out
+
 
 def _read_state() -> dict | None:
     if not STATE_FILE.exists():
@@ -120,7 +226,7 @@ def _read_chat_log_tail(lines: int = 30) -> list[str]:
         return []
     # Match any of the structured event prefixes. Keep this list in sync
     # with the `log.info("<PREFIX> ...")` strings in core / connectors / tools.
-    _prefixes = (" CHAT ", " TG ", " WEB ", " TASK ", " TOOL ")
+    _prefixes = (" CHAT ", " TG ", " WEB ", " TASK ", " TOOL ", " SKILL ")
     chat_only = [
         ln for ln in all_lines if any(p in ln for p in _prefixes)
     ]
@@ -179,16 +285,14 @@ def _proactive_source_badge(source: str) -> str:
 
 
 def _read_reflection_feed(limit: int = 8) -> list[dict]:
-    """Newest-first list of recent self-reflection entries."""
-    if not REFLECTION_FEED.exists():
-        return []
-    out: list[dict] = []
-    for ln in REFLECTION_FEED.read_text(encoding="utf-8").splitlines()[-limit:]:
-        try:
-            out.append(json.loads(ln))
-        except json.JSONDecodeError:
-            continue
-    return list(reversed(out))
+    """Newest-first tail of recent self-reflection critiques.
+
+    Reads every `state/reflection-YYYY-MM-DD.jsonl` rotated sibling plus
+    the legacy `state/reflection.jsonl` (if present) so the dashboard
+    stays accurate across midnight + the rotation cutover.
+    """
+    records = _rotated_jsonl_tail(REFLECTION_FEED, limit)
+    return list(reversed(records))
 
 
 def _read_deliberation_feed(limit: int = 5) -> list[dict]:
@@ -199,15 +303,8 @@ def _read_deliberation_feed(limit: int = 5) -> list[dict]:
     refine decisions, and total latency. Lets the operator see WHY the
     agent answered the way it did, not just WHAT it said.
     """
-    if not DELIBERATION_FEED.exists():
-        return []
-    out: list[dict] = []
-    for ln in DELIBERATION_FEED.read_text(encoding="utf-8").splitlines()[-limit:]:
-        try:
-            out.append(json.loads(ln))
-        except json.JSONDecodeError:
-            continue
-    return list(reversed(out))
+    records = _rotated_jsonl_tail(DELIBERATION_FEED, limit)
+    return list(reversed(records))
 
 
 def _verb_badge(verb: str) -> str:
@@ -254,6 +351,28 @@ def _read_mood_log_tail(lines: int = 20) -> list[str]:
     return mood_only[-lines:]
 
 
+def _read_errors_warnings_tail(lines: int = 20) -> list[str]:
+    """Tail recent ERROR / WARNING log lines from `state/logs/agent.log`.
+
+    The chat-activity panel filters by structured event prefixes
+    (`CHAT`, `TG`, `WEB`, `TASK`, `TOOL`, `SKILL`) and consequently hides
+    raw Python warnings + stack traces. This helper surfaces THOSE so an
+    operator can spot a failing dependency, a tripped circuit breaker,
+    or a soul-protection error without `tail -f`ing the file.
+    """
+    if not AGENT_LOG.exists():
+        return []
+    try:
+        all_lines = AGENT_LOG.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    # Match the standard logging format used in main.py:
+    #   "<ts> [<LEVEL>] <name>: <message>"
+    levels = ("[ERROR]", "[WARNING]", "[CRITICAL]")
+    flagged = [ln for ln in all_lines if any(lvl in ln for lvl in levels)]
+    return flagged[-lines:]
+
+
 def _read_tasks() -> list[dict]:
     """Load the recurring-task registry from `state/tasks.yaml`.
 
@@ -293,6 +412,34 @@ def _read_tools_inventory() -> list[dict]:
     return tools if isinstance(tools, list) else []
 
 
+def _read_skills_inventory() -> list[dict]:
+    """Load the registered-skill snapshot from `state/skills.json`.
+
+    Published by `main.py::_publish_skills_inventory` whenever the
+    SkillRegistry changes (initial boot + any dynamic register/
+    unregister). Empty list when the file is missing or unparseable.
+    """
+    if not SKILLS_FILE.exists():
+        return []
+    try:
+        payload = json.loads(SKILLS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    skills = payload.get("skills") if isinstance(payload, dict) else None
+    return skills if isinstance(skills, list) else []
+
+
+def _read_skills_activity(limit: int = 20) -> list[dict]:
+    """Tail recent SkillRegistry.invoke() audit entries (newest-first).
+
+    Each JSONL line is one invocation: ts, skill, ok, latency_ms,
+    tools_used, kwargs_keys, error[:200]. Surfaced in the Skills panel
+    so operators can see WHICH skills the agent actually picked.
+    """
+    records = _rotated_jsonl_tail(SKILLS_FEED, limit)
+    return list(reversed(records))
+
+
 def _format_task_interval(seconds: int) -> str:
     """Human-readable interval — mirrors `core.scheduler.format_interval`
     so the dashboard renders the same labels operators see in chat.
@@ -316,15 +463,15 @@ def _read_reflections_since(cutoff: datetime) -> list[dict]:
     """Mirror of `ReflectionEngine.read_recent` so the dashboard can preview
     LEARNED_PREFERENCES promotions over the SAME 24 h window that
     `core.heartbeat._consolidate_reflections` will use at 02:00.
+
+    Walks every rotated `state/reflection-YYYY-MM-DD.jsonl` sibling so the
+    window stays accurate across the previous-day boundary.
     """
-    if not REFLECTION_FEED.exists():
-        return []
     out: list[dict] = []
-    for line in REFLECTION_FEED.read_text(encoding="utf-8").splitlines():
+    for d in _rotated_jsonl_all(REFLECTION_FEED):
         try:
-            d = json.loads(line)
             ts = datetime.fromisoformat(d["ts"])
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             continue
         if ts < cutoff:
             continue
@@ -594,6 +741,41 @@ def main() -> None:
                     rendered.append(ln)
             st.markdown("\n\n".join(rendered))
 
+        # ----- Errors & warnings (raw log filter) ---------------------------
+        # Surfaces ERROR / WARNING / CRITICAL lines that the structured
+        # chat filter above intentionally drops — provider timeouts, soul
+        # protection rejections, tool exceptions, scheduler load failures.
+        # This panel is hidden behind an expander so it's only "loud" when
+        # something is actually wrong (count badge in the header).
+        err_lines = _read_errors_warnings_tail(lines=20)
+        err_count = len(err_lines)
+        err_critical = sum(1 for ln in err_lines if "[CRITICAL]" in ln)
+        err_error = sum(1 for ln in err_lines if "[ERROR]" in ln)
+        err_warn = err_count - err_critical - err_error
+        with st.expander(
+            (
+                f"⚠️ Errors & warnings (last 20 — "
+                f"{err_critical} critical, {err_error} error, {err_warn} warn)"
+            ),
+            expanded=(err_critical > 0 or err_error > 0),
+        ):
+            st.caption(
+                "Raw level-filtered tail of `state/logs/agent.log`. "
+                "Empty = healthy. Use this to spot a tripped circuit "
+                "breaker, a SearXNG outage, or a soul-protection rejection "
+                "the structured chat panel would otherwise hide."
+            )
+            if not err_lines:
+                st.success("No errors or warnings in the recent log tail.")
+            else:
+                for ln in err_lines:
+                    if "[CRITICAL]" in ln:
+                        st.markdown(f":red[**{ln}**]")
+                    elif "[ERROR]" in ln:
+                        st.markdown(f":red[{ln}]")
+                    else:
+                        st.markdown(f":orange[{ln}]")
+
     with right:
         st.subheader("Mood vector (5-D)")
         mood = state.get("mood") or {}
@@ -813,7 +995,7 @@ def main() -> None:
         "before replying: it decomposed the request into sub-questions, "
         "picked a verb (RECALL / SEARCH / ANSWER) for each, executed them "
         "concurrently, and \u2014 when a gap remained \u2014 ran ONE refine round. "
-        "Source: `state/deliberation.jsonl`."
+        "Source: `state/deliberation-YYYY-MM-DD.jsonl` (rotated daily)."
     )
     delibs = _read_deliberation_feed(limit=5)
     if not delibs:
@@ -1003,13 +1185,111 @@ def main() -> None:
                             line += f" — {adesc}"
                         st.markdown(line)
 
+    # ===== Skill registry ====================================================
+    st.divider()
+    st.subheader("🎯 Skill registry")
+    st.caption(
+        "Capabilities registered with `core.skills.SkillRegistry` at boot. "
+        "A Skill is the agent-facing layer above Tools — it composes 0..N "
+        "Tool calls + its own policy. Phase 2 will dispatch the Cognitive "
+        "Loop's PLAN-stage verbs through this registry. Source: "
+        "`state/skills.json` + `state/skills-YYYY-MM-DD.jsonl` (published + appended "
+        "by `main.py` / `SkillRegistry.invoke`)."
+    )
+    skills_inv = _read_skills_inventory()
+    if not skills_inv:
+        st.info(
+            "Skill inventory not published yet. Start `python main.py` — "
+            "the inventory is written at boot after each Skill is registered."
+        )
+    else:
+        # Cost-tier ordering badge — mirrors SkillRegistry._COST_ORDER so
+        # the dashboard renders cheap-first like the (future) PLAN menu.
+        _tier_badge = {
+            "free": ":green[**free**]",
+            "cheap": ":blue[**cheap**]",
+            "expensive": ":orange[**expensive**]",
+        }
+        _tier_order = {"free": 0, "cheap": 1, "expensive": 2}
+        for sk in sorted(
+            skills_inv,
+            key=lambda s: (_tier_order.get(s.get("cost_tier", "expensive"), 99),
+                            s.get("name", "~")),
+        ):
+            name = sk.get("name", "?")
+            desc = sk.get("description", "")
+            tier = sk.get("cost_tier", "cheap")
+            chips = [_tier_badge.get(tier, f"`{tier}`")]
+            if sk.get("requires_network"):
+                chips.append(":violet[**network**]")
+            else:
+                chips.append(":gray[**offline-ok**]")
+            if sk.get("side_effects"):
+                chips.append(":orange[**side-effects**]")
+            else:
+                chips.append(":green[**read-only**]")
+            if sk.get("requires_confirmation"):
+                chips.append(":red[**needs ack**]")
+            with st.expander(
+                f"`{name}` — {desc}  ·  " + " · ".join(chips),
+                expanded=False,
+            ):
+                hints = sk.get("trigger_hints") or []
+                if hints:
+                    st.markdown("**When to pick this skill:**")
+                    for h in hints:
+                        st.markdown(f"- {h}")
+                args = sk.get("args_schema") or {}
+                if not args:
+                    st.caption("(no documented args)")
+                else:
+                    st.markdown("**Arguments:**")
+                    for arg_name, meta in args.items():
+                        req = "required" if meta.get("required") else "optional"
+                        atype = meta.get("type", "any")
+                        adesc = meta.get("desc", "")
+                        line = f"- `{arg_name}` ({atype}, {req})"
+                        if adesc:
+                            line += f" — {adesc}"
+                        st.markdown(line)
+
+        # Recent invocations — newest first. Populated by every dispatch
+        # through `SkillRegistry.invoke(...)`; Brain / Cognition /
+        # Heartbeat / Scheduler all route their searches, recalls and
+        # reflections through the registry, so this feed is the
+        # canonical timeline of what the agent actually used.
+        activity = _read_skills_activity(limit=20)
+        st.markdown("**Recent invocations** (newest first):")
+        if not activity:
+            st.caption(
+                "(no recent invocations — no `state/skills-*.jsonl` siblings yet)"
+            )
+        else:
+            for entry in activity:
+                ok = entry.get("ok", False)
+                badge = "🟢" if ok else "🔴"
+                ts = entry.get("ts", "?")
+                sname = entry.get("skill", "?")
+                ms = entry.get("latency_ms", 0)
+                tools_used = entry.get("tools_used") or []
+                kwargs_keys = entry.get("kwargs_keys") or []
+                err = (entry.get("error") or "").strip()
+                line = (
+                    f"{badge} `{ts}` · **{sname}** · {ms} ms"
+                    f" · tools=[{', '.join(tools_used)}]"
+                    f" · args=[{', '.join(kwargs_keys)}]"
+                )
+                if err:
+                    line += f"\n  └ error: `{err[:120]}`"
+                st.markdown(line)
+
     # ===== Self-reflection feed (proof of self-learning) =====================
     st.divider()
     st.subheader("🪞 Self-reflection feed (last 8)")
     st.caption(
         "Each entry is the agent grading its OWN reply. Recurring `interest` "
         "topics get auto-promoted to LEARNED_PREFERENCES during Sleep "
-        "Metabolism. Source: `state/reflection.jsonl`."
+        "Metabolism. Source: `state/reflection-YYYY-MM-DD.jsonl` (rotated daily)."
     )
     refls = _read_reflection_feed(limit=8)
     if not refls:

@@ -28,25 +28,24 @@ or transmitted — enforcing FUNDAMENTAL_LAW #3 (Positive Anchor).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .emotions import Emotions, EmotionVector
 from .empathy import EmpathyEngine, EmpathyReading
 from .monitor import Monitor, VitalSigns
 from .positive_filter import FilterResult, PositiveFilter
 from .provider import ChatMessage, Provider, ProviderUnavailable
+from .skills import SkillContext, SkillRegistry
 from .soul_handler import SoulHandler
 from .stm import ShortTermMemory
 
 if TYPE_CHECKING:
-    from tools.searxng import SearXNG
     from .cognition import CognitiveLoop, CognitiveTrace
-    from .reflection import ReflectionEngine
     from .scheduler import Task, TaskAction, TaskSpec, TaskUpdate
     from .stm import Turn
 
@@ -297,14 +296,14 @@ class Brain:
         positive_filter: PositiveFilter,
         provider: Provider,
         stm: ShortTermMemory,
-        archive_path: str | Path,
+        skill_registry: SkillRegistry,
+        skill_ctx: SkillContext,
         architect_name: str = "Architect",
         architect_honorific: str = "Boss",
-        searxng: "SearXNG | None" = None,
         web_search_triage_enabled: bool = True,
         ltm_short_circuit_enabled: bool = True,
         ltm_short_circuit_min_score: int = 2,
-        reflection: "ReflectionEngine | None" = None,
+        reflection_enabled: bool = True,
         cognition: "CognitiveLoop | None" = None,
     ) -> None:
         self._soul = soul
@@ -314,19 +313,32 @@ class Brain:
         self._filter = positive_filter
         self._provider = provider
         self._stm = stm
-        self._archive_path = Path(archive_path)
+        # Skill dispatch — every web search / LTM lookup / reflection
+        # goes through the registry. The legacy `searxng=` /
+        # `archive_path=` / `reflection=` kwargs were removed in Phase 2;
+        # the equivalent capability is reached via the registry ("research",
+        # "recall", "self_reflect"). Construction-time gating: callers
+        # can pass `reflection_enabled=False` to suppress the fire-and-
+        # forget self_reflect dispatch when ReflectionEngine isn't wired.
+        self._skill_registry = skill_registry
+        self._skill_ctx = skill_ctx
         self._architect_name = (architect_name or "Architect").strip() or "Architect"
         self._architect_honorific = (architect_honorific or "").strip()
-        self._searxng = searxng
         self._triage_enabled = web_search_triage_enabled
         self._ltm_short_circuit_enabled = bool(ltm_short_circuit_enabled)
         self._ltm_short_circuit_min_score = max(1, int(ltm_short_circuit_min_score))
-        self._reflection = reflection
+        self._reflection_enabled = bool(reflection_enabled)
         self._cognition = cognition
         # Lazy-built once per Brain instance from the live soul.md Designation.
         # soul.md is read async, so we can't build it in __init__; the first
         # call to _maybe_web_search() populates it.
         self._chitchat_re: re.Pattern[str] | None = None
+        # Strong references to background tasks. CPython's event loop only
+        # holds weak refs to tasks created via asyncio.create_task; a task
+        # not referenced elsewhere may be GC'd mid-flight ("Task was
+        # destroyed but it is pending!"). We add tasks here, drop them on
+        # completion, and drain remaining ones in aclose().
+        self._inflight: set[asyncio.Task[Any]] = set()
 
     # ---------- public entry points ------------------------------------------
 
@@ -336,16 +348,40 @@ class Brain:
         # Self-reflection runs in the background — it must NOT delay the reply
         # the connector is about to send. Skip when the provider is offline:
         # there's no real reply to learn from and reflection itself would
-        # just hit the same dead endpoint.
-        if self._reflection is not None and trace.backend != "offline":
-            await self._reflection.fire_and_forget(
-                kind="user",
-                input_text=user_input,
-                response=trace.filtered.text,
-                web_searched="Live SearXNG results" in trace.system_prompt,
-                backend=trace.backend,
+        # just hit the same dead endpoint. Dispatched through the Skill
+        # registry ("self_reflect") so the audit trail and timing land in
+        # state/skills.jsonl alongside every other skill invocation.
+        if self._reflection_enabled and trace.backend != "offline":
+            task = asyncio.create_task(
+                self._skill_registry.invoke(
+                    "self_reflect",
+                    self._skill_ctx,
+                    kind="user",
+                    input_text=user_input,
+                    response=trace.filtered.text,
+                    web_searched="Live SearXNG results" in trace.system_prompt,
+                    backend=trace.backend,
+                )
             )
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
         return trace
+
+    async def aclose(self) -> None:
+        """Drain background `self_reflect` tasks before shutdown.
+
+        `think()` schedules reflection as fire-and-forget so the
+        connector reply isn't delayed. On shutdown we must wait for any
+        still-running reflections to finish their SLM call + JSONL
+        write, otherwise the audit feed and reflection log get partial
+        records when the event loop is torn down. Called by main.py
+        BEFORE skill_registry.aclose_all().
+        """
+        if not self._inflight:
+            return
+        pending = list(self._inflight)
+        log.info("Brain aclose: draining %d background task(s)", len(pending))
+        await asyncio.gather(*pending, return_exceptions=True)
 
     async def proactive_thought(self, mission: str) -> ThoughtTrace:
         """Heartbeat-triggered thought (no human input)."""
@@ -1186,7 +1222,7 @@ class Brain:
         # None when the input doesn't match — falls through to the
         # normal pipeline. Skipped on proactive turns (no user_input).
         if is_user_turn and user_input:
-            shortcut_reply = self._handle_identity_question(
+            shortcut_reply = await self._handle_identity_question(
                 user_input, soul_block, vitals, mood,
             )
             if shortcut_reply is not None:
@@ -1601,7 +1637,7 @@ class Brain:
             return f"{honor} {name}"
         return name or "operator"
 
-    def _handle_identity_question(
+    async def _handle_identity_question(
         self,
         user_input: str,
         soul_block: str,
@@ -1616,6 +1652,13 @@ class Brain:
         config.yaml + live vitals/mood, OR None when the input does NOT
         match any short-circuit pattern (caller falls through to the
         normal cognition / triage / synth pipeline).
+
+        Phase 3.1: `_AGENT_NAME_RE` and `_CREATOR_QUESTION_RE` now
+        delegate to `IdentitySkill` via the registry so the persona
+        block lives in ONE place. The other two branches stay inline
+        because they need vitals/mood/architect-name that the Skill
+        doesn't see. Skill failures fall back to the previous inline
+        templates so this path can never regress.
 
         Important guards:
         * Skipped when the operator explicitly asked to search — they
@@ -1637,6 +1680,9 @@ class Brain:
         op_name = (self._architect_name or "operator").strip() or "operator"
 
         if _AGENT_NAME_RE.search(text):
+            skill_reply = await self._try_identity_skill(kind="name")
+            if skill_reply:
+                return f"{skill_reply.rstrip('.')}, {sal}. Standing by — how can I help?"
             return (
                 f"I'm **{designation}**, {sal}. Standing by — how can I help?"
             )
@@ -1646,6 +1692,12 @@ class Brain:
                 f"this deployment. What can I do for you?"
             )
         if _CREATOR_QUESTION_RE.search(text):
+            skill_reply = await self._try_identity_skill(kind="creator")
+            if skill_reply:
+                return (
+                    f"{skill_reply} Each running instance serves one "
+                    f"Architect; mine is you, {sal}."
+                )
             creator_str = creator or "the OpenCrayFish project author"
             return (
                 f"I was built by **{creator_str}**, the author of the "
@@ -1676,6 +1728,34 @@ class Brain:
                 f"**{mood_label}**. Ready for your next directive."
             )
         return None
+
+    async def _try_identity_skill(self, *, kind: str) -> str | None:
+        """Invoke `IdentitySkill` via the registry; return its summary or None.
+
+        Centralises the registry call + failure handling so the identity
+        shortcut can delegate to a real `Skill` without risking a
+        regression: any exception, missing registry, or non-OK result
+        returns None and the caller falls back to the inline template.
+        """
+        if self._skill_registry is None or self._skill_ctx is None:
+            return None
+        if not self._skill_registry.has("identity"):
+            return None
+        try:
+            result = await self._skill_registry.invoke(
+                "identity", self._skill_ctx, kind=kind,
+            )
+        except Exception:
+            log.exception("CHAT identity-skill dispatch failed kind=%s", kind)
+            return None
+        if not result.ok:
+            log.info(
+                "CHAT identity-skill kind=%s returned ok=False error=%r",
+                kind, (result.error or "")[:120],
+            )
+            return None
+        summary = (result.summary or "").strip()
+        return summary or None
 
     @staticmethod
     def _build_minimal_retry_prompt(
@@ -1754,7 +1834,7 @@ class Brain:
         is bypassed — only an EXPLICIT user request will still trigger a
         search.
         """
-        if user_input is None or self._searxng is None:
+        if user_input is None or not self._skill_registry.has("research"):
             return ""
 
         text = user_input.strip()
@@ -1814,17 +1894,28 @@ class Brain:
         return await self._do_search(decision, reason="triage")
 
     async def _do_search(self, query: str, *, reason: str) -> str:
-        """Run SearXNG and format hits for the system prompt's KNOWLEDGE block."""
+        """Run the `research` Skill and format hits for the system prompt's KNOWLEDGE block.
+
+        Phase 2: dispatches via SkillRegistry instead of touching SearXNG
+        directly. The Skill's `evidence` is iterated here so the output
+        format stays byte-identical to the legacy path (the SLM's prompt
+        is sensitive to the `[i] title\n    URL: url\n    snippet` shape).
+        """
         search_t0 = time.perf_counter()
-        try:
-            results = await self._searxng.search(query, limit=5)  # type: ignore[union-attr]
-        except Exception:
-            log.exception("CHAT search FAILED query=%r reason=%s", query, reason)
+        result = await self._skill_registry.invoke(
+            "research", self._skill_ctx, query=query, limit=5,
+        )
+        search_ms = int((time.perf_counter() - search_t0) * 1000)
+        if not result.ok:
+            log.warning(
+                "CHAT search FAILED query=%r reason=%s error=%s",
+                query, reason, result.error,
+            )
             return (
                 f"(SearXNG query for {query!r} failed — proceed without live web "
                 "results and tell the Architect the search backend is offline.)"
             )
-        search_ms = int((time.perf_counter() - search_t0) * 1000)
+        results = result.evidence
         if not results:
             log.info(
                 "CHAT search EMPTY query=%r reason=%s search_ms=%d",
@@ -1835,15 +1926,17 @@ class Brain:
             return f"(SearXNG returned no results for {query!r}.)"
         lines: list[str] = [f"Query: {query!r}  (trigger: {reason})"]
         for i, r in enumerate(results, 1):
-            snippet = (r.snippet or "").replace("\n", " ").strip()
-            lines.append(f"[{i}] {r.title}\n    URL: {r.url}\n    {snippet}")
+            title = (r.get("title") or "").strip()
+            url = (r.get("url") or "").strip()
+            snippet = (r.get("snippet") or "").replace("\n", " ").strip()
+            lines.append(f"[{i}] {title}\n    URL: {url}\n    {snippet}")
         log.info(
             "CHAT search OK reason=%s query=%r hits=%d search_ms=%d first_url=%s",
             reason,
             query,
             len(results),
             search_ms,
-            results[0].url,
+            (results[0].get("url") or ""),
         )
         return "\n".join(lines)
 
@@ -2069,26 +2162,25 @@ class Brain:
 
         The score is consumed by `_cycle` to decide whether to short-circuit
         the SLM web-search triage — strong LTM hit → skip the web round-trip.
-        """
-        if not self._archive_path.exists() or not query.strip():
-            return "", 0
-        terms = {t for t in query.lower().split() if len(t) > 3}
-        if not terms:
-            return "", 0
 
-        hits: list[tuple[int, str]] = []
-        for line in self._archive_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            score = sum(1 for t in terms if t in stripped.lower())
-            if score:
-                hits.append((score, stripped))
-        if not hits:
+        Phase 2: dispatches via the `recall` Skill instead of reading the
+        archive file directly. The Skill returns evidence sorted by score
+        (`[{"line": str, "score": int}, ...]`); we extract `top_score` and
+        join lines to preserve the legacy `(text, top_score)` shape.
+        """
+        if not query.strip():
             return "", 0
-        hits.sort(key=lambda kv: kv[0], reverse=True)
-        top_score = hits[0][0]
-        text = "\n".join(line for _, line in hits[:5])
+        result = await self._skill_registry.invoke(
+            "recall", self._skill_ctx, query=query, limit=5,
+        )
+        # recall is best-effort: failure (or empty evidence) collapses to
+        # the legacy "no LTM hit" signal so callers branch the same way.
+        if not result.ok or not result.evidence:
+            return "", 0
+        top_score = int(result.evidence[0].get("score", 0) or 0)
+        text = "\n".join(
+            str(e.get("line", "")) for e in result.evidence if e.get("line")
+        )
         return text, top_score
 
 

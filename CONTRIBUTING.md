@@ -37,6 +37,7 @@ Not all contributions are code. The following are equally welcome:
 | Feature proposals | [Issues](https://github.com/easonlai/opencrayfish/issues) using the Feature Request template |
 | Documentation fixes | Direct PR to [README.md](README.md), [CONTRIBUTING.md](CONTRIBUTING.md), or any module docstring |
 | New tools (web, GPIO, MCP, etc.) | New file under [tools/](tools/) implementing the `Tool` protocol |
+| New skills (capability orchestration above Tools) | New file under [core/skills/](core/skills/) implementing the `Skill` protocol |
 | New connectors (Discord, Slack, MCP server, …) | New file under [connectors/](connectors/) |
 | New sensors (BME680, MPU6050, …) | Extension of `VitalSigns` in [core/monitor.py](core/monitor.py) |
 | Hardware port reports (Pi 4, Orange Pi, Jetson Nano, x86 mini-PC) | Open an Issue tagged `hardware-port` with your `state/vitals.json` and `state/deliberation.jsonl` excerpts |
@@ -149,13 +150,27 @@ python -c "from core.config import Config; c = Config.load('config.yaml'); print
 # Every core module imports without side effects
 python -c "from core import brain, heartbeat, cognition, emotions, empathy, monitor, provider, reflection, scheduler, soul_handler, stm, positive_filter; print('imports OK')"
 
-# Tools + connectors import
-python -c "from tools import searxng, registry, base; from connectors import telegram, web_chat; print('tools+connectors OK')"
+# Tools + connectors + skills import
+python -c "from tools import searxng, registry, base, archive_read; from connectors import telegram, web_chat; from core.skills import identity, recall, research, direct_answer, self_reflect, proactive_learning, recurring_research; print('tools+connectors+skills OK')"
+
+# PLAN-stage menu filter matrix (cost-tier cap, offline, stressed)
+python scripts/smoke_phase3_menu.py
+
+# CognitiveLoop dispatch + dynamic menu + degrade paths
+python scripts/smoke_phase3_dispatch.py
+
+# JSONL rotation + reflection skill-failure summary + identity skill
+python scripts/smoke_phase31_rotation_reflection_identity.py
+
+# Dashboard rotation-aware feed readers (fan-out across rotated siblings)
+python scripts/smoke_dashboard_rotation.py
 
 # Pylance check (in VS Code: open the workspace — should show 0 problems)
 ```
 
-If your PR adds a new module, add an import line for it to the smoke checks.
+Each smoke script prints `ALL ... PASSED` on success and exits non-zero on failure, so you can chain them in CI.
+
+If your PR adds a new module, add an import line for it to the smoke checks. If your PR adds a new Skill, register it in `scripts/smoke_phase3_menu.py` and verify the assertions still hold.
 
 ---
 

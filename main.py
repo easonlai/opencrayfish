@@ -11,6 +11,7 @@ import logging.handlers
 import signal
 from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 from connectors.telegram import TelegramConnector
 from connectors.web_chat import WebChatConnector
@@ -25,8 +26,17 @@ from core.positive_filter import PositiveFilter
 from core.provider import Provider
 from core.reflection import ReflectionEngine
 from core.scheduler import TaskScheduler
+from core.skills import CostTier, SkillContext, SkillRegistry
+from core.skills.direct_answer import DirectAnswerSkill
+from core.skills.identity import IdentitySkill
+from core.skills.proactive_learning import ProactiveLearningSkill
+from core.skills.recall import RecallSkill
+from core.skills.recurring_research import RecurringResearchSkill
+from core.skills.research import ResearchSkill
+from core.skills.self_reflect import SelfReflectSkill
 from core.soul_handler import SoulHandler
 from core.stm import ShortTermMemory
+from tools.archive_read import ArchiveRead
 from tools.registry import ToolRegistry
 from tools.searxng import SearXNG
 
@@ -90,6 +100,51 @@ def _publish_tools_inventory(registry: ToolRegistry) -> None:
         log.exception("Failed to publish tools inventory")
 
 
+def _publish_skills_inventory(registry: SkillRegistry) -> None:
+    """Atomically dump the registered skill catalogue to `state/skills.json`.
+
+    Mirror of `_publish_tools_inventory` for the Skill layer. Read by
+    `ui/dashboard.py` so the Skills panel can render cost-tier chips,
+    network/side-effect badges, trigger hints, and the args schema
+    WITHOUT needing access to the live registry object (separate
+    Streamlit process).
+    """
+    out_path = Path("state/skills.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "published_at": datetime.now().isoformat(timespec="seconds"),
+        "skills": [
+            {
+                "name": getattr(s, "name", "?"),
+                "description": getattr(s, "description", ""),
+                "trigger_hints": list(getattr(s, "trigger_hints", []) or []),
+                "args_schema": getattr(s, "args_schema", {}),
+                "cost_tier": getattr(s, "cost_tier", "cheap"),
+                "requires_network": bool(getattr(s, "requires_network", False)),
+                "side_effects": bool(getattr(s, "side_effects", False)),
+                "requires_confirmation": bool(
+                    getattr(s, "requires_confirmation", False)
+                ),
+            }
+            for s in (registry.get(n) for n in registry.names())
+            if s is not None
+        ],
+    }
+    tmp = out_path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(out_path)
+        log.info(
+            "SKILL Published skills inventory to %s (count=%d)",
+            out_path, len(payload["skills"]),
+        )
+    except Exception:
+        log.exception("SKILL Failed to publish skills inventory")
+
+
 async def amain() -> None:
     cfg = Config.load("config.yaml")
 
@@ -142,15 +197,25 @@ async def amain() -> None:
     searxng = SearXNG(base_url=cfg.tools.searxng_url)
 
     # Tool registry. SearXNG is registered as the first plugin
-    # (`name="web_search"`) so future PLAN-stage code can dispatch by name
-    # instead of by typed kwarg. Existing call sites still receive
-    # `searxng=` directly — the registry is purely additive at this point.
+    # (`name="web_search"`) so PLAN-stage code can dispatch by name
+    # instead of by typed kwarg. Brain / CognitiveLoop / Heartbeat /
+    # Scheduler all route their searches through the Skill registry,
+    # which in turn dispatches into this Tool registry — `searxng` is
+    # no longer wired through any constructor.
     tool_registry = ToolRegistry()
     tool_registry.register(searxng)
-    # Publish a small inventory snapshot so the dashboard (separate
-    # process) can render the live tool catalogue without sharing state.
-    # Re-published only on registration changes — see ToolRegistry, the
-    # current registry is static-at-boot so a one-shot dump is enough.
+    # archive_read \u2014 read-only LTM lookup wrapped as a Tool so the
+    # RecallSkill (used by Brain._retrieve_relevant and
+    # CognitiveLoop._do_recall) can invoke it through the registry
+    # instead of touching the file directly. Same archive_path as the
+    # legacy direct readers used, so the canonical snapshot is unchanged.
+    tool_registry.register(ArchiveRead(archive_path=cfg.memory.archive_path))
+    # Re-publish the tools inventory whenever the registry changes so
+    # the dashboard's Tool panel stays accurate even when Phase 2 / 3
+    # registers tools at runtime (e.g. ToolboxSkill discovery).
+    tool_registry.set_change_listener(
+        lambda: _publish_tools_inventory(tool_registry)
+    )
     _publish_tools_inventory(tool_registry)
 
     # Reflection engine — wired into Brain (post-reply) and Heartbeat
@@ -162,6 +227,63 @@ async def amain() -> None:
             timezone=cfg.system.timezone,
         )
 
+    # Skill registry. Every Skill below is registered, published to
+    # state/skills.json for dashboard discoverability, and dispatched
+    # from Brain / CognitiveLoop / Heartbeat / Scheduler via
+    # `skill_registry.invoke(...)`. That gives us per-invocation
+    # timing, JSONL audit (state/skills.jsonl, date-rotated), and
+    # exception isolation for free. The PLAN-stage menu the SLM picks
+    # from is generated dynamically from the registry per turn, so
+    # registering a new Skill with a `plan_verb` extends what the SLM
+    # can choose with zero edits to the orchestrators.
+    #
+    # SkillContext is BUILT ONCE at boot and reused for every
+    # invocation \u2014 it's a frozen dataclass of shared subsystem
+    # references, NOT per-call mutable state.
+    skill_ctx = SkillContext(
+        tools=tool_registry,
+        soul=soul,
+        stm=stm,
+        monitor=monitor,
+        provider=provider,
+        archive_path=cfg.memory.archive_path,
+        designation=cfg.system.individual_designation,
+        architect_name=cfg.system.architect_name,
+        architect_honorific=cfg.system.architect_honorific,
+    )
+    skill_registry = SkillRegistry()
+    # The skill enable-map lets operators opt OUT of specific skills
+    # via config.yaml without code edits. Default (missing key or
+    # True) = register; False = skip.
+    _skill_enabled = cfg.skills.enabled
+
+    def _maybe_register(skill_obj: Any) -> None:
+        if _skill_enabled.get(skill_obj.name, True):
+            skill_registry.register(skill_obj)
+        else:
+            log.info("SKILL %s disabled via cfg.skills.enabled", skill_obj.name)
+
+    _maybe_register(IdentitySkill())
+    _maybe_register(RecallSkill())
+    _maybe_register(DirectAnswerSkill())
+    _maybe_register(ResearchSkill())
+    _maybe_register(ProactiveLearningSkill())
+    _maybe_register(RecurringResearchSkill())
+    # SelfReflectSkill is only useful when ReflectionEngine is alive;
+    # we still register a stub (engine=None) so the dashboard surfaces
+    # the capability, but execute() returns a graceful no-op.
+    _maybe_register(SelfReflectSkill(engine=reflection_engine))
+
+    skill_registry.set_change_listener(
+        lambda: _publish_skills_inventory(skill_registry)
+    )
+    _publish_skills_inventory(skill_registry)
+    log.info(
+        "SKILL Registered %d skill(s): %s",
+        len(skill_registry.names()),
+        ", ".join(skill_registry.names()),
+    )
+
     # Cognitive loop — THINK → PLAN → ACT → REFINE deliberation in front of
     # the final synthesize call. Disabled cleanly when cfg.cognition.enabled
     # is false; Brain then falls back to the legacy single-shot path.
@@ -169,11 +291,22 @@ async def amain() -> None:
     if cfg.cognition.enabled:
         cognitive_loop = CognitiveLoop(
             provider=provider,
-            searxng=searxng,
-            archive_path=cfg.memory.archive_path,
+            skill_registry=skill_registry,
+            skill_ctx=skill_ctx,
+            # Monitor feeds vitals into _active_plan_entries() so a
+            # stressed Pi auto-degrades the PLAN menu to local-only
+            # skills without the operator having to flip a flag.
+            monitor=monitor,
             max_subquestions=cfg.cognition.max_subquestions,
             max_act_rounds=cfg.cognition.max_act_rounds,
             refine_enabled=cfg.cognition.refine_enabled,
+            # PLAN-menu filter knobs sourced from cfg.skills.
+            # cost_tier_cap is the operator baseline; auto_offline_filter
+            # consults provider.is_tripped per-turn so the SLM never
+            # picks SEARCH while SearXNG is unreachable.
+            cost_tier_cap=cast(CostTier, cfg.skills.default_cost_tier_cap),
+            auto_offline_filter=cfg.skills.auto_offline_filter,
+            dispatch_answer_via_skill=cfg.cognition.dispatch_answer_via_skill,
             timezone=cfg.system.timezone,
         )
 
@@ -185,16 +318,14 @@ async def amain() -> None:
         positive_filter=pos_filter,
         provider=provider,
         stm=stm,
-        archive_path=cfg.memory.archive_path,
+        skill_registry=skill_registry,
+        skill_ctx=skill_ctx,
         architect_name=cfg.system.architect_name,
         architect_honorific=cfg.system.architect_honorific,
-        searxng=searxng,
         web_search_triage_enabled=cfg.tools.web_search_triage_enabled,
         ltm_short_circuit_enabled=cfg.tools.ltm_short_circuit_enabled,
         ltm_short_circuit_min_score=cfg.tools.ltm_short_circuit_min_score,
-        reflection=(
-            reflection_engine if cfg.reflection.reflect_on_user_turn else None
-        ),
+        reflection_enabled=cfg.reflection.reflect_on_user_turn,
         cognition=cognitive_loop,
     )
 
@@ -205,7 +336,8 @@ async def amain() -> None:
         monitor=monitor,
         emotions=emotions,
         stm=stm,
-        searxng=searxng,
+        skill_registry=skill_registry,
+        skill_ctx=skill_ctx,
         reflection=(
             reflection_engine if cfg.reflection.reflect_on_proactive else None
         ),
@@ -248,7 +380,8 @@ async def amain() -> None:
         scheduler = TaskScheduler(
             config=cfg,
             brain=brain,
-            searxng=searxng,
+            skill_registry=skill_registry,
+            skill_ctx=skill_ctx,
             heartbeat=heartbeat,
             state_path=cfg.tasks.state_path,
             max_active_tasks=cfg.tasks.max_active_tasks,
@@ -313,6 +446,12 @@ async def amain() -> None:
         await tg_app.stop()
         await tg_app.shutdown()
         await provider.aclose()
+        # Skill registry first — Skills may hold references back into
+        # Tools and want to release them before the tools themselves
+        # close. Order: brain (drain fire-and-forget reflections) →
+        # skills → tools.
+        await brain.aclose()
+        await skill_registry.aclose_all()
         # Tool registry owns the SearXNG client lifecycle now — closing
         # via the registry isolates per-tool failures and will close any
         # additional tools registered in the future without touching this

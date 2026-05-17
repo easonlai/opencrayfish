@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 from .base import Tool, ToolResult
 
@@ -46,6 +46,28 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # Optional callback invoked AFTER any register/unregister so a
+        # dashboard publisher (state/tools.json) can re-snapshot the
+        # catalogue without polling. Mirrors SkillRegistry's pattern.
+        self._change_listener: Callable[[], None] | None = None
+
+    # ---------- registration --------------------------------------------------
+
+    def set_change_listener(self, cb: Callable[[], None] | None) -> None:
+        """Install (or clear with None) a fn called after every
+        register/unregister. Replaces any previous listener — single
+        owner pattern; main.py is currently the only caller."""
+        self._change_listener = cb
+
+    def _notify_change(self) -> None:
+        cb = self._change_listener
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            # A buggy listener must NEVER break registration itself.
+            log.exception("TOOL change_listener raised (continuing)")
 
     # ---------- registration --------------------------------------------------
 
@@ -69,11 +91,15 @@ class ToolRegistry:
             getattr(tool, "side_effects", False),
             getattr(tool, "requires_confirmation", False),
         )
+        self._notify_change()
 
     def unregister(self, name: str) -> Tool | None:
         """Remove and return the tool with this name, or None if absent.
         Does NOT call `aclose()` — caller decides what to do with it."""
-        return self._tools.pop(name, None)
+        removed = self._tools.pop(name, None)
+        if removed is not None:
+            self._notify_change()
+        return removed
 
     # ---------- lookup --------------------------------------------------------
 

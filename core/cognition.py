@@ -21,14 +21,14 @@ The loop returns a `CognitiveTrace`. Brain renders the trace's
 `knowledge_block` into the synthesize prompt — replacing what the legacy
 `_retrieve_relevant + _maybe_web_search` produced for engaged turns.
 
-Every deliberation is appended to `state/deliberation.jsonl` for audit and
-dashboard visibility. Failures never raise — the loop degrades to whatever
-evidence it managed to collect.
+Every deliberation is appended to `state/deliberation.jsonl` (rotated by
+local date with bounded retention) for audit and dashboard visibility.
+Failures never raise — the loop degrades to whatever evidence it managed
+to collect.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import time
@@ -38,9 +38,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from .skills import CostTier, PlanMenuEntry, SkillContext, SkillRegistry
+
 if TYPE_CHECKING:
+    from .monitor import Monitor
     from .provider import Provider
-    from tools.searxng import SearXNG
 
 log = logging.getLogger(__name__)
 
@@ -59,20 +61,48 @@ _QUESTION_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # Plan lines: "Q1: SEARCH \"minions 3 movie\"" | "Q2: RECALL" | "Q3: ANSWER"
-_PLAN_RE = re.compile(
-    r"^\s*Q(?P<idx>\d+)\s*[:\-.)]\s*"
-    r"(?P<verb>RECALL|SEARCH|ANSWER)\b"
-    r"(?:\s*[:\-]?\s*[\"'`]?(?P<query>[^\"'`\n]+?)[\"'`]?\s*)?$",
-    re.IGNORECASE | re.MULTILINE,
+# Phase 3 made the verb list dynamic — the regex is rebuilt per call
+# from the active PlanMenuEntry list (see `_build_plan_regex`). The
+# static fallback below is kept ONLY for the rare case where the
+# registry yields zero entries (we still parse but the runner will
+# refuse unknown verbs).
+#
+# IMPORTANT: the optional query group uses `[^\S\n]*` (horizontal
+# whitespace) NOT `\s*`. Because `\s` includes `\n`, a `\s*` between
+# the verb and the query would let the lazy query capture pull text
+# from the NEXT Q-line, producing a single match that swallows the
+# rest of the plan. `[^\S\n]*` forbids crossing the line boundary so
+# each Q-line stays self-contained.
+_PLAN_RE_TEMPLATE = (
+    r"^[^\S\n]*Q(?P<idx>\d+)[^\S\n]*[:\-.)][^\S\n]*"
+    r"(?P<verb>{verbs})\b"
+    r"(?:[^\S\n]*[:\-]?[^\S\n]*[\"'`]?(?P<query>[^\"'`\n]+?)[\"'`]?[^\S\n]*)?$"
 )
-# Refine output: either "OK" alone, or "GAP: SEARCH \"...\"".
+# Refine output: either "OK" alone, or "GAP: SEARCH \"...\".
 _REFINE_OK_RE = re.compile(r"^\s*OK\b", re.IGNORECASE | re.MULTILINE)
 _REFINE_GAP_RE = re.compile(
     r"^\s*GAP\s*:\s*SEARCH\s*[\"'`]?(?P<query>[^\"'`\n]+?)[\"'`]?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
-_VALID_VERBS = {"RECALL", "SEARCH", "ANSWER"}
+
+def _build_plan_regex(entries: list[PlanMenuEntry]) -> re.Pattern[str]:
+    """Compile the PLAN-line regex from the active verb set.
+
+    Per-call so a Skill registered/unregistered at runtime (e.g. a future
+    MCP-bridge plugin) immediately changes what the parser accepts.
+    Verbs are escaped to defend against an externally-provided Skill
+    choosing an exotic verb character.
+    """
+    if not entries:
+        # Defensive: fall back to a never-matching regex so a misconfigured
+        # registry can't crash the parser. The PLAN loop will then default
+        # every Q to SEARCH via the missing-Q fallback path.
+        verbs = "__NO_VERBS__"
+    else:
+        verbs = "|".join(re.escape(e.verb) for e in entries)
+    pattern = _PLAN_RE_TEMPLATE.format(verbs=verbs)
+    return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
 
 
 # ---------------------------------------------------------------------------
@@ -173,10 +203,18 @@ def _missing_from_haystack(salient: set[str], *texts: str) -> set[str]:
 
 @dataclass(frozen=True)
 class PlanStep:
-    """One sub-question paired with the verb chosen for it."""
+    """One sub-question paired with the verb chosen for it.
+
+    `skill_name` is the registry key the verb resolves to at parse time.
+    The ACT runner dispatches via
+    `skill_registry.invoke(skill_name, ...)` instead of switching on
+    `verb`. `verb` is the SLM-facing UPPER token kept for logging and
+    deliberation audit byte-identical to legacy traces.
+    """
     sub_q: str
-    verb: str               # RECALL | SEARCH | ANSWER
-    query: str = ""         # populated only for SEARCH
+    verb: str               # SLM-facing UPPER token, e.g. "SEARCH"
+    query: str = ""         # populated only for verbs with a query arg
+    skill_name: str = ""    # registry key resolved from verb ("" = noop)
 
 
 @dataclass
@@ -224,26 +262,111 @@ class CognitiveLoop:
         self,
         *,
         provider: "Provider",
-        searxng: "SearXNG | None",
-        archive_path: str | Path,
+        skill_registry: SkillRegistry,
+        skill_ctx: SkillContext,
+        monitor: "Monitor | None" = None,
         max_subquestions: int = 3,
         max_act_rounds: int = 2,    # 1 = no refine; 2 = one refine allowed
         refine_enabled: bool = True,
+        cost_tier_cap: CostTier = "expensive",
+        auto_offline_filter: bool = True,
+        dispatch_answer_via_skill: bool = False,
         feed_path: Path | str = DELIBERATION_FEED,
+        feed_retain_days: int = 14,
         timezone: str = "UTC",
     ) -> None:
         from .provider import ChatMessage  # local import to avoid cycle on type stub
+        from .jsonl_writer import RotatingJsonlWriter
         self._ChatMessage = ChatMessage
 
         self._provider = provider
-        self._searxng = searxng
-        self._archive_path = Path(archive_path)
+        # Skill dispatch — every verb in the PLAN menu resolves to a
+        # Skill at parse time and dispatches via the registry in ACT.
+        # The PLAN menu itself is generated from
+        # `SkillRegistry.plan_menu(...)`, so registering a new Skill
+        # with a `plan_verb` automatically extends what the SLM can
+        # pick — no edits to this file required.
+        self._skill_registry = skill_registry
+        self._skill_ctx = skill_ctx
+        # Monitor is OPTIONAL. When provided, `_active_plan_entries()`
+        # consults vital signs to auto-degrade the PLAN menu (stressed
+        # vitals → cap to 'cheap', no expensive web calls). When None,
+        # the cap comes from `cost_tier_cap` unchanged.
+        self._monitor = monitor
         self._max_subq = max(1, min(int(max_subquestions), 5))
         self._max_rounds = max(1, min(int(max_act_rounds), 3))
         self._refine_enabled = bool(refine_enabled) and self._max_rounds >= 2
+        # PLAN menu filter knobs. `cost_tier_cap` is the OPERATOR
+        # baseline (config-driven); `_active_plan_entries()` may tighten
+        # it further at runtime based on vitals. `auto_offline_filter`
+        # consults `provider.is_tripped` per turn so the SLM never picks
+        # a network skill while the circuit-breaker is open.
+        self._cost_tier_cap: CostTier = cost_tier_cap
+        self._auto_offline_filter = bool(auto_offline_filter)
+        # When True, ANSWER verb actually runs `direct_answer` Skill
+        # (one extra SLM call per ANSWER step) and surfaces the reply
+        # as evidence. When False (legacy), ANSWER is a marker that
+        # tells synth "no retrieval needed" — no extra SLM call.
+        self._dispatch_answer_via_skill = bool(dispatch_answer_via_skill)
         self._feed_path = Path(feed_path)
         self._feed_path.parent.mkdir(parents=True, exist_ok=True)
+        # Deliberation traces rotate by local date with bounded
+        # retention. Deliberations are bigger than skill audit
+        # rows (whole THINK/PLAN/ACT/REFINE payload), so default to a
+        # shorter retention window than the skill feed.
+        self._feed_writer = RotatingJsonlWriter(
+            self._feed_path,
+            retain_days=feed_retain_days,
+            tz=timezone,
+        )
         self._tz = ZoneInfo(timezone)
+
+    # ---------- PLAN-menu plumbing -------------------------------------------
+
+    async def _active_plan_entries(self) -> list[PlanMenuEntry]:
+        """Compute the verb menu the PLAN stage should offer THIS turn.
+
+        Pulls two runtime signals into the registry filter:
+
+          1. **Provider circuit-breaker** — when `auto_offline_filter`
+             is on (default) and `provider.is_tripped` is True, drop
+             every skill with `requires_network=True` so the SLM
+             never picks SEARCH while we can't reach SearXNG.
+
+          2. **Vitals stress** — when a Monitor is wired and reports
+             `is_stressed=True`, tighten the cost-tier cap to 'cheap'
+             so the loop stays local (no expensive web round-trips
+             while the Pi is thermally throttling or RAM-starved).
+
+        Both signals OVERRIDE the operator-configured baseline cap;
+        never RELAX it (a stressed Pi never gets MORE permissions).
+        """
+        cap: CostTier = self._cost_tier_cap
+        exclude_network = False
+
+        if self._auto_offline_filter and getattr(self._provider, "is_tripped", False):
+            exclude_network = True
+
+        if self._monitor is not None:
+            try:
+                vitals = await self._monitor.sample()
+                if getattr(vitals, "is_stressed", False):
+                    # Tighten to 'cheap' only if the operator wasn't
+                    # already restricting harder (don't promote 'free').
+                    if cap == "expensive":
+                        cap = "cheap"
+            except Exception:
+                log.exception("CHAT cognition vitals sample failed (keeping cap=%s)", cap)
+
+        entries = self._skill_registry.plan_menu(
+            cost_tier_cap=cap,
+            exclude_network=exclude_network,
+        )
+        log.debug(
+            "CHAT cognition plan_menu cap=%s exclude_network=%s entries=%s",
+            cap, exclude_network, [e.verb for e in entries],
+        )
+        return entries
 
     # ---------- public entry --------------------------------------------------
 
@@ -280,7 +403,7 @@ class CognitiveLoop:
                 trace.engaged = False
                 trace.bypass_reason = "think_empty"
                 trace.total_ms = int((time.perf_counter() - t0) * 1000)
-                self._persist(trace)
+                await self._persist(trace)
                 return trace
             trace.intent = intent
             trace.sub_questions = subqs
@@ -313,11 +436,12 @@ class CognitiveLoop:
                 )
                 if decision.upper().startswith("GAP"):
                     gap_q = self._extract_gap_query(decision)
-                    if gap_q and self._searxng is not None:
+                    if gap_q and self._skill_registry.has("research"):
                         gap_step = PlanStep(
                             sub_q=f"(refine) {gap_q}",
                             verb="SEARCH",
                             query=gap_q,
+                            skill_name="research",
                         )
                         trace.plan.append(gap_step)
                         more = await self._stage_act([gap_step])
@@ -337,7 +461,7 @@ class CognitiveLoop:
                 "CHAT cognition done engaged=%s rounds=%d evidence=%d total_ms=%d",
                 trace.engaged, trace.refine_rounds, len(trace.evidence), trace.total_ms,
             )
-            self._persist(trace)
+            await self._persist(trace)
         return trace
 
     # ---------- stages --------------------------------------------------------
@@ -459,19 +583,53 @@ class CognitiveLoop:
     async def _stage_plan(
         self, intent: str, subqs: list[str], *, user_input: str = ""
     ) -> list[PlanStep]:
-        """SLM call #2: assign one verb to each sub-question."""
+        """SLM call #2: assign one verb to each sub-question.
+
+        The verb menu is built dynamically from
+        `SkillRegistry.plan_menu(...)` so registering a new Skill (with
+        a `plan_verb`) automatically extends what the SLM can pick.
+        Filters (cost-tier cap, exclude-network) are recomputed every
+        turn from vitals + provider circuit-breaker state, so a
+        stressed Pi or an offline SearXNG immediately drops options
+        the SLM otherwise wastes a turn picking.
+        """
+        entries = await self._active_plan_entries()
+        verb_to_skill: dict[str, PlanMenuEntry] = {e.verb: e for e in entries}
+        plan_re = _build_plan_regex(entries)
+        # Render the menu block from entries. Each line:
+        #   `  VERB [arg-hint]  - description`
+        # Width-padded to 26 chars before the dash so the menu lines up
+        # visually — small SLMs anchor on column alignment as a
+        # "this is a list" cue.
+        menu_lines: list[str] = []
+        for e in entries:
+            head = e.verb if not e.arg_hint else f"{e.verb} {e.arg_hint}"
+            menu_lines.append(f"  {head:<26} - {e.description}")
+        menu_block = "\n".join(menu_lines) if menu_lines else "  (no skills available)"
+        # Default fallback verb for missing-Q recovery: prefer the
+        # research/SEARCH-style verb (network-aware) when present,
+        # else the first available verb in the menu, else legacy "SEARCH".
+        fallback_verb: str = "SEARCH"
+        fallback_skill: str = "research"
+        for e in entries:
+            if e.has_query_arg:
+                fallback_verb = e.verb
+                fallback_skill = e.skill_name
+                break
+        else:
+            if entries:
+                fallback_verb = entries[0].verb
+                fallback_skill = entries[0].skill_name
         system = (
             "You are the PLAN stage of an agent cognitive loop. For EACH\n"
             "sub-question shown below, output ONE line that picks ONE verb\n"
-            "from this fixed menu:\n\n"
-            "  RECALL                   - search the agent's local memory archive\n"
-            "  SEARCH \"<3-8 keywords>\"  - issue a live web search via SearXNG\n"
-            "  ANSWER                   - the small SLM can answer from training data\n"
+            "from this menu:\n\n"
+            f"{menu_block}\n"
             "\n"
             "OUTPUT FORMAT (follow EXACTLY — one line per Q, in order, no\n"
             "prose, no explanation, no preface):\n"
-            "  Q1: <VERB> [\"<query>\" if SEARCH]\n"
-            "  Q2: <VERB> [\"<query>\" if SEARCH]\n"
+            "  Q1: <VERB> [\"<query>\" if the verb takes one]\n"
+            "  Q2: <VERB> [\"<query>\" if the verb takes one]\n"
             "\n"
             "Format examples (study the FORMAT only — these are abstract\n"
             "patterns with placeholders, NOT topics to copy):\n"
@@ -521,37 +679,53 @@ class CognitiveLoop:
                 return user_input
             return sub_q
 
-        for m in _PLAN_RE.finditer(raw or ""):
+        for m in plan_re.finditer(raw or ""):
             idx = int(m.group("idx"))
             if idx in seen_idx or idx < 1 or idx > len(subqs):
                 continue
             verb = m.group("verb").upper()
-            if verb not in _VALID_VERBS:
+            entry = verb_to_skill.get(verb)
+            if entry is None:
                 continue
             query = (m.group("query") or "").strip().strip("\"'`,;.")
-            if verb != "SEARCH":
+            if not entry.has_query_arg:
                 query = ""
             elif not query:
-                # SEARCH without a query → fall back to keyword-extracted form
-                # of the user's literal message (single-Q case) or the sub_q
-                # (multi-part case). Better than dropping the step OR sending
-                # a full English sentence to SearXNG.
+                # Query-arg verb without a query → fall back to keyword-
+                # extracted form of the user's literal message (single-Q
+                # case) or the sub_q (multi-part case). Better than
+                # dropping the step OR sending a full English sentence to
+                # the underlying tool.
                 query = self._keywordize(_fallback_kw_source(idx, subqs[idx - 1]))
-            plan.append(PlanStep(sub_q=subqs[idx - 1], verb=verb, query=query))
+            plan.append(PlanStep(
+                sub_q=subqs[idx - 1],
+                verb=entry.verb,
+                query=query,
+                skill_name=entry.skill_name,
+            ))
             seen_idx.add(idx)
         # Fill in any sub-questions the SLM forgot to plan for. Default verb
-        # is SEARCH (safer than ANSWER for an unplanned question). When PLAN
-        # missed Q1 in a single-question turn, prefer the user's literal
-        # message over the THINK-derived sub_q so a contaminated THINK can
-        # never poison the search query.
+        # is the registry's network-aware verb (typically SEARCH); if the
+        # network was filtered out we use the first available verb. When
+        # PLAN missed Q1 in a single-question turn, prefer the user's
+        # literal message over the THINK-derived sub_q so a contaminated
+        # THINK can never poison the search query.
         for i, q in enumerate(subqs, start=1):
             if i in seen_idx:
                 continue
-            log.info("CHAT cognition PLAN missing Q%d → defaulting to SEARCH", i)
+            log.info(
+                "CHAT cognition PLAN missing Q%d → defaulting to %s",
+                i, fallback_verb,
+            )
+            fallback_entry = verb_to_skill.get(fallback_verb)
+            fallback_needs_query = (
+                fallback_entry.has_query_arg if fallback_entry else True
+            )
             plan.append(PlanStep(
                 sub_q=q,
-                verb="SEARCH",
-                query=self._keywordize(_fallback_kw_source(i, q)),
+                verb=fallback_verb,
+                query=self._keywordize(_fallback_kw_source(i, q)) if fallback_needs_query else "",
+                skill_name=fallback_skill,
             ))
         return plan
 
@@ -577,17 +751,57 @@ class CognitiveLoop:
         return evidence
 
     async def _run_step(self, step: PlanStep) -> Evidence:
+        """Execute one PlanStep by dispatching its resolved Skill.
+
+        Dispatch table is `step.skill_name`. The verb (`SEARCH`
+        / `RECALL` / `ANSWER`) is kept on the step for logging and
+        deliberation-audit byte-identity with legacy traces, but the
+        runner no longer cares about it — the registry key is the
+        authoritative dispatch handle.
+
+        Three known shapes (legacy verbs) get bespoke formatting so the
+        synth prompt is byte-identical across releases. Any future
+        Skill with a `plan_verb` (e.g. an MCP-bridged tool) gets a
+        generic `summary`-based dispatch.
+        """
         t0 = time.perf_counter()
-        if step.verb == "SEARCH":
+        skill_name = step.skill_name
+        if skill_name == "research":
             content, hits = await self._do_search(step.query or step.sub_q)
-        elif step.verb == "RECALL":
-            content, hits = self._do_recall(step.sub_q)
-        else:  # ANSWER — no retrieval, synthesize will lean on SLM training data
-            content, hits = ("(SLM training data only — no retrieval performed)", 0)
+        elif skill_name == "recall":
+            content, hits = await self._do_recall(step.sub_q)
+        elif skill_name == "direct_answer":
+            if self._dispatch_answer_via_skill:
+                content, hits = await self._do_direct_answer(step.sub_q)
+            else:
+                # Legacy ANSWER semantic: no retrieval performed, synth
+                # leans on the SLM's training data. The string is a
+                # marker for the synth prompt's KNOWLEDGE block.
+                content, hits = (
+                    "(SLM training data only — no retrieval performed)", 0,
+                )
+        elif skill_name and self._skill_registry.has(skill_name):
+            # Generic dispatch path for any registered Skill that
+            # exposes a `plan_verb` but isn't one of the three legacy
+            # verbs. We invoke with query=step.query|sub_q and surface
+            # the Skill's `summary` directly into the evidence content.
+            content, hits = await self._do_generic_skill(
+                skill_name, step.query or step.sub_q,
+            )
+        else:
+            # Empty skill_name or unknown name — degrade to ANSWER's
+            # no-op marker rather than failing the whole turn.
+            log.warning(
+                "CHAT cognition unknown skill_name=%r verb=%r — treating as ANSWER no-op",
+                skill_name, step.verb,
+            )
+            content, hits = (
+                "(SLM training data only — no retrieval performed)", 0,
+            )
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         log.info(
-            "CHAT cognition stage=ACT verb=%s sub_q=%r query=%r hits=%d elapsed_ms=%d",
-            step.verb, step.sub_q[:60], step.query[:80], hits, elapsed_ms,
+            "CHAT cognition stage=ACT verb=%s skill=%s sub_q=%r query=%r hits=%d elapsed_ms=%d",
+            step.verb, skill_name, step.sub_q[:60], step.query[:80], hits, elapsed_ms,
         )
         return Evidence(
             sub_q=step.sub_q, verb=step.verb, query=step.query,
@@ -646,48 +860,100 @@ class CognitiveLoop:
     # ---------- verb runners --------------------------------------------------
 
     async def _do_search(self, query: str) -> tuple[str, int]:
-        """SEARCH verb: SearXNG. Returns (formatted_text, hit_count)."""
-        if self._searxng is None:
+        """SEARCH verb: dispatches the `research` Skill. Returns (formatted_text, hit_count).
+
+        Routes through the registry rather than touching SearXNG
+        directly. The result's `evidence` (list of `{title, url, snippet}`
+        dicts) is iterated here so the formatted block stays byte-identical
+        to the legacy `- title (url)\n  snippet` shape the SLM expects.
+        """
+        if not self._skill_registry.has("research"):
             return ("(no SearXNG configured)", 0)
         q = (query or "").strip()
         if not q:
             return ("(empty query)", 0)
-        try:
-            results = await self._searxng.search(q, limit=5)
-        except Exception as exc:
-            log.warning("CHAT cognition SEARCH failed q=%r: %s", q[:80], exc)
-            return (f"(search failed: {exc.__class__.__name__})", 0)
+        result = await self._skill_registry.invoke(
+            "research", self._skill_ctx, query=q, limit=5,
+        )
+        if not result.ok:
+            log.warning(
+                "CHAT cognition SEARCH failed q=%r: %s", q[:80], result.error or "?",
+            )
+            return (f"(search failed: {result.error or 'unknown'})", 0)
+        results = result.evidence
         if not results:
             return ("(no results)", 0)
         lines = [f"Query: {q!r}"]
         for r in results:
-            title = (r.title or "").strip()
-            url = (r.url or "").strip()
-            snippet = (r.snippet or "").strip().replace("\n", " ")[:240]
+            title = (r.get("title") or "").strip()
+            url = (r.get("url") or "").strip()
+            snippet = (r.get("snippet") or "").strip().replace("\n", " ")[:240]
             lines.append(f"- {title} ({url})\n  {snippet}")
         return ("\n".join(lines), len(results))
 
-    def _do_recall(self, sub_q: str) -> tuple[str, int]:
-        """RECALL verb: keyword-overlap search against archive.md."""
-        if not self._archive_path.exists():
-            return ("(archive empty)", 0)
-        q = (sub_q or "").lower()
-        terms = {t for t in q.split() if len(t) > 3}
-        if not terms:
+    async def _do_recall(self, sub_q: str) -> tuple[str, int]:
+        """RECALL verb: dispatches the `recall` Skill (keyword overlap vs archive.md).
+
+        Routes through the registry. The Skill returns evidence
+        sorted by score (`[{"line": str, "score": int}, ...]`); we keep
+        the legacy `- {line}` bullet format byte-identical so the synth
+        prompt is unchanged.
+        """
+        q = (sub_q or "").strip()
+        if not q:
             return ("(no recallable terms)", 0)
-        hits: list[tuple[int, str]] = []
-        for line in self._archive_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            score = sum(1 for t in terms if t in stripped.lower())
-            if score:
-                hits.append((score, stripped))
-        if not hits:
+        result = await self._skill_registry.invoke(
+            "recall", self._skill_ctx, query=q, limit=5,
+        )
+        if not result.ok or not result.evidence:
             return ("(no archive matches)", 0)
-        hits.sort(key=lambda kv: kv[0], reverse=True)
-        top = [line for _, line in hits[:5]]
-        return ("\n".join(f"- {line}" for line in top), len(top))
+        lines = [str(e.get("line", "")) for e in result.evidence if e.get("line")]
+        if not lines:
+            return ("(no archive matches)", 0)
+        return ("\n".join(f"- {line}" for line in lines), len(lines))
+
+    async def _do_direct_answer(self, sub_q: str) -> tuple[str, int]:
+        """ANSWER verb (opt-in): dispatch the `direct_answer` Skill.
+
+        Off by default to preserve byte-identical legacy behavior
+        (where ANSWER is a no-op marker telling synth not to bother
+        retrieving). Operators flip `dispatch_answer_via_skill=True`
+        when they want the SLM's per-sub-question answer surfaced as
+        evidence in the synth KNOWLEDGE block.
+        """
+        q = (sub_q or "").strip()
+        if not q:
+            return ("(empty sub-question)", 0)
+        result = await self._skill_registry.invoke(
+            "direct_answer", self._skill_ctx, query=q,
+        )
+        if not result.ok or not result.summary.strip():
+            return ("(SLM training data only — no retrieval performed)", 0)
+        text = result.summary.strip().replace("\n", " ")
+        # Cap to keep one ANSWER step from dominating the synth budget.
+        if len(text) > 320:
+            text = text[:317].rstrip() + "..."
+        return (f"- {text}", 1)
+
+    async def _do_generic_skill(self, skill_name: str, query: str) -> tuple[str, int]:
+        """Generic dispatch for any registered Skill that declared `plan_verb`.
+
+        Falls back to the Skill's `summary` field (every Skill must
+        produce one) and the count of evidence entries it returned.
+        Failures degrade to a clear marker so synth knows the step
+        didn't bring useful evidence.
+        """
+        q = (query or "").strip()
+        result = await self._skill_registry.invoke(
+            skill_name, self._skill_ctx, query=q,
+        )
+        if not result.ok:
+            return (f"(skill {skill_name!r} failed: {result.error or 'unknown'})", 0)
+        summary = (result.summary or "").strip()
+        hits = len(result.evidence)
+        if not summary:
+            return (f"(skill {skill_name!r} returned no summary)", hits)
+        return (summary, hits)
 
     # ---------- helpers -------------------------------------------------------
 
@@ -789,10 +1055,6 @@ class CognitiveLoop:
     def _indent(text: str, prefix: str) -> str:
         return "\n".join(prefix + ln for ln in (text or "").splitlines() if ln)
 
-    def _persist(self, trace: CognitiveTrace) -> None:
-        """Append the trace to the deliberation feed (non-blocking on errors)."""
-        try:
-            with self._feed_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(trace.to_jsonable(), ensure_ascii=False) + "\n")
-        except Exception:
-            log.exception("CHAT cognition persist FAILED feed=%s", self._feed_path)
+    async def _persist(self, trace: CognitiveTrace) -> None:
+        """Append the trace via the date-rotating writer (never raises)."""
+        await self._feed_writer.append(trace.to_jsonable())

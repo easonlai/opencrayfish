@@ -195,3 +195,40 @@ tasks:
   # How often the scheduler wakes to check for due tasks. Aligned with
   # heartbeat for cache friendliness; lower = more responsive add_task.
   tick_seconds: 30
+
+skills:
+  # Skill layer — capability registry above Tools. Each Skill is a
+  # named capability the agent can pick (Cognitive Loop PLAN stage),
+  # the Heartbeat can trigger (proactive_learning), or the Scheduler
+  # can fire (recurring_research). See `core/skills/` for the shipping
+  # set and `core/skills/base.py` for the plugin contract. Adding a
+  # new capability = one Skill class + (optionally) one Tool class —
+  # no Brain / Cognition / Heartbeat / Scheduler changes required.
+  #
+  # PHASE 1 NOTE: The knobs below describe the Phase 2 semantics. In
+  # Phase 1 the SkillRegistry is built and the catalogue published to
+  # state/skills.json for dashboard discoverability, but the SLM PLAN
+  # menu and dispatch still go through the legacy hardcoded path. The
+  # config is shipped now so operators can opt into Phase 2 with zero
+  # config churn later.
+  #
+  # Cost-tier cap for SLM-driven Skill picks. Skills above this tier
+  # are filtered out of the (future) PLAN menu. Useful for clamping
+  # budget when vitals are stressed.
+  #   free      — only pure-compute skills (identity)
+  #   cheap     — free + local-I/O (recall, direct_answer, self_reflect)
+  #   expensive — all skills allowed (research, proactive_learning, …)
+  default_cost_tier_cap: "expensive"
+  # When Provider's circuit breaker reports offline, auto-drop skills
+  # with requires_network=true from the PLAN menu so the SLM doesn't
+  # waste a turn picking something we can't execute.
+  auto_offline_filter: true
+  # Per-skill enable/disable. Keys are skill names. Omit a key to use
+  # the skill's default registration. Set to `false` to forcibly hide
+  # a skill (it won't be registered at boot at all).
+  enabled: {}
+  # Example: opt out of self_reflect on a deployment that doesn't need
+  # the audit trail. Uncomment and customise as needed.
+  # enabled:
+  #   self_reflect: false
+  #   research: true

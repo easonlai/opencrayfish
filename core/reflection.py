@@ -16,10 +16,13 @@ the agent's own output and emits a structured `ReflectionEntry`:
         "backend": <model id that produced the answer>
     }
 
-All entries are appended (newline-delimited JSON) to `state/reflection.jsonl`
+All entries are appended (newline-delimited JSON) to
+`state/reflection.jsonl` (rotated by local date with bounded retention)
 for permanent audit. During Sleep Metabolism, the heartbeat consolidates
-recurring `interest` topics into LEARNED_PREFERENCES and recurring `lesson`
-themes into EMOTIONAL_EVOLUTION — this is the closed self-learning loop.
+recurring `interest` topics into LEARNED_PREFERENCES, recurring `lesson`
+themes into EMOTIONAL_EVOLUTION, and chronic Skill failures (from
+`state/skills.jsonl`) into EMOTIONAL_EVOLUTION as well — this is the
+closed self-learning loop.
 
 The engine never raises; failures are logged and produce no entry.
 """
@@ -44,6 +47,10 @@ REFLECTION_FEED: Path = Path("state/reflection.jsonl")
 # Rejected payloads land here so the operator can audit *why* a turn produced
 # no reflection (instead of just disappearing). One JSONL line per drop.
 REFLECTION_DROPPED_FEED: Path = Path("state/reflection_dropped.jsonl")
+# Phase 3.1: ReflectionEngine reads the skill-invocation audit feed during
+# Sleep Metabolism consolidation so the agent can spot recurring Skill
+# failures (e.g. SearXNG unreachable for the last 24 h) and act on them.
+SKILLS_AUDIT_FEED: Path = Path("state/skills.jsonl")
 
 # Tolerant key scanner: finds each KEY: anywhere in the raw text (not just at
 # line start). Each field's value is everything between this key and the next
@@ -80,14 +87,42 @@ class ReflectionEngine:
         provider: "Provider",
         timezone: str = "UTC",
         feed_path: Path | str = REFLECTION_FEED,
+        dropped_feed_path: Path | str = REFLECTION_DROPPED_FEED,
+        skills_feed_path: Path | str = SKILLS_AUDIT_FEED,
+        retain_days: int = 60,
     ) -> None:
         from .provider import ChatMessage  # local import; avoid cycle on type stub
+        from .jsonl_writer import RotatingJsonlWriter
 
         self._provider = provider
         self._ChatMessage = ChatMessage
         self._tz = ZoneInfo(timezone)
         self._feed_path = Path(feed_path)
         self._feed_path.parent.mkdir(parents=True, exist_ok=True)
+        self._dropped_feed_path = Path(dropped_feed_path)
+        self._dropped_feed_path.parent.mkdir(parents=True, exist_ok=True)
+        # Phase 3.1: rotate both feeds by local date with bounded
+        # retention. Reflections drive Sleep Metabolism consolidation,
+        # so the window must be longer than the consolidation lookback
+        # (currently 24 h) by a comfortable margin.
+        self._writer = RotatingJsonlWriter(
+            self._feed_path,
+            retain_days=retain_days,
+            tz=timezone,
+        )
+        self._dropped_writer = RotatingJsonlWriter(
+            self._dropped_feed_path,
+            retain_days=retain_days,
+            tz=timezone,
+        )
+        # Skills audit feed is OWNED by SkillRegistry (which writes
+        # through its own RotatingJsonlWriter). ReflectionEngine only
+        # READS sibling rotated files for the Sleep Metabolism summary.
+        self._skills_reader = RotatingJsonlWriter(
+            Path(skills_feed_path),
+            retain_days=0,   # never sweep — we're a reader, not the owner
+            tz=timezone,
+        )
 
     # ---------- public surface ------------------------------------------------
 
@@ -169,19 +204,109 @@ class ReflectionEngine:
     # ---------- reading (used by heartbeat for consolidation) ----------------
 
     def read_recent(self, since: datetime | None = None) -> list[ReflectionEntry]:
-        if not self._feed_path.exists():
-            return []
+        """Return reflection entries newer than `since`.
+
+        Reads BOTH the legacy single-file feed (if present, for backwards
+        compatibility with sites that still have the un-rotated file) AND
+        every rotated sibling produced by `RotatingJsonlWriter`. Entries
+        with malformed JSON or missing keys are silently skipped — the
+        consolidator must keep working even if a partial line ever lands
+        on disk during an unclean shutdown.
+        """
+        paths: list[Path] = list(self._writer.sibling_paths())
+        if self._feed_path.exists() and self._feed_path not in paths:
+            paths.append(self._feed_path)
         out: list[ReflectionEntry] = []
-        for line in self._feed_path.read_text(encoding="utf-8").splitlines():
+        for p in paths:
             try:
-                d = json.loads(line)
-                ts = datetime.fromisoformat(d["ts"])
-                if since is not None and ts < since:
-                    continue
-                out.append(ReflectionEntry(**d))
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except OSError:
                 continue
+            for line in lines:
+                try:
+                    d = json.loads(line)
+                    ts = datetime.fromisoformat(d["ts"])
+                    if since is not None and ts < since:
+                        continue
+                    out.append(ReflectionEntry(**d))
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+        out.sort(key=lambda e: e.ts)
         return out
+
+    def read_recent_skills(
+        self, since: datetime | None = None,
+    ) -> list[dict]:
+        """Return Skill audit rows newer than `since` (raw dicts).
+
+        Owned by `SkillRegistry`; ReflectionEngine only reads. The shape
+        matches the registry's `_audit()` payload:
+            {ts, skill, ok, latency_ms, tools_used, kwargs_keys, error}
+        Tolerant of legacy/rotated files just like `read_recent` above.
+        """
+        legacy = self._skills_reader.base_path
+        paths: list[Path] = list(self._skills_reader.sibling_paths())
+        if legacy.exists() and legacy not in paths:
+            paths.append(legacy)
+        out: list[dict] = []
+        for p in paths:
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    d = json.loads(line)
+                    ts_str = d.get("ts")
+                    if not ts_str:
+                        continue
+                    if since is not None and datetime.fromisoformat(ts_str) < since:
+                        continue
+                    out.append(d)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+        out.sort(key=lambda e: e.get("ts", ""))
+        return out
+
+    def summarise_skills_recent(
+        self, since: datetime | None = None,
+    ) -> dict[str, dict]:
+        """Aggregate recent Skill invocations into a per-skill summary.
+
+        Returns ``{skill_name: {total, ok, failed, fail_rate,
+        avg_latency_ms, last_error}}`` for every Skill seen since the
+        cutoff. Used by Sleep Metabolism to detect systemic failures
+        (e.g. SearXNG unreachable, RAG corpus broken) and surface them
+        in soul.md so the agent remembers what went wrong.
+        """
+        rows = self.read_recent_skills(since=since)
+        agg: dict[str, dict] = {}
+        for r in rows:
+            name = str(r.get("skill") or "?")
+            slot = agg.setdefault(name, {
+                "total": 0, "ok": 0, "failed": 0,
+                "latency_sum": 0, "last_error": "",
+            })
+            slot["total"] += 1
+            if r.get("ok"):
+                slot["ok"] += 1
+            else:
+                slot["failed"] += 1
+                err = (r.get("error") or "").strip()
+                if err:
+                    slot["last_error"] = err[:200]
+            try:
+                slot["latency_sum"] += int(r.get("latency_ms") or 0)
+            except (TypeError, ValueError):
+                pass
+        # Finalise computed fields. Done after the pass so we never
+        # divide-by-zero mid-loop.
+        for slot in agg.values():
+            total = slot["total"] or 1
+            slot["avg_latency_ms"] = round(slot["latency_sum"] / total, 1)
+            slot["fail_rate"] = round(slot["failed"] / total, 3)
+            del slot["latency_sum"]
+        return agg
 
     # ---------- internals -----------------------------------------------------
 
@@ -295,13 +420,7 @@ class ReflectionEngine:
         }
 
     async def _persist(self, entry: ReflectionEntry) -> None:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._append_blocking, entry)
-
-    def _append_blocking(self, entry: ReflectionEntry) -> None:
-        self._feed_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._feed_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+        await self._writer.append(asdict(entry))
 
     async def _persist_dropped(
         self,
@@ -331,16 +450,7 @@ class ReflectionEngine:
             "reason": reason,
             "raw": raw[:2000],
         }
-        loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(
-                None, self._append_dropped_blocking, record
-            )
-        except Exception:  # never block the caller for a sidecar write
+            await self._dropped_writer.append(record)
+        except Exception:  # writer never raises; belt-and-braces
             log.exception("Failed to persist dropped reflection record")
-
-    @staticmethod
-    def _append_dropped_blocking(record: dict) -> None:
-        REFLECTION_DROPPED_FEED.parent.mkdir(parents=True, exist_ok=True)
-        with REFLECTION_DROPPED_FEED.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")

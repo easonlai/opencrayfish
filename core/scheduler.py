@@ -53,11 +53,12 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from .skills import SkillContext, SkillRegistry
+
 if TYPE_CHECKING:
     from .brain import Brain
     from .config import Config
     from .heartbeat import Heartbeat
-    from tools.searxng import SearXNG, SearchResult
 
 log = logging.getLogger(__name__)
 
@@ -443,7 +444,8 @@ class TaskScheduler:
         *,
         config: "Config",
         brain: "Brain",
-        searxng: "SearXNG",
+        skill_registry: SkillRegistry,
+        skill_ctx: SkillContext,
         heartbeat: "Heartbeat",
         state_path: str | Path = "state/tasks.yaml",
         max_active_tasks: int = 16,
@@ -453,7 +455,13 @@ class TaskScheduler:
     ) -> None:
         self._cfg = config
         self._brain = brain
-        self._searxng = searxng
+        # Skill dispatch — each fire cycle now invokes the
+        # "recurring_research" Skill instead of looping SearXNG calls
+        # inline. The Skill returns evidence as
+        # `[{"query", "hits", "error"}, ...]` so the per-query render
+        # logic stays byte-identical to the legacy gather-and-format path.
+        self._skill_registry = skill_registry
+        self._skill_ctx = skill_ctx
         self._heartbeat = heartbeat
         self._state_path = Path(state_path)
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -826,16 +834,38 @@ class TaskScheduler:
         log.info("TASK fire id=%s topic=%r queries=%d",
                  task.id, task.topic, len(task.queries))
 
-        # 1. Gather: run each query against SearXNG. Failures degrade
-        #    gracefully — we still synthesize from whatever we got.
-        gathered: list[tuple[str, list["SearchResult"]]] = []
-        for q in task.queries:
-            try:
-                hits = await self._searxng.search(q, limit=self._results_per_query)
-            except Exception:
-                log.exception("TASK search failed id=%s query=%r", task.id, q)
-                hits = []
-            gathered.append((q, hits))
+        # 1. Gather: dispatch the `recurring_research` Skill which runs
+        #    every query sequentially. The Skill is `ok=True` even when
+        #    every individual query fails (partial degradation matches
+        #    the legacy try/except-per-query behavior). Per-query errors
+        #    are surfaced through evidence[i]["error"].
+        sk_result = await self._skill_registry.invoke(
+            "recurring_research",
+            self._skill_ctx,
+            queries=task.queries,
+            results_per_query=self._results_per_query,
+        )
+        gathered: list[tuple[str, list[dict]]] = []
+        if sk_result.ok:
+            for entry in sk_result.evidence:
+                q_text = str(entry.get("query", ""))
+                hits = entry.get("hits") or []
+                # `hits` is list[dict] with {title,url,snippet} keys.
+                if isinstance(hits, list):
+                    gathered.append((q_text, list(hits)))
+                else:
+                    gathered.append((q_text, []))
+                if entry.get("error"):
+                    log.warning(
+                        "TASK search failed id=%s query=%r error=%s",
+                        task.id, q_text, entry.get("error"),
+                    )
+        else:
+            log.warning(
+                "TASK recurring_research dispatch failed id=%s error=%s",
+                task.id, sk_result.error or "?",
+            )
+            gathered = [(q, []) for q in task.queries]
 
         # 2. Render brief for the SLM. Each query gets a section so the
         #    model can cross-reference (e.g. "the price article and the
@@ -849,9 +879,10 @@ class TaskScheduler:
                 continue
             any_hit = True
             for h in hits:
-                title = h.title or "(untitled)"
-                snippet = h.snippet or "(no snippet)"
-                brief_parts.append(f"- **{title}** — {snippet}\n  {h.url}")
+                title = h.get("title") or "(untitled)"
+                snippet = h.get("snippet") or "(no snippet)"
+                url = h.get("url") or ""
+                brief_parts.append(f"- **{title}** — {snippet}\n  {url}")
         brief = "\n".join(brief_parts)
 
         # 3. Analyze: hand the brief + the original directive to Brain.

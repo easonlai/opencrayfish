@@ -1,1 +1,1 @@
-"""OpenCrayFish — Skills (SearXNG web search, etc.)."""
+"""OpenCrayFish — Tools (SearXNG web search, archive read, etc.)."""

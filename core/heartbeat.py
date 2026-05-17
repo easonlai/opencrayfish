@@ -13,9 +13,11 @@ Two coroutines drive the agent's life:
   with the STM conversation journal, asks the SLM to extract 3–5 key facts,
   appends them to `archive.md` (LTM), promotes the top two into
   `soul.md` [CORE_MEMORIES] (Soul Evolution), then mines
-  `state/reflection.jsonl` for recurring interest/lesson themes and
-  promotes those into [LEARNED_PREFERENCES] / [EMOTIONAL_EVOLUTION]. Finally
-  purges STM (RAM deque + pending buffer + journal) so tomorrow starts clean.
+  `state/reflection.jsonl` (date-rotated) for recurring interest/lesson
+  themes and `state/skills.jsonl` for chronically failing Skills, and
+  promotes those signals into [LEARNED_PREFERENCES] / [EMOTIONAL_EVOLUTION].
+  Finally purges STM (RAM deque + pending buffer + journal) so tomorrow
+  starts clean.
 
 Every pulse also writes `state/vitals.json` so the Streamlit dashboard
 (separate process) can render a live view without IPC.
@@ -30,10 +32,11 @@ from collections import deque
 from dataclasses import asdict
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from .config import Config
+from .skills import SkillContext, SkillRegistry
 
 if TYPE_CHECKING:  # avoid runtime cycles
     from .brain import Brain
@@ -42,7 +45,6 @@ if TYPE_CHECKING:  # avoid runtime cycles
     from .reflection import ReflectionEngine
     from .soul_handler import SoulHandler
     from .stm import ShortTermMemory
-    from tools.searxng import SearXNG
 
 log = logging.getLogger(__name__)
 
@@ -85,7 +87,8 @@ class Heartbeat:
         monitor: "Monitor",
         emotions: "Emotions",
         stm: "ShortTermMemory",
-        searxng: "SearXNG",
+        skill_registry: SkillRegistry,
+        skill_ctx: SkillContext,
         reflection: "ReflectionEngine | None" = None,
     ) -> None:
         self._cfg = config
@@ -94,8 +97,25 @@ class Heartbeat:
         self._monitor = monitor
         self._emotions = emotions
         self._stm = stm
-        self._searxng = searxng
+        # Skill dispatch — proactive research goes through the
+        # "proactive_learning" Skill, self-reflection through
+        # "self_reflect". Phase 2 removed the direct `searxng=` kwarg;
+        # the registry now mediates every outbound retrieval call so we
+        # get JSONL audit + per-invocation timing for free.
+        self._skill_registry = skill_registry
+        self._skill_ctx = skill_ctx
+        # `reflection` is kept as a direct dependency — the consolidation
+        # path (`_consolidate_reflections`) still calls
+        # `reflection.read_recent(...)` which isn't a Skill (no SLM /
+        # network involvement, just a JSONL tail read). Self-reflection
+        # itself is now fire-and-forget through the registry.
         self._reflection = reflection
+        # Strong references to background skill invocations spawned by
+        # `_proactive_research`. asyncio.create_task only registers a
+        # weak ref; without this set the GC can collect an in-flight
+        # task. Tasks self-remove via add_done_callback; remaining ones
+        # are awaited in `stop()`.
+        self._inflight: set[asyncio.Task[Any]] = set()
 
         self._tz = ZoneInfo(config.system.timezone)
         self._duty_start = _parse_hhmm(config.system.duty_start)
@@ -178,6 +198,15 @@ class Heartbeat:
 
     async def stop(self) -> None:
         self._stop.set()
+        # Drain background `self_reflect` tasks scheduled by
+        # `_proactive_research`. The pulse loop has already returned by
+        # the time main.py awaits the next subsystem; waiting here
+        # prevents fire-and-forget tasks from racing the registry's
+        # aclose_all() and writing partial audit/reflection records.
+        if self._inflight:
+            pending = list(self._inflight)
+            log.info("Heartbeat stop: draining %d background task(s)", len(pending))
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ---------- pulse ---------------------------------------------------------
 
@@ -288,18 +317,27 @@ class Heartbeat:
             return None
 
         log.info("PROACTIVE: source=%s topic=%r — searching SearXNG ...", source, topic)
-        try:
-            results = await self._searxng.search(topic, limit=3)
-        except Exception:
-            log.exception("SearXNG search failed for %r", topic)
+        sk_result = await self._skill_registry.invoke(
+            "proactive_learning", self._skill_ctx, topic=topic, limit=3,
+        )
+        if not sk_result.ok:
+            log.warning(
+                "SearXNG search failed for %r via proactive_learning Skill: %s",
+                topic, sk_result.error or "?",
+            )
             return None
+        # Skill evidence is list of {title, url, snippet} dicts — mirrors
+        # the legacy SearchResult attrs by key.
+        results = sk_result.evidence
         log.info(
             "PROACTIVE: %d hits (first=%s)",
             len(results),
-            results[0].url if results else "(none)",
+            (results[0].get("url") if results else "(none)"),
         )
 
-        digest = "\n".join(f"- {r.title}: {r.snippet}" for r in results) or "(no results)"
+        digest = "\n".join(
+            f"- {r.get('title', '')}: {r.get('snippet', '')}" for r in results
+        ) or "(no results)"
         idle_minutes = int(self._idle_proactive_threshold.total_seconds() // 60)
         # Mission text differs by source so the SLM understands the context.
         if source == "stm_gap":
@@ -356,15 +394,22 @@ class Heartbeat:
         self._last_proactive_at = self._now().isoformat()
         self._last_proactive_source = source
 
-        # Self-reflection on the proactive cycle (fire-and-forget).
+        # Self-reflection on the proactive cycle (fire-and-forget through
+        # the Skill registry so the audit lands in state/skills.jsonl).
         if self._reflection is not None:
-            await self._reflection.fire_and_forget(
-                kind="proactive",
-                input_text=topic,
-                response=reflection,
-                web_searched=bool(results),
-                backend=trace.backend,
+            task = asyncio.create_task(
+                self._skill_registry.invoke(
+                    "self_reflect",
+                    self._skill_ctx,
+                    kind="proactive",
+                    input_text=topic,
+                    response=reflection,
+                    web_searched=bool(results),
+                    backend=trace.backend,
+                )
             )
+            self._inflight.add(task)
+            task.add_done_callback(self._inflight.discard)
 
         event = {
             "ts": self._last_proactive_at,
@@ -373,7 +418,11 @@ class Heartbeat:
             "manual": topic_override is not None,
             "triage_decisions": triage_decisions,
             "hits": [
-                {"title": r.title, "url": r.url, "snippet": r.snippet}
+                {
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "snippet": r.get("snippet", ""),
+                }
                 for r in results
             ],
             "reflection": reflection,
@@ -715,6 +764,56 @@ class Heartbeat:
             promoted,
             len(low_quality),
         )
+
+        # ---------- A3: Skill failure consolidation -----------------
+        # Read the SkillRegistry audit feed (which ReflectionEngine
+        # mirrors via `summarise_skills_recent`) and surface systemic
+        # failures into soul.md so the agent carries the memory across
+        # restarts. We only flag a Skill when:
+        #   * it ran at least 3 times in the lookback window (so a
+        #     single transient failure doesn't pollute the soul), AND
+        #   * more than half of those runs failed (clear signal of a
+        #     broken backend, not normal variance).
+        # The note is appended as an emotion event because Sleep
+        # Metabolism is the agent's growth log; a chronically broken
+        # tool IS an emotional fact for an embodied agent.
+        try:
+            skills_summary = self._reflection.summarise_skills_recent(since=cutoff)
+        except Exception:
+            log.exception("Sleep Metabolism: skills summary failed")
+            skills_summary = {}
+        flagged: list[tuple[str, dict]] = [
+            (name, stats)
+            for name, stats in skills_summary.items()
+            if stats["total"] >= 3 and stats["fail_rate"] > 0.5
+        ]
+        # Sort by absolute failure count (loudest issues first) — keeps
+        # the soul focused on what's hurting the agent most.
+        flagged.sort(key=lambda t: t[1]["failed"], reverse=True)
+        for name, stats in flagged[:3]:  # cap to top 3 per cycle
+            note = (
+                f"Sleep Metabolism ({self._now().date().isoformat()}): "
+                f"skill '{name}' failed {stats['failed']}/{stats['total']} "
+                f"times in the last 24h (fail_rate={stats['fail_rate']:.0%})"
+            )
+            if stats.get("last_error"):
+                note += f" — last error: {stats['last_error']}"
+            try:
+                await self._soul.append_emotion_event(note)
+                log.info(
+                    "Sleep Metabolism: flagged skill failure name=%s failed=%d total=%d",
+                    name, stats["failed"], stats["total"],
+                )
+            except Exception:
+                log.exception(
+                    "Sleep Metabolism: failed to append skill flag name=%s", name,
+                )
+        if not flagged and skills_summary:
+            log.info(
+                "Sleep Metabolism: skills audit clean (skills=%d, total_invokes=%d)",
+                len(skills_summary),
+                sum(s["total"] for s in skills_summary.values()),
+            )
 
     # ---------- helpers -------------------------------------------------------
 
