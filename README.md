@@ -13,7 +13,7 @@
 ## Table of Contents
 
 - [What OpenCrayFish Is](#what-opencrayfish-is)
-- [60-Second Mental Model (Restaurant Analogy)](#60-second-mental-model-restaurant-analogy)
+- [60-Second Mental Model (The Crayfish in Its Burrow)](#60-second-mental-model-the-crayfish-in-its-burrow)
 - [Why This Project Exists](#why-this-project-exists)
 - [Design Pillars](#design-pillars)
 - [System Architecture at a Glance](#system-architecture-at-a-glance)
@@ -76,26 +76,26 @@ The agent serves a single human — **the Architect** — over Telegram and a lo
 
 ---
 
-## 60-Second Mental Model (Restaurant Analogy)
+## 60-Second Mental Model (The Crayfish in Its Burrow)
 
-If the system architecture diagram below looks intimidating, here's the friendly version:
+If the system architecture diagram below looks intimidating, here's the friendly version. The project simulates a *biological being* — so let's describe it like one:
 
-> **OpenCrayFish is a small, family-run restaurant that never closes.**
+> **OpenCrayFish is a small freshwater crayfish living in a burrow at the edge of a pond — alert, curious, occasionally hungry, never asleep for long.** It senses its body, samples the water for ripples, fires the right reflex for the moment, and every night it dreams a little so tomorrow's reflexes are a touch wiser.
 
-| Restaurant role | OpenCrayFish part | What it actually is |
+| Anatomy | OpenCrayFish part | What it actually is |
 |---|---|---|
-| 🧑‍🍳 **The chef** | `Brain` + the SLM (`qwen2.5-instruct:1.5b`) | The thinker that turns an order into a plated reply. Small but quick. |
-| 📖 **The menu** | `SkillRegistry.plan_menu()` | The short, curated list of dishes the chef can prepare *right now* (filtered by what's in stock and how stressed the kitchen is). |
-| 🍽️ **The dishes** | Skills — `recall`, `research`, `direct_answer`, `identity`, `self_reflect`, `proactive_learning`, `recurring_research` | Capabilities the chef can decide to prepare. Each has a cost label (cheap / expensive). |
-| 🔪 **The kitchen equipment** | Tools — `web_search` (SearXNG), `archive_read` (LTM) | The mechanical primitives a dish uses. The customer never sees them. |
-| 📋 **The order ticket** | `CognitiveTrace` (THINK → PLAN → ACT → REFINE) | The structured plan the chef writes before cooking: "table 4 wants X, I'll prep with dish A + dish B". |
-| 💗 **The chef's pulse** | `Heartbeat.pulse_loop()` | Even with no orders, the chef breathes, blinks, sips water — and notices if the stove is overheating. |
-| 🌙 **Closing time** | `Heartbeat.metabolism()` (02:00 nightly) | After the last customer leaves, the chef writes down what was learned today and tapes it inside the recipe book. |
-| 📓 **The recipe book** | `soul.md` (immutable laws) + `memory/archive.md` (learned facts) | Two notebooks: one the chef can never edit (the constitution), one the chef adds to every night. |
-| 🌡️ **The kitchen thermometer** | `Monitor` (CPU/RAM/temp + brain availability as a vital sign) | When the kitchen gets too hot, the chef skips the fancy garnish and serves faster, simpler plates. |
-| 🚪 **The waiters** | Connectors (`telegram`, `web_chat`) | Front-of-house staff who carry the order in and the plate out. The chef doesn't care which waiter is on duty. |
+| 🧠 **The nerve ganglion** | `Brain` + the SLM (`qwen2.5-instruct:1.5b`) | The small-but-quick neural cluster that turns a stimulus into a coordinated response. Compact on purpose — a crayfish doesn't need a mammalian cortex. |
+| 🌀 **The behavioural repertoire** | `SkillRegistry.plan_menu()` | The short, situational list of behaviours the animal can perform *right now* — filtered by hunger, fatigue, stress, and whether the water (network) is moving. |
+| ⚡ **Individual reflexes & behaviours** | Skills — `recall`, `research`, `direct_answer`, `identity`, `self_reflect`, `proactive_learning`, `recurring_research` | Capabilities the nervous system can fire. Each one comes with a metabolic-cost label (cheap / expensive). |
+| 👁️ **Antennae & sensory appendages** | Tools — `web_search` (SearXNG), `archive_read` (LTM) | The physical primitives a reflex uses to reach into the world. The outside never touches them directly — they're tucked inside the body. |
+| 🧬 **The neural firing sequence** | `CognitiveTrace` (THINK → PLAN → ACT → REFINE) | The motor program the ganglion writes before acting: "this stimulus means X, fire reflex A then reflex B, then check the result". |
+| 💓 **The autonomic heartbeat** | `Heartbeat.pulse_loop()` | Even with no stimulus, the body keeps beating, sips a breath, checks its own temperature, and notices when the water is getting dangerously warm. |
+| 🌙 **REM-like consolidation** | `Heartbeat.metabolism()` (02:00 nightly) | After the day's foraging, the crayfish settles into its burrow, rehearses what it learned, and etches the keepers into long-term memory. Wakes a tiny bit different than yesterday. |
+| 🧬 **DNA + learned engrams** | `soul.md` (immutable core) + `memory/archive.md` (plasticity) | Two layers of memory: a genome the animal can never rewrite (its constitution, its laws) plus adaptive engrams it grows every night. |
+| 🌡️ **Interoception (homeostasis)** | `Monitor` — CPU / RAM / temp / brain availability as **vital signs** | When the water gets too warm, the crayfish abandons elaborate display behaviours and falls back to faster, cheaper reflexes — conserving energy until conditions improve. |
+| 🌊 **Chemoreceptors & mechanoreceptors** | Connectors (`telegram`, `web_chat`) | The sensory channels through which ripples from the outside world reach the burrow — and through which the crayfish ripples back. The ganglion doesn't care which channel the ripple came in on. |
 
-**Why this matters for contributors:** want to add a new "dish"? Write a new Skill. Want to add a new "kitchen appliance"? Write a new Tool. Want to open a new "dining room"? Write a new Connector. The chef (Brain), the menu builder (SkillRegistry), and the order book (CognitiveLoop) all keep working with **zero edits** — your new thing just appears on the menu the next time the chef looks at it. See [§ 12 Skills & Tools](#12-skills--tools--the-two-tier-capability-stack) for the step-by-step recipe.
+**Why this matters for contributors:** want to teach the crayfish a **new instinct**? Write a new Skill. Want to give it a **new sensory appendage**? Write a new Tool. Want to open a **new channel through which the world can ripple in**? Write a new Connector. The nerve ganglion (Brain), the instinct selector (SkillRegistry), and the motor sequencer (CognitiveLoop) all keep working with **zero edits** — your new appendage / instinct / sense just appears in the repertoire the next time the animal looks at itself. See [§ 12 Skills & Tools](#12-skills--tools--the-two-tier-capability-stack) for the step-by-step graft.
 
 ---
 
@@ -1279,7 +1279,7 @@ And in `state/deliberation-YYYY-MM-DD.jsonl` you'll see `GREET` appear in the PL
 - Make it cost-aware: set `cost_tier="expensive"` and `requires_network=True` so the Loop hides it when the Pi is stressed or SearXNG is down.
 - Make it actuator-style: set `side_effects=True, requires_confirmation=True` for a Skill that, say, toggles a smart bulb — the Loop will refuse to run it without explicit ack scaffolding (a planned actuator hook lives in [core/cognition.py](core/cognition.py)).
 
-See [CONTRIBUTING.md § Ways to Contribute](CONTRIBUTING.md#ways-to-contribute) for the equivalent recipe for both layers.
+See [CONTRIBUTING.md § Ways to Contribute](CONTRIBUTING.md#ways-to-contribute) for the equivalent walkthrough for both layers.
 
 ---
 
@@ -1661,7 +1661,7 @@ The current codebase (Phase 3.1) is a **complete v1+**: every subsystem in this 
 
 OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passionate developer, architect, hardware hacker, and AI tinkerer is welcome to co-develop. The crayfish is small, but the pond is deep — there is plenty of room.
 
-> 💡 **We especially want you if…** you've ever wanted to wire a sensor, a smart bulb, a CalDAV calendar, a home-grown RAG, or an MCP server into a *living* edge agent and watch it learn from the result overnight. The Skill plugin layer (see [§ 12](#12-skills--tools--the-two-tier-capability-stack) and the [Hello-World Skill tutorial](#hello-world-skill--step-by-step)) is built so a working contribution is one file plus one line in `main.py`. The crayfish gets stronger every time someone adds a new dish to the menu.
+> 💡 **We especially want you if…** you've ever wanted to wire a sensor, a smart bulb, a CalDAV calendar, a home-grown RAG, or an MCP server into a *living* edge agent and watch it learn from the result overnight. The Skill plugin layer (see [§ 12](#12-skills--tools--the-two-tier-capability-stack) and the [Hello-World Skill tutorial](#hello-world-skill--step-by-step)) is built so a working contribution is one file plus one line in `main.py`. The crayfish grows a little stronger — a new reflex, a new sense, a new way of reaching into the world — every time someone grafts one on.
 
 ### Where to start
 
