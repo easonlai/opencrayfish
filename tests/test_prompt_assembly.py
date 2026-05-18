@@ -77,17 +77,33 @@ def test_format_task_block_idle_pulse_when_both_none():
     assert "Idle pulse" in out or "reflection" in out.lower()
 
 
-def test_format_task_block_web_searched_appends_searxng_addendum():
-    """``web_searched=True`` MUST mention the pre-fetched search results
-    so the SLM stops refusing on a retry. Without this hint qwen2:1.5b
-    will say "I cannot browse the web" even though results are right
-    there in KNOWLEDGE.
+def test_format_task_block_web_searched_does_not_append_legacy_searxng_suffix():
+    """``web_searched=True`` MUST NOT append the legacy "Live SearXNG
+    results have been pre-fetched" scaffolding sentence.
+
+    History: the original implementation appended a multi-line suffix
+    so qwen2:1.5b would stop refusing with "I cannot browse the web."
+    In production the Cognitive Loop's KNOWLEDGE block header already
+    conveys both the evidence AND the "use this as primary source of
+    truth" framing, making the suffix redundant. Worse, the SLM was
+    echoing the suffix verbatim, triggering prompt-leak retries (2
+    leaks observed in a 1 h field run). The suffix is now removed;
+    `web_searched` is retained for API compatibility but is a no-op
+    in the rendered string \u2014 the bool flows through
+    `ThoughtTrace.web_searched` instead.
     """
     out = format_task_block(
         user_input="latest AI news", mission=None,
         salutation="Boss", web_searched=True,
     )
-    assert "SearXNG" in out
+    # The user's question is still there.
+    assert "latest AI news" in out
+    # But none of the legacy leak-prone phrases.
+    assert "SearXNG" not in out
+    assert "pre-fetched" not in out
+    assert "Synthesize" not in out
+    # The flag must NOT also slip into a mission-style prefix.
+    assert "Heartbeat-triggered" not in out
 
 
 # ---------------------------------------------------------------------------

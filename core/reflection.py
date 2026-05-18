@@ -366,14 +366,24 @@ class ReflectionEngine:
         (or end-of-string). This works whether the SLM puts each key on
         its own line OR collapses them onto one line with `|` / `,`
         separators (a common chat-tuned model failure mode).
+
+        Tolerance budget (from observed 1.5B-model drift):
+          * If the SLM omits the `QUALITY:` label but the payload starts with
+            a bare grade word (`low`, `medium`, `high`), accept that as
+            QUALITY and treat the rest as CRITIQUE candidate text.
+          * If the SLM omits the `CRITIQUE:` label, accept any non-trivial
+            free-form text following the QUALITY field as the critique.
+          * LESSON is now OPTIONAL — many drift modes produce QUALITY +
+            CRITIQUE but no LESSON; the entry still carries signal worth
+            keeping for Sleep Metabolism's interest/lesson consolidation.
+          * INTEREST stays optional and defaults to "".
+        Minimum to keep an entry: a valid QUALITY grade and a CRITIQUE
+        sentence longer than a bare grade word.
         """
         if not raw:
             return None
 
         matches = list(_KEY_RE.finditer(raw))
-        if not matches:
-            return None
-
         fields: dict[str, str] = {}
         for idx, m in enumerate(matches):
             key = m.group(1).upper()
@@ -386,26 +396,78 @@ class ReflectionEngine:
             # Last-key-wins if the model emitted duplicates.
             fields[key] = value
 
-        if not all(k in fields for k in ("QUALITY", "CRITIQUE", "LESSON")):
+        # --- QUALITY recovery ------------------------------------------------
+        # If the label is missing but the payload opens with a bare grade
+        # word (`low\n...`, `LOW \n  \n ...`, `high - the response...`),
+        # synthesize a QUALITY field from it and prepend the trailing text
+        # to whatever became of CRITIQUE.
+        leading_quality: str | None = None
+        leading_remainder: str = ""
+        if "QUALITY" not in fields:
+            leading = re.match(
+                r"\s*(high|medium|low)\b[\s\-\.:,]*(.*)$",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if leading and (not matches or leading.end(1) <= matches[0].start()):
+                leading_quality = leading.group(1).lower()
+                leading_remainder = leading.group(2).strip()
+                fields["QUALITY"] = leading_quality
+
+        if "QUALITY" not in fields:
             return None
 
-        # QUALITY is required to contain one of the three grade words. If
-        # the model put the legend ("high | medium | low") here, we still
-        # extract the first valid grade rather than dropping the entry.
         q_match = _QUALITY_VALUE_RE.search(fields["QUALITY"])
         if not q_match:
             return None
         quality = q_match.group(1).lower()
 
-        critique = fields["CRITIQUE"].strip()
-        lesson = fields["LESSON"].strip()
+        # --- CRITIQUE recovery -----------------------------------------------
+        critique = fields.get("CRITIQUE", "").strip()
+        # If the SLM omitted the CRITIQUE label, fall back to:
+        #   1. text trailing a bare leading grade word (heuristic above), or
+        #   2. text between the QUALITY label and the next label.
+        if not critique and leading_remainder:
+            critique = leading_remainder
+        if not critique and "QUALITY" in fields:
+            # Find QUALITY's match span and slice raw up to the next label.
+            for idx, m in enumerate(matches):
+                if m.group(1).upper() != "QUALITY":
+                    continue
+                value_start = m.end()
+                value_end = (
+                    matches[idx + 1].start()
+                    if idx + 1 < len(matches)
+                    else len(raw)
+                )
+                qval = raw[value_start:value_end].strip()
+                # Strip the bare grade word that already populated QUALITY,
+                # then keep whatever sentence follows as the critique.
+                qval_after = re.sub(
+                    r"^\s*(high|medium|low)\b[\s\-\.:,]*",
+                    "",
+                    qval,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                if qval_after.strip():
+                    critique = qval_after.strip()
+                break
+
         # Reject pure-grade-word CRITIQUE values (like the SLM emitting
         # `CRITIQUE: medium`). Those carry no diagnostic signal and would
         # pollute downstream Sleep Metabolism consolidation.
-        if not critique or _QUALITY_VALUE_RE.fullmatch(critique):
+        # Also reject implausibly short critiques (<10 chars) — those are
+        # almost always parser noise rather than real critique sentences.
+        if not critique or _QUALITY_VALUE_RE.fullmatch(critique) or len(critique) < 10:
             return None
-        if not lesson:
-            return None
+
+        # LESSON is OPTIONAL since v2.0 — small-SLM drift frequently drops
+        # this field, but the QUALITY+CRITIQUE+INTEREST signal alone is
+        # already useful for Sleep Metabolism. Empty string is fine.
+        lesson = fields.get("LESSON", "").strip()
+        if lesson and _QUALITY_VALUE_RE.fullmatch(lesson):
+            lesson = ""  # drop bare-grade-word lessons, same logic as critique
 
         interest = fields.get("INTEREST", "").strip(" .\"'`")
         if interest.upper() == "NONE":

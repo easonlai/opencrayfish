@@ -834,7 +834,7 @@ Per-pulse stress is *not* logged or alerted (it would spam at every pulse the Pi
 - `state/logs/agent.log` — operator-tailable warning lines
 - `state/vitals_events.jsonl` — JSONL feed the dashboard renders as a stress timeline
 
-EXIT events carry `duration_s`, `peak_temp`, and `peak_ram` from the entire stress episode.
+ENTER events carry `temp`, `ram`, `cpu`, and a human-readable `reason` (the live `vitals.describe()` text). EXIT events add `duration_s`, `peak_temp`, `peak_ram` from the entire episode plus `current_temp` / `current_ram` / `current_cpu` snapshots and the same `reason` string — enough for the dashboard to render a stress timeline with explanatory tooltips without re-parsing `agent.log`.
 
 #### Live-state publishing
 
@@ -1245,16 +1245,22 @@ Idle ≥ N minutes →
           that I admit I don't know well"
         → returns list of candidate topics
 
-  PLAN (two-stage filtering, audited)
+  PLAN (three-stage filtering, audited)
     for candidate in gaps:
       ① _is_in_ltm(candidate)
             ← cheap substring check vs soul.md DYNAMIC + archive.md
             → hit? → verdict="in_ltm", skip
-      ② brain.triage_knowledge(candidate)
+      ② _recently_researched_proactively(candidate)
+            ← tail-scan state/proactive.jsonl over the last 24 h
+              (archive.md is only refreshed by nightly Sleep Metabolism,
+              so a topic researched 30 min ago still looks fresh to LTM)
+            → hit? → verdict="recently_proactive", skip
+      ③ brain.triage_knowledge(candidate)
             ← SLM self-assessment: "do you actually know this? answer YES/NO"
             → YES → verdict="known_by_slm", skip
             → NO  → verdict="unknown", PICK THIS
-    (if no gap survives → fall back to soul.md [LEARNED_PREFERENCES] tail line)
+    (if no gap survives → fall back to soul.md [LEARNED_PREFERENCES] tail line,
+     subject to the same proactive-recency guard)
 
   ACT
     ① searxng.search(topic, limit=3)
@@ -1315,6 +1321,8 @@ After every interaction (user-driven or proactive), Brain calls `reflection.fire
   "backend": "hailo"
 }
 ```
+
+Only `quality` and `critique` are guaranteed populated — `lesson` and `interest` may be empty strings when the small SLM omits them. The parser is intentionally tolerant of common 1.5B-class drift (bare leading grade word, missing `QUALITY:` label, single-line collapses) so most usable critiques survive into the feed. Implausibly short critiques (<10 chars) and bare-grade-word-only fields are still rejected as parser noise and routed to the sidecar.
 
 Each entry is appended to `state/reflection-YYYY-MM-DD.jsonl` (date-rotated, see [§ JSONL Rotation & Retention](#jsonl-rotation--retention)). Failed/malformed parses go to `state/reflection_dropped-YYYY-MM-DD.jsonl` so operators can see *why* a turn produced no reflection (instead of silently disappearing).
 
@@ -1563,6 +1571,7 @@ Two connectors run in the same `main.py` event loop, sharing the **same** Brain 
 - Validates incoming messages against `cfg.api_keys.telegram_user_id` — only the configured Architect can talk to the agent.
 - Recognizes `/emergency <msg>` as a sleep-bypass marker (the only kind of message answered during 02:00–06:00).
 - Slash commands: `/start`, `/tasks`, `/cancel`, `/pause`, `/resume`, `/research`.
+- Scheduled-task reports (`_deliver_report`) self-retry up to 3× with exponential backoff on transient `NetworkError` / `TimedOut`, and honour Telegram's `RetryAfter` cooldown — a single TCP hiccup no longer silently drops a 10-minute recurring report.
 
 #### WebChatConnector (in-process aiohttp)
 
@@ -1743,7 +1752,7 @@ Each subsystem is designed to **degrade, not crash**, when its dependency is bro
 | **STM journal corrupted** | `STM.recover()` skips malformed lines and continues. Worst case: zero turns rehydrated. | None required — the journal is truncated to zero on the next Sleep Metabolism `purge()`. |
 | **soul.md mutation rejected** | `SoulProtectionError` raised inside `metabolism()` is caught and logged. No partial write occurs (atomic swap). | Architect inspects the proposed Core Memory in `state/proactive.jsonl`; nothing else is required. |
 | **Cognitive Loop fails to parse THINK output** | Loop bails with `engaged=False`, `bypass_reason="think_unparseable"`. Brain falls through to legacy single-shot path. Trace still appended to `state/deliberation-YYYY-MM-DD.jsonl` for forensics. | None — every cycle is independent. |
-| **Connector outage (Telegram API rate-limit)** | python-telegram-bot retries internally. Agent state untouched; replies queue and drain when API recovers. | None — wait for rate-limit window. |
+| **Connector outage (Telegram API rate-limit or transient `NetworkError`)** | Inbound `python-telegram-bot` polling retries internally. Outbound scheduled-task deliveries (`_deliver_report`) self-retry up to 3× with exponential backoff on `NetworkError` / `TimedOut`, and honour `RetryAfter` cooldowns. Agent state untouched; replies queue and drain when the API recovers. | None — wait for the rate-limit window. |
 | **Heartbeat coroutine raises** | Exception propagates; Heartbeat task dies; `await pulse_task` in `main.amain()` raises and the process exits non-zero. | Restart the agent (systemd unit recommended). STM rehydrates from journal at boot. |
 | **Architect speaks while autonomous proactive research is mid-cycle** | The cycle yields at the next milestone (≤1 SLM call latency, ~1 s ceiling); no state mutation occurs because nothing was persisted yet. Live `think()` proceeds with normal latency. `PROACTIVE yield_to_foreground` line lands in `state/logs/agent.log`. | Automatic — the next idle window (after `idle_proactive_minutes` of silence) restarts the cycle from scratch. Manual `/research [topic]` bypasses the yield entirely. |
 

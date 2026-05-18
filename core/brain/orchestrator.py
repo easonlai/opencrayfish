@@ -183,8 +183,6 @@ _PROMPT_LEAK_FINGERPRINTS: tuple[str, ...] = (
     "## THIS TURN",
     # Distinctive imperative phrases used by sub-blocks.
     "EXHAUSTION DIRECTIVE",
-    "Live SearXNG results have been pre-fetched",
-    "Synthesize a concise, accurate answer grounded",
     "Heartbeat-triggered mission",
     "Idle pulse — produce a brief situational reflection",
     "Positive Anchor MUST hold",
@@ -218,6 +216,11 @@ class ThoughtTrace:
     vitals: VitalSigns
     empathy: EmpathyReading
     backend: str
+    # True when the turn's KNOWLEDGE block carries live web results or
+    # Cognitive Loop output. Replaces the previous string-scraping
+    # heuristic that searched `system_prompt` for the leak-prone phrase
+    # "Live SearXNG results".
+    web_searched: bool = False
 
 
 class Brain:
@@ -343,7 +346,7 @@ class Brain:
                     kind="user",
                     input_text=user_input,
                     response=trace.filtered.text,
-                    web_searched="Live SearXNG results" in trace.system_prompt,
+                    web_searched=trace.web_searched,
                     backend=trace.backend,
                 )
             )
@@ -881,11 +884,12 @@ class Brain:
         knowledge = "\n\n".join(knowledge_parts)
 
         # 6. Task Execution
+        web_searched = bool(web_hits) or cognitive_engaged
         task_block = format_task_block(
             user_input=user_input,
             mission=mission,
             salutation=self._salutation(),
-            web_searched=bool(web_hits) or cognitive_engaged,
+            web_searched=web_searched,
         )
 
         system_prompt = assemble_system_prompt(
@@ -931,6 +935,7 @@ class Brain:
                 vitals=vitals,
                 empathy=empathy_reading,
                 backend="offline",
+                web_searched=web_searched,
             )
         except Exception:
             log.exception("Provider failed during Brain._cycle (kind=%s)", kind)
@@ -1008,6 +1013,7 @@ class Brain:
             vitals=vitals,
             empathy=empathy_reading,
             backend=self._provider.active_backend,
+            web_searched=web_searched,
         )
 
     # ---------- prompt assembly ----------------------------------------------

@@ -6,10 +6,12 @@ all others are deferred until awakening.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -107,7 +109,18 @@ class TelegramConnector:
         )
 
     async def _deliver_report(self, report: str) -> None:
-        """Push a scheduled-task report to the architect's Telegram chat."""
+        """Push a scheduled-task report to the architect's Telegram chat.
+
+        Wrapped in a 3-attempt retry with exponential backoff for the
+        transient network classes (`NetworkError`, `TimedOut`) and an
+        honour-the-server-cooldown branch for `RetryAfter`. One
+        unhandled `NetworkError` observed in a 1 h field run motivated
+        this — reports are produced every 10 min for some tasks and a
+        single TCP hiccup should not silently drop a report.
+
+        All non-transient errors still fall through to the broad
+        `Exception` log so unexpected failure modes remain visible.
+        """
         if self._app is None or self._architect_chat_id is None:
             log.warning(
                 "TG task deliver skipped — chat_id=%s app=%s. Architect must "
@@ -115,13 +128,51 @@ class TelegramConnector:
                 self._architect_chat_id, self._app is not None,
             )
             return
-        try:
-            await self._app.bot.send_message(
-                chat_id=self._architect_chat_id, text=report,
-            )
-            log.info("TG task report delivered (len=%d)", len(report))
-        except Exception:
-            log.exception("TG task delivery failed")
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._app.bot.send_message(
+                    chat_id=self._architect_chat_id, text=report,
+                )
+                if attempt > 1:
+                    log.info(
+                        "TG task report delivered on attempt %d/%d (len=%d)",
+                        attempt, max_attempts, len(report),
+                    )
+                else:
+                    log.info("TG task report delivered (len=%d)", len(report))
+                return
+            except RetryAfter as exc:
+                # Telegram explicitly told us how long to wait — honour it,
+                # but cap so we don't sleep forever on a misbehaving server.
+                wait_s = min(float(getattr(exc, "retry_after", 5)), 30.0)
+                log.warning(
+                    "TG deliver hit RetryAfter on attempt %d/%d; sleeping %.1fs.",
+                    attempt, max_attempts, wait_s,
+                )
+                if attempt == max_attempts:
+                    log.error("TG task delivery exhausted retries (RetryAfter).")
+                    return
+                await asyncio.sleep(wait_s)
+            except (NetworkError, TimedOut) as exc:
+                if attempt == max_attempts:
+                    log.error(
+                        "TG task delivery failed after %d attempts: %s",
+                        max_attempts, exc,
+                    )
+                    return
+                backoff_s = 2 ** (attempt - 1)  # 1s, 2s, 4s
+                log.warning(
+                    "TG deliver transient error on attempt %d/%d (%s); "
+                    "retrying in %ds.",
+                    attempt, max_attempts, exc, backoff_s,
+                )
+                await asyncio.sleep(backoff_s)
+            except Exception:
+                # Non-transient — fail fast and loud, same as before.
+                log.exception("TG task delivery failed")
+                return
 
     def build(self) -> Application:
         app = ApplicationBuilder().token(self._token).build()

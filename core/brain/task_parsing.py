@@ -196,9 +196,25 @@ class TaskIntentParser:
         for line in queries_block_m.group("v").splitlines():
             ln = line.strip()
             ln = re.sub(r"^[-*\u2022]\s*", "", ln).strip().strip("\"'`")
-            if ln:
-                queries.append(ln)
-        # Cap to 5 \u2014 anything beyond is excess SLM cost per fire.
+            if not ln:
+                continue
+            # Filter sentinel tokens that the SLM sometimes copies verbatim
+            # from the prompt's instructional text into the QUERIES block.
+            # Symptom seen in production: `- NOT_TASK` appearing as a real
+            # query and being sent to SearXNG every interval tick.
+            up = ln.upper().strip(" .:")
+            if up in {"NOT_TASK", "NONE", "N/A", "NA", "NULL"}:
+                log.info("TASK parse: dropping sentinel query line %r", ln)
+                continue
+            # Reject single-token ALL_CAPS_WITH_UNDERSCORES shapes (the
+            # general pattern of sentinel leakage) and implausibly-short
+            # queries that would just waste SearXNG cycles.
+            if re.fullmatch(r"[A-Z][A-Z0-9_]{2,}", ln) or len(ln) < 3:
+                log.info("TASK parse: dropping degenerate query line %r", ln)
+                continue
+            queries.append(ln)
+        # Cap to 5 — anything beyond is excess SLM cost per fire.
+        queries = queries[:5]
         queries = queries[:5]
         if not queries:
             log.info("TASK parse: no queries extracted")

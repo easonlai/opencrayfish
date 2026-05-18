@@ -134,26 +134,28 @@ def format_task_block(
     were a known anti-pattern \u2014 the model would echo the very nouns
     the rules were trying to prohibit.
 
+    ``web_searched`` is retained for API compatibility but no longer
+    appends a scaffolding suffix \u2014 the Cognitive Loop's KNOWLEDGE
+    block header (\"Live SearXNG results (use these as the primary
+    source of truth)\" or similar) already conveys both the evidence
+    AND the framing. The previous suffix was redundant scaffolding and
+    triggered 2 prompt-leak retries in a 1 h field run because the 1.5B
+    SLM echoed it verbatim instead of synthesising.
+
     ``salutation`` is built by ``Brain._salutation()`` so this function
     needs no awareness of the architect-honorific config plumbing.
     """
-    suffix = ""
-    if web_searched:
-        suffix = (
-            "\n\nLive SearXNG results have been pre-fetched for this turn "
-            "(see KNOWLEDGE above). Synthesize a concise, accurate answer "
-            "grounded in those results. Cite source URLs inline. "
-            "Do NOT refuse \u2014 the search has already been performed for you. "
-            "If the results don't actually contain the answer, say so plainly "
-            "and suggest a refined query rather than guessing."
-        )
+    # Suffix intentionally removed \u2014 see docstring. `web_searched` is
+    # still accepted so callers don't break; the signal is carried by
+    # `ThoughtTrace.web_searched` for downstream telemetry.
+    _ = web_searched  # silence unused-arg linters
     if user_input is not None:
         return (
             f"Operator ({salutation}): {user_input.strip()}\n"
-            f"You:{suffix}"
+            f"You:"
         )
     if mission is not None:
-        return f"Heartbeat-triggered mission: {mission.strip()}{suffix}"
+        return f"Heartbeat-triggered mission: {mission.strip()}"
     return "Idle pulse \u2014 produce a brief situational reflection."
 
 

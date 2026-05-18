@@ -504,6 +504,14 @@ class Heartbeat:
                 if await self._is_in_ltm(candidate):
                     decisions.append({"topic": candidate, "verdict": "in_ltm"})
                     continue
+                # Proactive-recency check: archive.md only refreshes
+                # nightly, so a topic researched 30 min ago still looks
+                # fresh to LTM. Scan proactive.jsonl directly to avoid
+                # the duplicate-research thrash seen in the 1 h field
+                # log (5 cycles on the same "Minionese" topic).
+                if await self._recently_researched_proactively(candidate):
+                    decisions.append({"topic": candidate, "verdict": "recently_proactive"})
+                    continue
                 try:
                     known = await self._brain.triage_knowledge(
                         candidate,
@@ -521,7 +529,13 @@ class Heartbeat:
         if cfg.fallback_to_preferences:
             pref = await self._pick_research_topic()
             if pref:
-                return pref, "learned_preference", decisions
+                # Same proactive-recency guard as the STM-gap path \u2014
+                # learned preferences also leak duplicates when archive.md
+                # hasn't been distilled yet.
+                if await self._recently_researched_proactively(pref):
+                    decisions.append({"topic": pref, "verdict": "recently_proactive"})
+                else:
+                    return pref, "learned_preference", decisions
 
         return None, "skipped", decisions
 
@@ -561,6 +575,83 @@ class Heartbeat:
             return True
         hits = sum(1 for w in words if w in soul_text or w in archive_text)
         return hits >= max(2, len(words) // 2 + 1)
+
+    async def _recently_researched_proactively(
+        self, topic: str, *, window_hours: int = 24
+    ) -> bool:
+        """Has this topic appeared in `proactive.jsonl` recently?
+
+        `_is_in_ltm` only sees soul.md / archive.md \u2014 but archive.md is
+        only refreshed nightly by Sleep Metabolism. A topic researched at
+        22:41 and re-considered at 23:13 will still look fresh to LTM
+        even though we just spent a SLM cycle on it. This check closes
+        the gap by scanning the audit trail directly.
+
+        Symptom in production: "the Minionese language and culture"
+        researched 5\u00d7 in one hour because each cycle wrote to
+        proactive.jsonl but nothing rolled it into archive.md.
+        """
+        if not PROACTIVE_FEED.exists():
+            return False
+        normalized = (topic or "").lower().strip()
+        if not normalized:
+            return False
+        words = [
+            w for w in re.findall(r"[\w-]+", normalized)
+            if len(w) > 3 and w not in _LTM_STOPWORDS
+        ]
+        if not words:
+            return False
+        cutoff = self._now() - timedelta(hours=window_hours)
+        loop = asyncio.get_running_loop()
+        try:
+            recent_topics = await loop.run_in_executor(
+                None, self._read_recent_proactive_topics, cutoff
+            )
+        except Exception:
+            log.exception("proactive recency scan crashed; treating as not recent")
+            return False
+        for past_topic in recent_topics:
+            past = past_topic.lower().strip()
+            if not past:
+                continue
+            if normalized == past or normalized in past or past in normalized:
+                return True
+            past_words = set(re.findall(r"[\w-]+", past))
+            hits = sum(1 for w in words if w in past_words)
+            if hits >= max(2, len(words) // 2 + 1):
+                return True
+        return False
+
+    @staticmethod
+    def _read_recent_proactive_topics(cutoff: datetime) -> list[str]:
+        """Return topics from proactive.jsonl whose `ts` is at or after `cutoff`.
+
+        Blocking I/O \u2014 callers should hand this off to a thread executor.
+        """
+        topics: list[str] = []
+        try:
+            with PROACTIVE_FEED.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts_raw = entry.get("ts") or ""
+                    try:
+                        ts = datetime.fromisoformat(ts_raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if ts >= cutoff:
+                        topic = entry.get("topic") or ""
+                        if topic:
+                            topics.append(str(topic))
+        except OSError:
+            log.exception("failed reading proactive.jsonl for recency scan")
+        return topics
 
     async def _record_proactive_event(self, event: dict) -> None:
         loop = asyncio.get_running_loop()
@@ -905,11 +996,12 @@ class Heartbeat:
                 if vitals.temperature_c is not None
                 else "n/a"
             )
+            reason = vitals.describe()
             log.warning(
                 "VITALS stress=ENTER temp=%s ram=%.1f%% (%s)",
                 temp_str,
                 vitals.ram_percent,
-                vitals.describe(),
+                reason,
             )
             event = {
                 "ts": now.isoformat(),
@@ -917,6 +1009,7 @@ class Heartbeat:
                 "temp": vitals.temperature_c,
                 "ram": vitals.ram_percent,
                 "cpu": vitals.cpu_percent,
+                "reason": reason,
             }
         else:
             # Falling edge — EXIT
@@ -928,12 +1021,13 @@ class Heartbeat:
                 if self._stress_peak_temp is not None
                 else "n/a"
             )
+            reason = vitals.describe()
             log.info(
                 "VITALS stress=EXIT duration=%ds peak_temp=%s peak_ram=%.1f%% (%s)",
                 duration_s,
                 peak_str,
                 self._stress_peak_ram,
-                vitals.describe(),
+                reason,
             )
             event = {
                 "ts": now.isoformat(),
@@ -943,6 +1037,8 @@ class Heartbeat:
                 "peak_ram": self._stress_peak_ram,
                 "current_temp": vitals.temperature_c,
                 "current_ram": vitals.ram_percent,
+                "current_cpu": vitals.cpu_percent,
+                "reason": reason,
             }
             self._was_stressed = False
             self._stress_started_at = None
