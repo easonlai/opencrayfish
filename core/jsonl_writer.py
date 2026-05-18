@@ -18,6 +18,13 @@ Centralises three concerns that previously lived inline in
      older than `retain_days` runs at most once per process-day. Cheap
      scandir + unlink, no compression — operators who want long-term
      archival should move files off the device, not bloat the SD card.
+  4. **Forward-defensive ``schema_version``** — every record is stamped
+     with the writer's configured schema version (default ``1``) as the
+     FIRST field of the line. Future producers that bump their on-disk
+     format only need to pass ``schema_version=N`` at construction and
+     downstream readers can branch on the field. A record that already
+     carries an explicit ``schema_version`` is passed through unchanged
+     so producers can emit mixed versions during a migration window.
 
 Synchronous writers (e.g. heartbeat's own log) keep their existing path;
 this module is only for the high-frequency feeds.
@@ -65,6 +72,13 @@ class RotatingJsonlWriter:
     tz
         Timezone for both the date stamp and the retention window. Match
         whatever the rest of the agent uses (cfg.system.timezone).
+    schema_version
+        Stamped into every appended record (as the FIRST field of the
+        JSON object) unless the caller already provided one. Bump when
+        the on-disk record shape changes incompatibly so downstream
+        readers can branch on it. Defaults to ``1`` — the baseline
+        version for every feed that existed at the time of the P3.3
+        forward-defensive rollout.
     """
 
     def __init__(
@@ -73,6 +87,7 @@ class RotatingJsonlWriter:
         *,
         retain_days: int = 30,
         tz: str = "UTC",
+        schema_version: int = 1,
     ) -> None:
         self._base_path = Path(base_path)
         self._base_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +99,7 @@ class RotatingJsonlWriter:
         self._dir = self._base_path.parent
         self._retain_days = max(0, int(retain_days))
         self._tz = ZoneInfo(tz)
+        self._schema_version = int(schema_version)
         # Reused per-instance — serialises Python-side writers so two
         # awaiters can't both hand a write to the executor pool at the
         # exact same instant on the same file descriptor path.
@@ -95,6 +111,12 @@ class RotatingJsonlWriter:
     @property
     def base_path(self) -> Path:
         return self._base_path
+
+    @property
+    def schema_version(self) -> int:
+        """The schema_version stamped into every record produced by this
+        writer (overridable per-record by the caller)."""
+        return self._schema_version
 
     def active_path(self, *, now: datetime | None = None) -> Path:
         """Return the file the NEXT write will target."""
@@ -120,8 +142,23 @@ class RotatingJsonlWriter:
         out.sort(key=lambda t: t[0])
         return [p for _, p in out]
 
-    async def append(self, record: dict[str, Any]) -> None:
+    async def append(
+        self,
+        record: dict[str, Any],
+        *,
+        fsync: bool = False,
+    ) -> None:
         """Append one record. Never raises — failures log and degrade.
+
+        Parameters
+        ----------
+        record
+            A JSON-serialisable dict.
+        fsync
+            When True, ``os.fsync()`` the file before close. Strict power-
+            loss durability at the cost of an SD-card sync (Pi). Default
+            False: rely on the kernel to flush on its own schedule, which
+            is the right trade-off for high-frequency telemetry feeds.
 
         The caller's coroutine is suspended only while the executor
         runs the actual write (a few µs for a small JSON line). The
@@ -131,32 +168,107 @@ class RotatingJsonlWriter:
         async with self._lock:
             try:
                 loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._append_blocking, record)
+                await loop.run_in_executor(
+                    None, self._append_blocking, record, fsync,
+                )
             except Exception:
                 log.exception(
                     "JSONL writer append failed base=%s", self._base_path,
                 )
-            # Retention sweep is opportunistic, fire-and-forget on
-            # the executor — failure here must NEVER fail the write.
+            await self._maybe_sweep_locked()
+
+    async def append_many(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        fsync: bool = False,
+    ) -> int:
+        """Append a batch of records in a SINGLE open()/write()/close().
+
+        Used by callers (e.g. ``ShortTermMemory.flush_journal``) that
+        accumulate records in RAM and flush them as one durable unit —
+        the batched write keeps total syscall count to one per flush
+        instead of one per record, which matters on the Pi's SD card
+        where every open() costs ~ms-class latency.
+
+        Returns the number of records actually written (0 on empty input
+        or on error — errors are logged, not raised, so the caller's
+        hot path stays alive).
+        """
+        if not records:
+            return 0
+        async with self._lock:
             try:
-                today = datetime.now(tz=self._tz).date()
-                if self._retain_days > 0 and self._last_sweep_date != today:
-                    self._last_sweep_date = today
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        None, self._sweep_blocking, today,
-                    )
+                loop = asyncio.get_running_loop()
+                n = await loop.run_in_executor(
+                    None, self._append_many_blocking, list(records), fsync,
+                )
             except Exception:
                 log.exception(
-                    "JSONL writer retention sweep scheduling failed base=%s",
-                    self._base_path,
+                    "JSONL writer append_many failed base=%s", self._base_path,
                 )
+                n = 0
+            await self._maybe_sweep_locked()
+            return n
+
+    async def purge_all(self) -> int:
+        """Unlink EVERY rotated sibling under this base path.
+
+        Used by callers (e.g. ``ShortTermMemory.purge`` during Sleep
+        Metabolism) that need a complete wipe — the agent's STM journal
+        is consolidated into ``archive.md`` nightly, so retaining the
+        raw turn-level files past metabolism would just duplicate state.
+
+        Foreign files in the same directory are NEVER touched (the
+        filename guard in ``sibling_paths()`` ensures we only see files
+        we ourselves wrote). Returns the number of files unlinked.
+        """
+        async with self._lock:
+            removed = 0
+            for p in self.sibling_paths():
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    log.exception(
+                        "JSONL writer purge_all: unlink failed path=%s", p,
+                    )
+            if removed:
+                log.info(
+                    "JSONL writer purge_all base=%s removed=%d",
+                    self._base_path, removed,
+                )
+            return removed
 
     # ---------- internals -----------------------------------------------------
 
-    def _append_blocking(self, record: dict[str, Any]) -> None:
+    async def _maybe_sweep_locked(self) -> None:
+        """Run the daily retention sweep at most once per local day.
+
+        Caller MUST hold ``self._lock``. Failures are logged but never
+        raised — a flaky filesystem must never fail the actual write.
+        """
+        try:
+            today = datetime.now(tz=self._tz).date()
+            if self._retain_days > 0 and self._last_sweep_date != today:
+                self._last_sweep_date = today
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None, self._sweep_blocking, today,
+                )
+        except Exception:
+            log.exception(
+                "JSONL writer retention sweep scheduling failed base=%s",
+                self._base_path,
+            )
+
+    def _append_blocking(
+        self,
+        record: dict[str, Any],
+        fsync: bool = False,
+    ) -> None:
         path = self.active_path()
-        line = json.dumps(record, ensure_ascii=False) + "\n"
+        line = json.dumps(self._stamp(record), ensure_ascii=False) + "\n"
         # POSIX O_APPEND keeps the byte-level write atomic when multiple
         # processes write to the same file — the asyncio lock above
         # handles intra-process races. `os.open` + `os.write` avoids
@@ -165,8 +277,50 @@ class RotatingJsonlWriter:
         fd = os.open(path, flags, 0o644)
         try:
             os.write(fd, line.encode("utf-8"))
+            if fsync:
+                os.fsync(fd)
         finally:
             os.close(fd)
+
+    def _append_many_blocking(
+        self,
+        records: list[dict[str, Any]],
+        fsync: bool = False,
+    ) -> int:
+        """Batched sibling of ``_append_blocking`` — one open() for N records.
+
+        The byte payload is built in RAM first so the os.write() is one
+        contiguous syscall — line-atomic under POSIX O_APPEND just like
+        the single-record path.
+        """
+        path = self.active_path()
+        payload = b"".join(
+            (json.dumps(self._stamp(r), ensure_ascii=False) + "\n").encode("utf-8")
+            for r in records
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(path, flags, 0o644)
+        try:
+            os.write(fd, payload)
+            if fsync:
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        return len(records)
+
+    def _stamp(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Return ``record`` with ``schema_version`` stamped FIRST.
+
+        Pass-through if the caller already set the field — preserves
+        their value and position so a migration-window producer can
+        emit mixed versions intentionally. Otherwise we splice the
+        writer's configured version at the front of a fresh dict so
+        the field is the first key in the serialised JSON object
+        (cheap to grep / eyeball when tailing a feed).
+        """
+        if "schema_version" in record:
+            return record
+        return {"schema_version": self._schema_version, **record}
 
     def _sweep_blocking(self, today: date) -> None:
         cutoff = today - timedelta(days=self._retain_days)

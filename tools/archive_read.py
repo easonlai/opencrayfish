@@ -19,10 +19,13 @@ Failures degrade — a missing/unreadable archive returns
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from .base import ToolResult
+
+log = logging.getLogger(__name__)
 
 
 class ArchiveRead:
@@ -63,8 +66,14 @@ class ArchiveRead:
 
         # Missing archive → empty result, not failure. Mirrors the legacy
         # `(archive empty)` / `(no archive matches)` semantics that
-        # downstream Brain / Cognition code already handles.
+        # downstream Brain / Cognition code already handles. We DO log a
+        # warning so a deleted / not-yet-created archive surfaces in the
+        # rolling agent.log instead of silently degrading every recall.
         if not self._path.exists():
+            log.warning(
+                "ARCHIVE missing at %s — every recall lookup will return empty.",
+                self._path,
+            )
             return ToolResult(
                 ok=True,
                 data=[],

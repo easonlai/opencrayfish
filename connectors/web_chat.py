@@ -36,6 +36,7 @@ Security model:
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -182,7 +183,10 @@ class WebChatConnector:
         token = self._cfg.auth_token.strip()
         if token:
             sent = request.headers.get("X-OCF-Token", "").strip()
-            if sent != token:
+            # Constant-time compare — plain `!=` leaks token length /
+            # prefix via timing side-channel. `compare_digest` runs in
+            # time proportional to the longer of the two inputs.
+            if not hmac.compare_digest(sent, token):
                 log.warning(
                     "Web-chat auth rejected: path=%s remote=%s",
                     request.path,

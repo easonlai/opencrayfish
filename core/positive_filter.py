@@ -10,9 +10,34 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
+# Apostrophe character class — covers ASCII (U+0027), Unicode RIGHT SINGLE
+# QUOTATION MARK (U+2019, what most modern fonts render for "smart quotes"),
+# Unicode LEFT SINGLE QUOTATION MARK (U+2018, rarer but seen in pasted
+# input), and MODIFIER LETTER APOSTROPHE (U+02BC, occasionally emitted by
+# multilingual SLMs). Without this, an SLM that smart-quotes ``I can't``
+# slips past the positive-anchor rewrite because the literal U+0027 in
+# the regex doesn't match U+2019.
+_APOS: Final = r"['\u2019\u2018\u02BC]"
+
 # Conservative, additive rewrites — never silently delete the model's output.
 _REWRITES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
-    (re.compile(r"\bI can'?t\b", re.IGNORECASE), "I will find a way to"),
+    # ``can't`` / ``can\u2019t`` / ``cannot`` / ``can not`` — all four
+    # phrasings of refusal collapse to the same constructive frame.
+    (
+        re.compile(
+            rf"\bI ca(?:n{_APOS}?t|nnot|n\s+not)\b",
+            re.IGNORECASE,
+        ),
+        "I will find a way to",
+    ),
+    # ``won't`` / ``won\u2019t`` / ``will not`` — same treatment.
+    (
+        re.compile(
+            rf"\b(?:won{_APOS}?t|will\s+not)\b",
+            re.IGNORECASE,
+        ),
+        "will",
+    ),
     (re.compile(r"\bimpossible\b", re.IGNORECASE), "challenging"),
     (re.compile(r"\bnever\b", re.IGNORECASE), "not yet"),
     (re.compile(r"\bhopeless\b", re.IGNORECASE), "difficult, but tractable"),
@@ -22,6 +47,10 @@ _REWRITES: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
 )
 
 _HARD_REJECT: Final = re.compile(
+    # ``self.?harm`` matches ``self-harm`` / ``selfharm`` / ``self harm``.
+    # Hate-target group includes the static defaults — the per-instance
+    # regex in ``PositiveFilter.__init__`` adds the configured honorific
+    # and architect name on top of these.
     r"\b(kill yourself|self.?harm|hate (you|the (architect|boss|operator)))\b",
     re.IGNORECASE,
 )

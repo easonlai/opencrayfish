@@ -822,6 +822,14 @@ class Brain:
                 ][-_TRIAGE_CONTEXT_TURNS:]
                 ctx_block = self._render_triage_context(prior) if prior else ""
             except Exception:
+                # STM render is best-effort — a transient failure must not
+                # break the cognition path. Log the exception so operators
+                # can see why a particular turn ran without prior-turn
+                # context (which can degrade follow-up question quality).
+                log.exception(
+                    "CHAT STM render failed; cognition will run without "
+                    "prior-turn context for this message."
+                )
                 ctx_block = ""
             cognitive_trace = await self._cognition.deliberate(
                 user_input or "",

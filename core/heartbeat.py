@@ -666,14 +666,24 @@ class Heartbeat:
             await self._stm.flush_journal()
         except Exception:
             log.exception("STM flush before consolidation failed (continuing).")
-        journal = self._stm.journal_path
-        if journal is None or not journal.exists():
+        # P3.2: STM journal is now rotated daily — a single consolidation
+        # run can straddle a midnight boundary, so iterate every sibling
+        # the writer has produced (oldest first) instead of reading one
+        # fixed file. Empty / missing siblings just contribute nothing.
+        siblings = self._stm.journal_siblings()
+        if not siblings:
             return ""
-        try:
-            lines = journal.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            log.exception("Failed reading STM journal during consolidation.")
-            return ""
+        lines: list[str] = []
+        for sibling in siblings:
+            try:
+                lines.extend(
+                    sibling.read_text(encoding="utf-8").splitlines()
+                )
+            except OSError:
+                log.exception(
+                    "Failed reading STM journal sibling %s during consolidation.",
+                    sibling,
+                )
         out: list[str] = []
         for raw in lines:
             raw = raw.strip()

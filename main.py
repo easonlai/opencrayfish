@@ -189,6 +189,7 @@ async def amain() -> None:
         max_turns=cfg.memory.stm_max_turns,
         journal_path="state/stm_journal.jsonl",
         fsync_on_flush=cfg.system.journal_fsync_on_flush,
+        tz=cfg.system.timezone,
     )
     # Crash recovery: replay yesterday's tail-window before any task starts.
     recovered = await stm.recover()

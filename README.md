@@ -485,6 +485,10 @@ streamlit run ui/dashboard.py --server.port 8501
 
 # 6. Open the browser chat
 streamlit run ui/web_chat.py --server.port 8502
+
+# 7. (Optional) Run the test suite
+pip install -e ".[dev]"                    # adds pytest + pytest-asyncio + ruff
+python -m pytest -q                        # 113 tests, runs in <1s
 ```
 
 Now talk to it on Telegram or in the browser. The agent will reply, remember, decay its mood, get curious during idle time, and once the clock crosses 02:00, it will sleep and consolidate the day.
@@ -1581,13 +1585,13 @@ proactive:
   max_candidates_per_cycle: 3
   fallback_to_preferences: true
   triage_known_token: "YES"
-  refine_enabled: true
 
 cognition:
   enabled: true
   max_subquestions: 3
   max_act_rounds: 2                       # 2 = REFINE allowed; 1 = no refine
   refine_enabled: true
+  dispatch_answer_via_skill: false        # route PLAN ANSWER through DirectAnswerSkill
 
 skills:
   default_cost_tier_cap: "expensive"      # free | cheap | expensive
@@ -1614,7 +1618,7 @@ tasks:
 
 ## Operational Commands
 
-Both connectors recognize:
+Both connectors recognize the slash commands in the table below unless explicitly marked as channel-specific. Where a slash is Telegram-only, the web-chat channel exposes an equivalent JSON field on `POST /chat` (see the `web_chat` section in [`connectors/web_chat.py`](connectors/web_chat.py) for the full request schema).
 
 | Slash | Natural Language equivalent | Action |
 |---|---|---|
@@ -1623,8 +1627,8 @@ Both connectors recognize:
 | `/cancel <id>` | "cancel task abc123", "stop the bitcoin task" | Remove a task |
 | `/pause <id>` | "pause task abc123" | Pause without removing |
 | `/resume <id>` | "resume task abc123" | Resume a paused task |
-| `/research [topic]` | "research <topic>" | Trigger an on-demand proactive cycle |
-| `/emergency <msg>` | (Telegram only) | Bypass Sleep Metabolism gating |
+| `/research [topic]` | (Telegram only) — "research <topic>" | Trigger an on-demand proactive cycle |
+| `/emergency <msg>` | (Telegram only) — web-chat uses `"emergency": true` in the JSON body | Bypass Sleep Metabolism gating |
 
 Plus normal natural-language messages — which automatically route to:
 
@@ -1694,7 +1698,7 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 ## Roadmap
 
-The current codebase is **v2.0**: every subsystem in this README is implemented, tested with smoke scripts, and Pylance-clean. v2.0 consolidates the pluggable Skill layer, the date-rotated JSONL audit feeds, the Architect-priority cooperative yield between live `think()` and autonomous proactive research, and the atomic-swap write path for `soul.md`. The natural next directions:
+The current codebase is **v2.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (113 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean. v2.0 consolidates the pluggable Skill layer, the date-rotated JSONL audit feeds, the Architect-priority cooperative yield between live `think()` and autonomous proactive research, and the atomic-swap write path for `soul.md`. The natural next directions:
 
 - **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs), `mcp_bridge` (turn any MCP server into a Skill).
 - **GPIO / I²C sensor library** — temperature/humidity (BME680), motion (PIR), light (TSL2591), gas (CCS811/MQ-2), heart rate (MAX30102), motion (MPU6050) feeding straight into `VitalSigns` and `MoodTuning`.
@@ -1703,7 +1707,7 @@ The current codebase is **v2.0**: every subsystem in this README is implemented,
 - **Output actuators** — WS2812 LED strip for mood visualization, OLED for facial expression, servos for embodied motion — these are `side_effects=True, requires_confirmation=False` Skills with policy.
 - **Sleep-time soul evolution v2** — SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve, replacing the current rule-based `_consolidate_reflections`.
 - **Encrypted state at rest** — for deployments in regulated environments (clinical, legal, financial).
-- **Pytest suite** — the project currently has only smoke checks. Coverage of `Emotions`, `PositiveFilter`, `CognitiveLoop` parsing, `SkillRegistry.plan_menu`, and the task pre-filter chain would be high-impact — see [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
+- **Pytest suite expansion** — the project now ships a real `tests/` directory (113 tests covering `IntentRouter`, `RotatingJsonlWriter` schema + STM rotation, `PositiveFilter`, `prompt_assembly`, `SkillContext`, and the task-parsing pre-filters). The next coverage gaps worth filling: `Emotions` decay/nudge math, `CognitiveLoop` THINK/PLAN/REFINE parsing edge cases, `SkillRegistry.plan_menu` filtering under stressed vitals + offline brain, and `Provider`'s circuit-breaker trip / half-open / recover lifecycle. See [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
 
 ---
 
@@ -1727,7 +1731,7 @@ OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passi
 
 Look for the [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue) label. Concrete areas where help is especially appreciated:
 
-- **Pytest suite** — the project currently has only smoke checks. Adding real tests for `Emotions`, `PositiveFilter`, `CognitiveLoop` parsing, and the task pre-filter chain would be high-impact.
+- **Pytest suite expansion** — the `tests/` directory ships with 113 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
 - **Hardware port reports** — try OpenCrayFish on a Pi 4, an Orange Pi, a Jetson Nano, or an x86 mini-PC and file an Issue tagged `hardware-port` with your `state/vitals.json` and notable latency numbers.
 - **New `Tool` plugins** — implement the `Tool` protocol from [tools/base.py](tools/base.py) for local file ops, GPIO control, sensor reads, MCP servers, etc.
 - **New `Connector`s** — Discord, Slack, Matrix, IRC, MCP server. Use [connectors/web_chat.py](connectors/web_chat.py) as a template.

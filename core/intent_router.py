@@ -40,12 +40,15 @@ must still pass.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from .brain.orchestrator import Brain
     from .scheduler import Task, TaskScheduler
+
+log = logging.getLogger(__name__)
 
 IntentKind = Literal["list", "action", "modify", "create", "noop"]
 ActionVerb = Literal["cancel", "pause", "resume"]
@@ -161,6 +164,14 @@ class IntentRouter:
         cheapest-filter-first order and returns the first match.
         """
         if self._scheduler is None or not user_input:
+            # Make the bypass observable — silent noop here used to be
+            # a debugging headache ("why doesn't /tasks parsing fire?").
+            log.debug(
+                "IntentRouter noop: scheduler=%s input_len=%d origin=%s",
+                "enabled" if self._scheduler is not None else "disabled",
+                len(user_input or ""),
+                self._origin,
+            )
             return IntentOutcome(kind="noop")
 
         # Local imports — scheduler is a leaf module with no Brain deps;
