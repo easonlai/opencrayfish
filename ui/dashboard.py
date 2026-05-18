@@ -17,13 +17,26 @@ import + call here.
 Pure read-only: the dashboard NEVER writes any of the agent's state
 files. It is a mirror, not a control surface.
 """
-# ruff: noqa: I001  (import order matters — ui.panels must come before
-# core.* so the sys.path side-effect in ui.panels._paths fires first)
+# ruff: noqa: I001  (import order matters — the sys.path bootstrap below
+# must run before ui.panels resolves, and ui.panels must come before
+# core.* so the sys.path side-effect in ui.panels._paths also fires.)
 from __future__ import annotations
 
-import streamlit as st
+# Streamlit invokes this file as a script (``streamlit run ui/dashboard.py``),
+# which puts ``ui/`` on sys.path[0] — NOT the repo root. That means
+# ``from ui.panels import ...`` fails with ModuleNotFoundError before the
+# in-package bootstrap in ``ui/panels/_paths.py`` ever runs. Mirror the
+# same bootstrap here so the script form works from any cwd.
+import sys as _sys
+from pathlib import Path as _Path
 
-from ui.panels import (
+_REPO_ROOT_BOOTSTRAP = _Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT_BOOTSTRAP) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT_BOOTSTRAP))
+
+import streamlit as st  # noqa: E402
+
+from ui.panels import (  # noqa: E402
     deliberation,
     footer,
     header,
@@ -35,10 +48,10 @@ from ui.panels import (
     tools,
     vitals,
 )
-from ui.panels._paths import REFRESH_SECONDS, REPO_ROOT
-from ui.panels._readers import read_state
+from ui.panels._paths import REFRESH_SECONDS, REPO_ROOT  # noqa: E402
+from ui.panels._readers import read_state  # noqa: E402
 
-# Side-effect import: ``ui.panels._paths`` prepends the repo root to
+# Side-effect import: ``ui.panels._paths`` also prepends the repo root to
 # ``sys.path`` at import time so ``from core...`` resolves below. Keep
 # this Config import AFTER the panels import to preserve that ordering.
 from core.config import Config  # noqa: E402

@@ -22,6 +22,7 @@
 - [Hardware & Software Stack](#hardware--software-stack)
 - [Repository Layout](#repository-layout)
 - [Quick Start](#quick-start)
+- [SearXNG Setup (Local Web Search)](#searxng-setup-local-web-search)
 - [Deep Dive: How Everything Works](#deep-dive-how-everything-works)
   - [1. The Soul — `soul.md`](#1-the-soul--soulmd)
   - [2. The Heartbeat — Time, Rhythm, and Metabolism](#2-the-heartbeat--time-rhythm-and-metabolism)
@@ -403,7 +404,12 @@ OpenCrayFish/
 │   ├── provider.py           ← Ollama/Hailo backends + circuit breaker
 │   ├── stm.py                ← short-term memory (RAM + journal)
 │   ├── cognition.py          ← THINK → PLAN → ACT → REFINE loop (dispatches via SkillRegistry)
-│   ├── brain.py              ← prompt assembly orchestrator
+│   ├── brain/                ← prompt-assembly + orchestration package
+│   │   ├── orchestrator.py   ← Brain class — top-level _cycle() pipeline
+│   │   ├── prompt_assembly.py ← soul + vitals + mood + KNOWLEDGE + STM prompt builder
+│   │   ├── identity_responder.py ← deterministic identity-class reply templater
+│   │   └── task_parsing.py   ← LLM-backed task-intent / task-action parsers
+│   ├── intent_router.py      ← shared NL pre-filter chain for both connectors
 │   ├── reflection.py         ← self-critique engine (reads skills.jsonl for failure flags)
 │   ├── jsonl_writer.py       ← date-rotating, retention-bounded JSONL appender
 │   ├── heartbeat.py          ← pulse_loop + metabolism + proactive_thought
@@ -468,7 +474,10 @@ pip install -r requirements.txt
 # 2. Bring up the local stack (separate terminals or systemd units)
 ollama serve                              # CPU fallback
 ollama pull qwen2:1.5b
-docker run -d -p 8080:8080 searxng/searxng    # web search
+# Self-hosted web search — see the full setup section below; the one-line
+# command here will work for the first boot but will return HTTP 403 on every
+# search until you enable the JSON API. See § SearXNG Setup for the fix.
+docker run -d --name searxng -p 8080:8080 searxng/searxng
 # (Pi 5 only) hailo-ollama serve            # NPU primary
 
 # 3. Configure
@@ -492,6 +501,138 @@ python -m pytest -q                        # 113 tests, runs in <1s
 ```
 
 Now talk to it on Telegram or in the browser. The agent will reply, remember, decay its mood, get curious during idle time, and once the clock crosses 02:00, it will sleep and consolidate the day.
+
+---
+
+## SearXNG Setup (Local Web Search)
+
+OpenCrayFish's `research` Skill, the autonomous proactive cycle, and the recurring-task scheduler **all** depend on a working [SearXNG](https://docs.searxng.org/) instance reachable at `tools.searxng_url` (default `http://localhost:8080`). The agent calls SearXNG over its **JSON API** — and SearXNG ships that API **disabled by default**, which is the single most common "the agent doesn't search anymore" failure mode. This section walks through a known-good Docker deployment.
+
+> **Why self-hosted?** Pillar 1 (Sovereign AI) mandates that the agent's web requests never leak to a third-party search provider. A self-hosted SearXNG aggregates dozens of upstream engines (Google, Bing, DuckDuckGo, Brave, Qwant, Wikipedia, …) without ever exposing the Architect's queries or IP. From OpenCrayFish's perspective, the wire format is plain JSON over HTTP — no API key, no rate-limit account, no vendor lock-in.
+
+### Minimum viable deployment
+
+```bash
+# Pull and start the container (port 8080 on the host)
+docker run -d \
+  --name searxng \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  searxng/searxng:latest
+```
+
+The first start auto-generates an internal `/etc/searxng/settings.yml` inside a Docker-managed named volume. The container is reachable at `http://localhost:8080` but **the JSON API is OFF** — every call from OpenCrayFish will fail with `HTTP 403 Forbidden` until you enable it (see next subsection).
+
+### Enable the JSON API (REQUIRED)
+
+There are two equally-valid ways to do this. **Method A** is the fastest fix for an existing container; **Method B** is the cleaner long-term setup if you want your config in version control.
+
+#### Method A — patch the in-container settings.yml (fastest)
+
+Use this if you already have the container running with the default named volume:
+
+```bash
+# 1) Add "- json" to the formats list (idempotent — re-running is safe)
+docker exec searxng sh -c "grep -q '^    - json' /etc/searxng/settings.yml || sed -i '/^  formats:/,/^[^ ]/ { /^    - html$/a\\
+    - json
+}' /etc/searxng/settings.yml"
+
+# 2) Restart so the change takes effect
+docker restart searxng
+
+# 3) Verify (should print HTTP 200 and a JSON payload)
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+  'http://localhost:8080/search?q=test&format=json'
+```
+
+The patch survives container restarts because it's persisted inside the named volume. It would only be lost if you `docker volume rm` the SearXNG volume.
+
+#### Method B — bind-mount your own settings.yml (cleanest)
+
+If you'd rather keep SearXNG's config in `~/searxng/` (or `/etc/searxng/` on a server, or anywhere git-tracked), use a bind mount instead of the default named volume. **Remove the existing container first** (the named volume can stay):
+
+```bash
+docker rm -f searxng 2>/dev/null
+
+# Create a minimal settings.yml in your home directory
+mkdir -p ~/searxng
+cat > ~/searxng/settings.yml <<'YAML'
+use_default_settings: true
+
+server:
+  # Replace with `openssl rand -hex 32` for production; any 32+ char string works.
+  secret_key: "change-me-please-32-plus-character-string"
+  limiter: false          # set true on public instances; false is fine on loopback
+  image_proxy: true
+
+search:
+  formats:
+    - html
+    - json                # ← required by OpenCrayFish
+  safe_search: 1          # 0=none, 1=moderate, 2=strict (OpenCrayFish sends 1)
+YAML
+
+# Start with the bind mount
+docker run -d \
+  --name searxng \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -v ~/searxng/settings.yml:/etc/searxng/settings.yml:ro \
+  searxng/searxng:latest
+```
+
+Future config changes are just `$EDITOR ~/searxng/settings.yml && docker restart searxng`.
+
+### End-to-end smoke test
+
+After either method, the JSON endpoint should respond exactly like OpenCrayFish expects it to:
+
+```bash
+curl -sS 'http://localhost:8080/search?q=raspberry+pi+5&format=json' \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print(f"results={len(d[\"results\"])}, first={d[\"results\"][0][\"url\"]}" if d.get("results") else "EMPTY")'
+```
+
+Expected output (URLs will vary):
+
+```text
+results=10, first=https://www.raspberrypi.com/products/raspberry-pi-5/
+```
+
+When this works, your agent's next `/research` (or any user query that triages to `SEARCH`) will succeed end-to-end. Cross-check `state/logs/agent.log` — you should see `TOOL call name=web_search status=ok latency_ms=...` instead of `status=fail ... 403 Forbidden`.
+
+### Tuning that OpenCrayFish actually cares about
+
+The defaults in `use_default_settings: true` are fine for local dev. Two SearXNG knobs are worth knowing about for a 24/7 edge deployment:
+
+| `settings.yml` key | Recommended | Why |
+|---|---|---|
+| `search.formats` | `[html, json]` | **Required** — OpenCrayFish only speaks JSON. |
+| `search.safe_search` | `1` (moderate) | Matches what `tools/searxng.py` always sends (`safesearch=1`). Setting `2` may filter results too aggressively; setting `0` may surface NSFW snippets to `proactive_learning`. |
+| `server.limiter` | `false` on a loopback instance, `true` if you ever expose port 8080 to the LAN/WAN | The limiter rejects requests that look bot-like — including ones from your own agent. Leave it off unless port 8080 is publicly reachable. |
+| `server.image_proxy` | `true` | Hides upstream image fetches behind SearXNG so favicons / thumbnails don't leak the Architect's IP. |
+| `engines` (per-entry `disabled: true`) | disable anything noisy | If a particular search engine is rate-limiting your IP and polluting results with `unresponsive_engines` warnings, disable it. The aggregator works fine with the remaining engines. |
+
+### Wiring it into `config.yaml`
+
+The only OpenCrayFish-side setting is the URL:
+
+```yaml
+tools:
+  searxng_url: "http://localhost:8080"   # http://<host>:8080 if SearXNG is on another box
+```
+
+No auth, no API key. OpenCrayFish always sends `q=<query>&format=json&safesearch=1` (`tools/searxng.py`'s `search(...)` and `Tool.call(...)` surfaces) — there's no other tuning to do.
+
+### Troubleshooting
+
+| Symptom in `state/logs/agent.log` | Likely cause | Fix |
+|---|---|---|
+| `TOOL call name=web_search status=fail ... 403 Forbidden` | JSON API not enabled | Apply **Method A** above. |
+| `TOOL call name=web_search status=fail ... ConnectError` | Container not running, or port 8080 in use by something else | `docker ps`, `docker logs searxng`, `lsof -i :8080` |
+| `TOOL call name=web_search status=ok ... hits=0` for every query | Upstream engines rate-limiting your IP; or `safe_search: 2` filtering everything | Inspect `docker logs searxng` for `unresponsive_engines`. Disable the noisy engines in `settings.yml` or lower `safe_search`. |
+| `TOOL call name=web_search status=fail ... 429 Too Many Requests` | `server.limiter: true` is blocking the agent's own traffic | Set `limiter: false` in `settings.yml` and `docker restart searxng`. |
+
+> **The agent degrades gracefully.** Even with SearXNG totally down, the `recall` and `direct_answer` Skills still work — `Cognition`'s ACT stage will silently drop the `SEARCH` evidence and synthesize from LTM + STM + SLM knowledge. The dashboard's **⚠️ Errors & warnings** panel will surface the SearXNG failures so you know to fix them, but the agent stays conversational. See [§ Failure-Mode Matrix](#failure-mode-matrix) for the full degradation contract.
 
 ---
 
@@ -781,7 +922,7 @@ Rotation + retention details live in [§ JSONL Rotation & Retention](#jsonl-rota
 
 ### 6. The Thinking Process — Brain & Cognitive Loop
 
-**Modules:** [core/brain.py](core/brain.py) · [core/cognition.py](core/cognition.py)
+**Modules:** [core/brain/orchestrator.py](core/brain/orchestrator.py) · [core/brain/prompt_assembly.py](core/brain/prompt_assembly.py) · [core/brain/identity_responder.py](core/brain/identity_responder.py) · [core/cognition.py](core/cognition.py)
 
 Every reply the agent produces — whether triggered by a user message, a heartbeat proactive thought, or a scheduled task — flows through `Brain._cycle()`. The cycle is a strict pipeline:
 
@@ -922,7 +1063,7 @@ A 5-dimensional state with per-channel baselines:
 | **excitement** | 0.2 | new topics, positive surprise |
 | **calm** | 0.6 | the resting state — drift target for everything else |
 
-Each pulse, every channel decays exponentially toward its baseline with a `half_life_pulses=6` (≈3 minutes at 30s/pulse). All deltas live on `MoodTuning` so brain.py / heartbeat.py read a single source of truth instead of sprinkling magic numbers.
+Each pulse, every channel decays exponentially toward its baseline with a `half_life_pulses=6` (≈3 minutes at 30s/pulse). All deltas live on `MoodTuning` so [core/brain/orchestrator.py](core/brain/orchestrator.py) and [core/heartbeat.py](core/heartbeat.py) read a single source of truth instead of sprinkling magic numbers.
 
 ##### Mood deltas (exact values from `core/emotions.MoodTuning`)
 
