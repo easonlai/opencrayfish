@@ -298,7 +298,37 @@ class Heartbeat:
         """
         return await self._proactive_research(topic_override=topic_override)
 
+    def _yield_to_foreground(self, stage: str, *, topic: str | None = None) -> bool:
+        """Return True if the Architect has spoken — caller should bail out.
+
+        Background autonomous research must not hog the NPU while a live
+        Architect turn is waiting in the inference queue. The proactive
+        cycle calls this between every long-running milestone (topic
+        selection, web search, SLM synthesis, REFINE); the first True
+        return short-circuits the rest of the cycle. Re-tried on the next
+        idle window — no data loss, just a deferred curiosity tick.
+        """
+        if not self._brain.is_foreground_busy():
+            return False
+        log.info(
+            "PROACTIVE yield_to_foreground stage=%s topic=%r — Architect is active.",
+            stage, topic or "(pre-topic)",
+        )
+        return True
+
     async def _proactive_research(self, *, topic_override: str | None = None) -> dict | None:
+        # Yield BEFORE topic selection too: STM-gap extraction itself
+        # makes a small SLM call to self-assess. If the Architect just
+        # spoke, defer the whole cycle.
+        #
+        # Manual `/research [topic]` requests are operator-initiated and
+        # bypass EVERY yield checkpoint — silently dropping an explicit
+        # operator command would be worse than running it concurrently
+        # with another foreground turn. Only the autonomous idle-driven
+        # path yields.
+        if not topic_override and self._yield_to_foreground("topic_selection"):
+            return None
+
         # Two-stage topic selection. STM gaps win; LEARNED_PREFERENCES is
         # the safety net for quiet days.
         triage_decisions: list[dict] = []
@@ -314,6 +344,12 @@ class Heartbeat:
                 "(triage_decisions=%d).",
                 len(triage_decisions),
             )
+            return None
+
+        # Same bypass as checkpoint #1: manual `/research` skips this
+        # yield. Autonomous idle research yields if Architect spoke
+        # while topic selection was in flight.
+        if not topic_override and self._yield_to_foreground("pre_search", topic=topic):
             return None
 
         log.info("PROACTIVE: source=%s topic=%r — searching SearXNG ...", source, topic)
@@ -359,6 +395,12 @@ class Heartbeat:
             f"Web findings:\n{digest}\n"
             "Produce a 2-sentence reflection that may later become a Core Memory."
         )
+        # Yield BEFORE the largest SLM call in the proactive cycle (~1 s
+        # on NPU). Manual `/research` paths skip the yield (operator
+        # explicitly asked); autonomous paths defer if the Architect spoke
+        # while we were waiting on SearXNG.
+        if not topic_override and self._yield_to_foreground("pre_synthesis", topic=topic):
+            return None
         try:
             trace = await self._brain.proactive_thought(mission)
         except Exception:

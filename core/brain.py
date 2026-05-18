@@ -340,11 +340,47 @@ class Brain:
         # completion, and drain remaining ones in aclose().
         self._inflight: set[asyncio.Task[Any]] = set()
 
+        # Foreground-priority signal. Background subsystems (Heartbeat's
+        # proactive research, TaskScheduler's recurring synthesis) read
+        # `is_foreground_busy()` at each long-running milestone and yield
+        # the NPU back to the Architect when this is non-zero. A depth
+        # counter (instead of a bare flag) handles the legitimate case
+        # where Architect input arrives concurrently on two connectors
+        # (Telegram + Web Chat) and both have a `think()` cycle in flight
+        # — yield stays asserted until ALL of them finish.
+        self._foreground_depth: int = 0
+        # asyncio is single-threaded so int inc/dec at non-await points
+        # is atomic; no lock needed for the counter itself.
+
     # ---------- public entry points ------------------------------------------
+
+    def is_foreground_busy(self) -> bool:
+        """True when an Architect-initiated `think()` cycle is in flight.
+
+        Read by background subsystems (Heartbeat._proactive_research,
+        TaskScheduler._fire) at long-running milestones so they can
+        cooperatively yield NPU bandwidth back to the live conversation
+        path. Cheap (single int comparison), safe to poll.
+        """
+        return self._foreground_depth > 0
 
     async def think(self, user_input: str) -> ThoughtTrace:
         """Full PROMPT_ASSEMBLY cycle for an incoming user message."""
-        trace = await self._cycle(user_input=user_input, mission=None)
+        self._foreground_depth += 1
+        log.info(
+            "FOREGROUND start depth=%d input_chars=%d",
+            self._foreground_depth, len(user_input or ""),
+        )
+        t0 = time.perf_counter()
+        try:
+            trace = await self._cycle(user_input=user_input, mission=None)
+        finally:
+            self._foreground_depth -= 1
+            log.info(
+                "FOREGROUND end depth=%d dur_ms=%.1f",
+                self._foreground_depth,
+                (time.perf_counter() - t0) * 1000.0,
+            )
         # Self-reflection runs in the background — it must NOT delay the reply
         # the connector is about to send. Skip when the provider is offline:
         # there's no real reply to learn from and reflection itself would

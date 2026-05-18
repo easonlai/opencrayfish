@@ -165,6 +165,9 @@ python scripts/smoke_phase31_rotation_reflection_identity.py
 # Dashboard rotation-aware feed readers (fan-out across rotated siblings)
 python scripts/smoke_dashboard_rotation.py
 
+# Architect-priority cooperative yield (Brain ↔ Heartbeat foreground signalling)
+python scripts/smoke_foreground_priority.py
+
 # Pylance check (in VS Code: open the workspace — should show 0 problems)
 ```
 

@@ -1028,6 +1028,22 @@ The result: **the agent gets smarter while the Architect sleeps**. Every morning
 
 `/research [topic]` from either connector triggers `trigger_proactive(topic_override)` for an on-demand cycle (does NOT reset the idle clock).
 
+#### Architect-priority cooperative yield
+
+The autonomous research cycle holds the NPU for several seconds per SLM call (topic-selection triage → SearXNG → synthesis → REFINE). If the Architect speaks while a cycle is in flight, the live `think()` would otherwise queue behind the autonomous work on the single Hailo queue — a latency priority inversion. Phase 4 closes that gap with a **cooperative yield at every long-running milestone**:
+
+| Checkpoint | Where in `_proactive_research` | Behaviour when `brain.is_foreground_busy()` is true |
+|---|---|---|
+| `topic_selection` | top of the cycle (before STM-gap SLM call) | bail → return `None` |
+| `pre_search` | after topic resolved, before SearXNG round-trip | bail → return `None` |
+| `pre_synthesis` | before the largest SLM call (`brain.proactive_thought`) | bail → return `None` |
+
+Brain exposes `is_foreground_busy()` as a single-int comparison (a depth counter incremented on `think()` entry and decremented in `finally`); the counter handles concurrent foreground turns from Telegram + Web Chat correctly. The maximum yield latency is bounded by the next SLM call (~1 s ceiling) — no hard preemption, no half-written state. Every yield is logged as `PROACTIVE yield_to_foreground stage=<x> topic=<y> — Architect is active.` so the dashboard's chat-activity panel makes the deference visible.
+
+Manual `/research [topic]` is **operator-initiated** and bypasses all three checkpoints — silently dropping an explicit operator command would be worse than running it concurrently with another foreground turn. Only the autonomous idle-driven path yields.
+
+> Validated by [scripts/smoke_foreground_priority.py](scripts/smoke_foreground_priority.py).
+
 ---
 
 ### 10. Self-Reflection — The Self-Learning Loop
@@ -1094,6 +1110,7 @@ The scheduler then, every `interval_seconds`:
 - **Sleep-window aware.** Tasks PAUSE during 02:00–06:00. After wakeup, any task whose `next_run_at` slid past in the night fires ONCE as a catch-up, then resumes its normal cadence.
 - **Persistent.** State is in `state/tasks.yaml` — atomic writes survive reboots. Each task remembers its `origin` so deliver callbacks rebind to the right connector at boot via `bind_deliver()`.
 - **Bounded.** `max_active_tasks` (default 16) caps registry size. The cost is *sequential SLM time per fire*, not registry size.
+- **Does NOT yield to foreground.** Unlike autonomous proactive research (which yields when the Architect is busy — see [§ 9](#9-proactiveness--idle-time-as-growth-time)), the scheduler runs each task to completion regardless. Tasks are **explicit operator-scheduled deliverables** with a known cadence; deferring them would risk missing the next scheduled report. If a scheduler tick overlaps a live `think()` cycle, both queue on the NPU sequentially — the live turn gets ~1 task-fire of added latency in the worst case, which is acceptable for the operator-promised guarantee that every tick produces its report.
 
 #### Operational commands
 
@@ -1351,9 +1368,21 @@ The three high-frequency feeds — `deliberation`, `skills`, `reflection` — ar
 
 #### Logs on disk
 
-- `state/logs/agent.log` — rotating console mirror (`RotatingFileHandler`, 2 MB × 5 files) set up in [main.py](main.py). Every structured event (`CHAT / TG / WEB / TASK / TOOL / SKILL / MOOD / VITALS`) plus all `[INFO] / [WARNING] / [ERROR] / [CRITICAL]` lines land here. This is the single source the dashboard's chat-activity and errors-and-warnings panels tail.
+- `state/logs/agent.log` — rotating console mirror (`RotatingFileHandler`, 2 MB × 5 files) set up in [main.py](main.py). Every structured event (`CHAT / TG / WEB / TASK / TOOL / SKILL / MOOD / VITALS / FOREGROUND / PROACTIVE`) plus all `[INFO] / [WARNING] / [ERROR] / [CRITICAL]` lines land here. This is the single source the dashboard's chat-activity and errors-and-warnings panels tail.
 - `<memory.log_path>/YYYY-MM-DD.log` — per-day heartbeat telemetry (PULSE / PROACTIVE / Sleep Metabolism). Default `logs/daily/`. Written synchronously by [core/heartbeat.py](core/heartbeat.py)'s `_append_log()`.
 - `state/*-YYYY-MM-DD.jsonl` — date-rotated structured audit feeds (see [§ JSONL Rotation & Retention](#jsonl-rotation--retention)).
+
+##### Phase 4 instrumentation (foreground priority)
+
+Every live conversation turn now bookends itself in `state/logs/agent.log`, and every yielded background cycle leaves a single explanatory line:
+
+| Source | Format | When |
+|---|---|---|
+| `core.brain` | `FOREGROUND start depth=N input_chars=M` | `Brain.think()` entry — `N` is the foreground depth counter after the increment (≥1 means at least one live turn in flight; ≥2 means concurrent connectors) |
+| `core.brain` | `FOREGROUND end depth=N dur_ms=X` | `Brain.think()` exit (success OR exception — emitted from `finally`) — gives wall-clock latency per turn |
+| `core.heartbeat` | `PROACTIVE yield_to_foreground stage=<x> topic=<y> — Architect is active.` | autonomous proactive cycle deferred at one of the three checkpoints (`topic_selection` / `pre_search` / `pre_synthesis`); `topic=(pre-topic)` when no topic has been resolved yet |
+
+These three lines flow into the dashboard's **💬 Live chat activity** and **⚠️ Errors & warnings** panels via the existing `CHAT / TG / WEB / TASK / TOOL / SKILL` filter (FOREGROUND / PROACTIVE are surfaced through the same `agent.log` tail), so an operator can see at a glance when the Architect interrupted background research and how long the live cycle took.
 
 ---
 
@@ -1381,6 +1410,25 @@ Mutable state is protected by **fine-grained `asyncio.Lock`s**, not a global loc
 - `ShortTermMemory._lock` — protects the deque + pending buffer + journal write path.
 
 Because the Provider's HTTP calls are async (`httpx.AsyncClient`), a long-running SLM call does NOT block the heartbeat — the loop simply yields and the heartbeat fires at its scheduled interval. Per-turn brain cycles can comfortably overlap an in-flight scheduler task fire on the same event loop.
+
+#### Foreground priority — cooperative yield without a lock
+
+There's a coordination gap that locks can't solve. The Hailo-10H exposes a single inference queue; when the autonomous proactive cycle is mid-flight (a 5–10 s sequence of SLM calls), a fresh `Brain.think()` from Telegram queues behind it and the Architect waits. This is not a race — every shared file is already locked — it is a **latency priority inversion** at the NPU. A lock can't fix it because the offending work is legitimately holding the resource; we need it to *step aside*.
+
+The solution is a **signal, not a lock**:
+
+- `Brain` owns an integer `_foreground_depth` counter, incremented at `think()` entry and decremented in `finally`. Because asyncio is single-threaded, int inc/dec between `await` points is atomic — no `Lock` needed. The counter (rather than a boolean `Event`) handles the legitimate case of Telegram + Web Chat both having a live turn at once: it stays asserted until **all** foreground turns finish.
+- `Brain.is_foreground_busy()` exposes the counter as a single int comparison. Background subsystems poll it — cheap, side-effect-free, safe to call from any coroutine.
+- `Heartbeat._proactive_research()` calls `_yield_to_foreground()` at three milestones — `topic_selection` (before the STM-gap triage call), `pre_search` (before the SearXNG round-trip), `pre_synthesis` (before the largest SLM call). When the signal is asserted, the cycle returns `None` and the next idle window retries from scratch. No state has been mutated yet, so nothing is lost. Maximum yield latency is bounded by the next SLM call — roughly a 1 s ceiling.
+
+The design choices behind this shape:
+
+- **Cooperative, not preemptive.** We never `task.cancel()` the background cycle. A cancelled HTTP call against the NPU server leaves the SLM queue in a half-known state; cooperative bail at clean milestones costs at most one extra SLM call of latency for a clean shutdown.
+- **Only the autonomous path yields.** Operator-initiated `/research [topic]` (`topic_override` set) bypasses every checkpoint — silently dropping an explicit operator command would be worse than running it concurrently with another foreground turn.
+- **`TaskScheduler` does NOT yield.** Recurring tasks are operator-scheduled deliverables with a known cadence; deferring them would risk missing the next scheduled report. The latency cost of overlapping a task fire with a live turn (~1 task-fire of added wait, worst case) is the acceptable price.
+- **The signal IS the audit.** Every yield emits a single `PROACTIVE yield_to_foreground stage=<x> topic=<y>` line into `state/logs/agent.log`, so the dashboard's chat-activity panel makes the deference visible to the operator. See [§ 9 Proactiveness](#9-proactiveness--idle-time-as-growth-time) for the checkpoint table and [§ 14 Observability](#14-observability--dashboard--state-files) for the log format.
+
+Validated by [scripts/smoke_foreground_priority.py](scripts/smoke_foreground_priority.py) (5 checks: counter lifecycle on success + exception, concurrent-turn depth semantics, yield helper, autonomous bail, operator bypass).
 
 ### Atomic Writes Everywhere
 
@@ -1446,6 +1494,7 @@ Each subsystem is designed to **degrade, not crash**, when its dependency is bro
 | **Cognitive Loop fails to parse THINK output** | Loop bails with `engaged=False`, `bypass_reason="think_unparseable"`. Brain falls through to legacy single-shot path. Trace still appended to `state/deliberation-YYYY-MM-DD.jsonl` for forensics. | None — every cycle is independent. |
 | **Connector outage (Telegram API rate-limit)** | python-telegram-bot retries internally. Agent state untouched; replies queue and drain when API recovers. | None — wait for rate-limit window. |
 | **Heartbeat coroutine raises** | Exception propagates; Heartbeat task dies; `await pulse_task` in `main.amain()` raises and the process exits non-zero. | Restart the agent (systemd unit recommended). STM rehydrates from journal at boot. |
+| **Architect speaks while autonomous proactive research is mid-cycle** | The cycle yields at the next milestone (≤1 SLM call latency, ~1 s ceiling); no state mutation occurs because nothing was persisted yet. Live `think()` proceeds with normal latency. `PROACTIVE yield_to_foreground` line lands in `state/logs/agent.log`. | Automatic — the next idle window (after `idle_proactive_minutes` of silence) restarts the cycle from scratch. Manual `/research [topic]` bypasses the yield entirely. |
 
 The repeated theme: **per-turn / per-pulse work is independent**, so a single failure never poisons the next cycle. The only un-survivable failure is the `Heartbeat` task itself dying, because there's no point keeping a body alive without a heart — better to fail loudly under systemd than to silently freeze.
 
