@@ -253,7 +253,25 @@ class SoulHandler:
                         f"Refusing write: marker {marker!r} count would become "
                         f"{new_raw.count(marker)} (must be 1)."
                     )
-            self._path.write_text(new_raw, encoding="utf-8")
+            # Atomic disk swap: write to a sibling tmp then POSIX-rename
+            # over the canonical path. Guarantees a power-loss / OOM-kill
+            # mid-write never leaves soul.md truncated — the on-disk file
+            # is ALWAYS either the previous good content or the new good
+            # content, never a half-written intermediate. The four dry-run
+            # checks above (sanitize, immutable fingerprint, marker count)
+            # have already proven `new_raw` is structurally valid, so the
+            # only failure mode left is the disk I/O itself.
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            try:
+                tmp.write_text(new_raw, encoding="utf-8")
+                tmp.replace(self._path)  # atomic on the same filesystem
+            except Exception:
+                # Clean up any half-written tmp so it doesn't linger as
+                # operator-visible cruft. The canonical soul.md is
+                # untouched because tmp.replace was either not reached
+                # or is itself atomic.
+                tmp.unlink(missing_ok=True)
+                raise
             log.info(
                 "Soul append: section=%s len=%d preview=%r",
                 section_key,

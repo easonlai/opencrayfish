@@ -165,6 +165,9 @@ python scripts/smoke_phase31_rotation_reflection_identity.py
 # Dashboard rotation-aware feed readers (fan-out across rotated siblings)
 python scripts/smoke_dashboard_rotation.py
 
+# soul.md atomic-write + crash-safety (tmp + os.replace + cleanup-on-failure)
+python scripts/smoke_soul_atomic.py
+
 # Architect-priority cooperative yield (Brain ↔ Heartbeat foreground signalling)
 python scripts/smoke_foreground_priority.py
 
