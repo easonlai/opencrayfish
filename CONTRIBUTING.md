@@ -154,13 +154,13 @@ python -c "from core import brain, heartbeat, cognition, emotions, empathy, moni
 python -c "from tools import searxng, registry, base, archive_read; from connectors import telegram, web_chat; from core.skills import identity, recall, research, direct_answer, self_reflect, proactive_learning, recurring_research; print('tools+connectors+skills OK')"
 
 # PLAN-stage menu filter matrix (cost-tier cap, offline, stressed)
-python scripts/smoke_phase3_menu.py
+python scripts/smoke_skill_menu.py
 
 # CognitiveLoop dispatch + dynamic menu + degrade paths
-python scripts/smoke_phase3_dispatch.py
+python scripts/smoke_cognition_dispatch.py
 
 # JSONL rotation + reflection skill-failure summary + identity skill
-python scripts/smoke_phase31_rotation_reflection_identity.py
+python scripts/smoke_rotation_reflection_identity.py
 
 # Dashboard rotation-aware feed readers (fan-out across rotated siblings)
 python scripts/smoke_dashboard_rotation.py
@@ -176,7 +176,7 @@ python scripts/smoke_foreground_priority.py
 
 Each smoke script prints `ALL ... PASSED` on success and exits non-zero on failure, so you can chain them in CI.
 
-If your PR adds a new module, add an import line for it to the smoke checks. If your PR adds a new Skill, register it in `scripts/smoke_phase3_menu.py` and verify the assertions still hold.
+If your PR adds a new module, add an import line for it to the smoke checks. If your PR adds a new Skill, register it in `scripts/smoke_skill_menu.py` and verify the assertions still hold.
 
 ---
 

@@ -120,8 +120,8 @@ class SkillRegistry:
         self._skills: dict[str, Skill] = {}
         self._audit_feed = Path(audit_feed)
         self._audit_feed.parent.mkdir(parents=True, exist_ok=True)
-        # Phase 3.1: rotate the audit feed by local date with bounded
-        # retention so a long-running Pi never fills the SD card.
+        # Rotate the audit feed by local date with bounded retention so
+        # a long-running Pi never fills the SD card.
         self._audit_writer = RotatingJsonlWriter(
             self._audit_feed,
             retain_days=audit_retain_days,

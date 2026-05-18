@@ -205,13 +205,6 @@ skills:
   # new capability = one Skill class + (optionally) one Tool class —
   # no Brain / Cognition / Heartbeat / Scheduler changes required.
   #
-  # PHASE 1 NOTE: The knobs below describe the Phase 2 semantics. In
-  # Phase 1 the SkillRegistry is built and the catalogue published to
-  # state/skills.json for dashboard discoverability, but the SLM PLAN
-  # menu and dispatch still go through the legacy hardcoded path. The
-  # config is shipped now so operators can opt into Phase 2 with zero
-  # config churn later.
-  #
   # Cost-tier cap for SLM-driven Skill picks. Skills above this tier
   # are filtered out of the (future) PLAN menu. Useful for clamping
   # budget when vitals are stressed.

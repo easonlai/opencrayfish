@@ -47,8 +47,8 @@ REFLECTION_FEED: Path = Path("state/reflection.jsonl")
 # Rejected payloads land here so the operator can audit *why* a turn produced
 # no reflection (instead of just disappearing). One JSONL line per drop.
 REFLECTION_DROPPED_FEED: Path = Path("state/reflection_dropped.jsonl")
-# Phase 3.1: ReflectionEngine reads the skill-invocation audit feed during
-# Sleep Metabolism consolidation so the agent can spot recurring Skill
+# ReflectionEngine reads the skill-invocation audit feed during Sleep
+# Metabolism consolidation so the agent can spot recurring Skill
 # failures (e.g. SearXNG unreachable for the last 24 h) and act on them.
 SKILLS_AUDIT_FEED: Path = Path("state/skills.jsonl")
 
@@ -101,9 +101,9 @@ class ReflectionEngine:
         self._feed_path.parent.mkdir(parents=True, exist_ok=True)
         self._dropped_feed_path = Path(dropped_feed_path)
         self._dropped_feed_path.parent.mkdir(parents=True, exist_ok=True)
-        # Phase 3.1: rotate both feeds by local date with bounded
-        # retention. Reflections drive Sleep Metabolism consolidation,
-        # so the window must be longer than the consolidation lookback
+        # Rotate both feeds by local date with bounded retention.
+        # Reflections drive Sleep Metabolism consolidation, so the
+        # window must be longer than the consolidation lookback
         # (currently 24 h) by a comfortable margin.
         self._writer = RotatingJsonlWriter(
             self._feed_path,

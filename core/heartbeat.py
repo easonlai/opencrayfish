@@ -99,9 +99,9 @@ class Heartbeat:
         self._stm = stm
         # Skill dispatch — proactive research goes through the
         # "proactive_learning" Skill, self-reflection through
-        # "self_reflect". Phase 2 removed the direct `searxng=` kwarg;
-        # the registry now mediates every outbound retrieval call so we
-        # get JSONL audit + per-invocation timing for free.
+        # "self_reflect". The registry mediates every outbound
+        # retrieval call so we get JSONL audit + per-invocation timing
+        # for free.
         self._skill_registry = skill_registry
         self._skill_ctx = skill_ctx
         # `reflection` is kept as a direct dependency — the consolidation

@@ -169,13 +169,13 @@ class CognitionCfg:
     # Useful for first-day rollout: prove THINK + PLAN + ACT are stable,
     # then flip this to true to enable refinement.
     refine_enabled: bool = True
-    # Phase 3: when True, the ANSWER verb actually invokes the
-    # `direct_answer` Skill (one extra SLM call per ANSWER step) and
-    # surfaces the reply as evidence in the synth KNOWLEDGE block.
-    # When False (default, byte-identical to Phase 2), ANSWER is a
-    # no-op marker telling synth "no retrieval needed; lean on SLM
-    # training data". Flip to true once you've measured the latency
-    # impact and decided the extra grounding is worth it.
+    # When True, the ANSWER verb actually invokes the `direct_answer`
+    # Skill (one extra SLM call per ANSWER step) and surfaces the reply
+    # as evidence in the synth KNOWLEDGE block. When False (default,
+    # byte-identical legacy behaviour), ANSWER is a no-op marker telling
+    # synth "no retrieval needed; lean on SLM training data". Flip to
+    # true once you've measured the latency impact and decided the extra
+    # grounding is worth it.
     dispatch_answer_via_skill: bool = False
 
 

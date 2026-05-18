@@ -51,11 +51,11 @@ class DirectAnswerSkill:
     requires_network: bool = False
     side_effects: bool = False
     requires_confirmation: bool = False
-    # Phase 3 PLAN-menu exposure. `ANSWER` is a marker verb: by default
-    # the CognitiveLoop treats it as a no-op (synth leans on SLM
-    # training data) for byte-identical legacy behavior. Operators can
-    # opt in (`cfg.cognition.dispatch_answer_via_skill = true`) to have
-    # ACT invoke this Skill and surface the reply as evidence.
+    # PLAN-menu exposure. `ANSWER` is a marker verb: by default the
+    # CognitiveLoop treats it as a no-op (synth leans on SLM training
+    # data) for byte-identical legacy behavior. Operators can opt in
+    # (`cfg.cognition.dispatch_answer_via_skill = true`) to have ACT
+    # invoke this Skill and surface the reply as evidence.
     plan_verb: str | None = "ANSWER"
     plan_arg_hint: str | None = ""
 

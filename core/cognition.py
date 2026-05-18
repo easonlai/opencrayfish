@@ -61,11 +61,11 @@ _QUESTION_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # Plan lines: "Q1: SEARCH \"minions 3 movie\"" | "Q2: RECALL" | "Q3: ANSWER"
-# Phase 3 made the verb list dynamic — the regex is rebuilt per call
-# from the active PlanMenuEntry list (see `_build_plan_regex`). The
-# static fallback below is kept ONLY for the rare case where the
-# registry yields zero entries (we still parse but the runner will
-# refuse unknown verbs).
+# The verb list is dynamic — the regex is rebuilt per call from the
+# active PlanMenuEntry list (see `_build_plan_regex`). The static
+# fallback below is kept ONLY for the rare case where the registry
+# yields zero entries (we still parse but the runner will refuse
+# unknown verbs).
 #
 # IMPORTANT: the optional query group uses `[^\S\n]*` (horizontal
 # whitespace) NOT `\s*`. Because `\s` includes `\n`, a `\s*` between

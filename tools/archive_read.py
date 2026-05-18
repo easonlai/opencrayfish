@@ -2,16 +2,16 @@
 
 A small, side-effect-free Tool that wraps the keyword-overlap scoring
 used by `core/cognition.py::_do_recall` and `core/brain.py::_retrieve_relevant`
-today. Phase 1 introduces it so the new `RecallSkill` can dispatch
-through the ToolRegistry like every other capability instead of reading
-the archive file directly — keeping the Tool layer the single seam for
+today. It exists so the `RecallSkill` can dispatch through the
+ToolRegistry like every other capability instead of reading the
+archive file directly — keeping the Tool layer the single seam for
 file/network I/O.
 
 Behavior is intentionally identical to the inline implementations
 (same tokenization: lowercase split, >3-char terms; same scoring:
 count of unique terms found per line; same `#` comment skip; same
 top-N truncation default of 5). This lets RecallSkill and the legacy
-inline code coexist during Phase 1 without behavior drift.
+inline code coexist without behavior drift.
 
 Failures degrade — a missing/unreadable archive returns
 `ok=True, data=[]` rather than `ok=False`, matching the existing

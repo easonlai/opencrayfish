@@ -20,7 +20,7 @@ from typing import Any
 from .base import SkillContext, SkillResult
 
 # Mirrors the regex pattern in `core/brain.py::_extract_identity` so the
-# two implementations agree until Phase 2 unifies them.
+# two implementations agree.
 _DESIGNATION_RE = re.compile(r"\*\*Designation\*\*\s*:\s*(?P<value>.+)", re.IGNORECASE)
 _CODENAME_RE = re.compile(r"\*\*Codename\*\*\s*:\s*(?P<value>.+)", re.IGNORECASE)
 _CREATOR_RE = re.compile(r"\*\*Creator\*\*\s*:\s*(?P<value>.+)", re.IGNORECASE)

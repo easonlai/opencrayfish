@@ -2,7 +2,7 @@
 
 The dashboard reads four rotated feeds (skills, deliberation, reflection,
 reflections-since) that previously pointed at the legacy un-rotated
-`state/<feed>.jsonl`. After the Phase 3.1 rotation cutover the writers
+`state/<feed>.jsonl`. After the v2.0 rotation cutover the writers
 produce `state/<feed>-YYYY-MM-DD.jsonl` siblings instead, and the
 dashboard MUST fan its reads across them (plus any legacy file an older
 operator left behind) without picking up foreign files in the same

@@ -1,6 +1,6 @@
-"""Phase 3.1 smoke test — JSONL rotation + reflection skills + identity skill routing.
+"""Smoke test — JSONL rotation + reflection skill-failure summary + identity routing.
 
-Covers the three improvements landed in Phase 3.1:
+Covers three subsystems that interact at the JSONL boundary:
   * A4 — `RotatingJsonlWriter` produces date-stamped files, sweeps old ones,
          preserves concurrent line atomicity, and never raises on writer failures.
   * A3 — `ReflectionEngine.read_recent_skills` + `summarise_skills_recent` read
@@ -8,7 +8,7 @@ Covers the three improvements landed in Phase 3.1:
   * A2 — `Brain._handle_identity_question` (async) routes name/creator branches
          through `IdentitySkill` via the registry and falls back cleanly.
 
-Run with: python scripts/smoke_phase31_rotation_reflection_identity.py
+Run with: python scripts/smoke_rotation_reflection_identity.py
 """
 from __future__ import annotations
 
@@ -319,7 +319,7 @@ async def main() -> None:
         with tempfile.TemporaryDirectory(prefix=f"smoke-p31-{name}-") as td:
             await fn(Path(td))
 
-    print("\nALL PHASE 3.1 SMOKE TESTS PASSED")
+    print("\nALL ROTATION / REFLECTION / IDENTITY SMOKE TESTS PASSED")
 
 
 if __name__ == "__main__":

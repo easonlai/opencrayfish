@@ -47,9 +47,9 @@ class RecallSkill:
     requires_network: bool = False
     side_effects: bool = False
     requires_confirmation: bool = False
-    # Phase 3 PLAN-menu exposure. The CognitiveLoop renders the menu
-    # from `SkillRegistry.plan_menu(...)`; this verb is the SLM-facing
-    # token (kept SHORT and SHOUTY because small SLMs anchor on stable
+    # PLAN-menu exposure. The CognitiveLoop renders the menu from
+    # `SkillRegistry.plan_menu(...)`; this verb is the SLM-facing token
+    # (kept SHORT and SHOUTY because small SLMs anchor on stable
     # all-caps verbs better than lowercase Skill names). The verb maps
     # back to this Skill's `name` at dispatch time.
     plan_verb: str | None = "RECALL"

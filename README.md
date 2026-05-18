@@ -3,6 +3,7 @@
 > **An edge-native, biologically-inspired AI companion that lives on a single Raspberry Pi 5 — fully offline, powered by a 1.5B-parameter local SLM, with a heart that beats, a brain that sleeps, and a soul you can read.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-2.0.0-1f8a4f.svg)](#roadmap)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Code of Conduct](https://img.shields.io/badge/code%20of%20conduct-Contributor%20Covenant%202.1-blueviolet.svg)](CODE_OF_CONDUCT.md)
@@ -407,7 +408,7 @@ OpenCrayFish/
 │   ├── jsonl_writer.py       ← date-rotating, retention-bounded JSONL appender
 │   ├── heartbeat.py          ← pulse_loop + metabolism + proactive_thought
 │   ├── scheduler.py          ← recurring research-task scheduler
-│   └── skills/               ← capability layer above Tools (Phase 1–3.1)
+│   └── skills/               ← capability layer above Tools (pluggable Skills)
 │       ├── base.py           ← Skill protocol + SkillContext + SkillResult
 │       ├── registry.py       ← SkillRegistry + dynamic PLAN menu + audit feed
 │       ├── identity.py       ← soul-templated identity replies (free, no-net)
@@ -821,7 +822,7 @@ Every reply the agent produces — whether triggered by a user message, a heartb
 
 The qwen2:1.5b model **reliably mishandles** the most basic identity questions ("what is your name", "do you know my name", "how are you", "who created you"). From production logs, "what is your name" used to triage as a SEARCH and pollute the synth with Netflix's "My Name" + the anime "Your Name". Fix: detect a small set of unambiguous identity-class regexes BEFORE any cognition runs, and return a templated reply built from soul.md + config.yaml + live vitals/mood. **Deterministic. Zero round-trip. Zero hallucination.**
 
-Since Phase 3.1, the "what is your name / who created you" branches delegate the actual templating to `IdentitySkill` via `skill_registry.invoke("identity", ctx, kind="name"|"creator")`. The Skill reads the IDENTITY block from `soul.md` and returns a short factual line; Brain wraps it with the live salutation/status sentence. If the registry call fails (no registry, exception, `ok=False`, empty summary), Brain falls back to the previous inline template — strictly additive, zero regression risk. The `who am I` and `how are you` branches stay inline because they need vitals / mood / architect-name that `IdentitySkill` doesn't see.
+Since v2.0, the "what is your name / who created you" branches delegate the actual templating to `IdentitySkill` via `skill_registry.invoke("identity", ctx, kind="name"|"creator")`. The Skill reads the IDENTITY block from `soul.md` and returns a short factual line; Brain wraps it with the live salutation/status sentence. If the registry call fails (no registry, exception, `ok=False`, empty summary), Brain falls back to the previous inline template — strictly additive, zero regression risk. The `who am I` and `how are you` branches stay inline because they need vitals / mood / architect-name that `IdentitySkill` doesn't see.
 
 #### Cognitive Loop — THINK → PLAN → ACT → REFINE
 
@@ -1030,7 +1031,7 @@ The result: **the agent gets smarter while the Architect sleeps**. Every morning
 
 #### Architect-priority cooperative yield
 
-The autonomous research cycle holds the NPU for several seconds per SLM call (topic-selection triage → SearXNG → synthesis → REFINE). If the Architect speaks while a cycle is in flight, the live `think()` would otherwise queue behind the autonomous work on the single Hailo queue — a latency priority inversion. Phase 4 closes that gap with a **cooperative yield at every long-running milestone**:
+The autonomous research cycle holds the NPU for several seconds per SLM call (topic-selection triage → SearXNG → synthesis → REFINE). If the Architect speaks while a cycle is in flight, the live `think()` would otherwise queue behind the autonomous work on the single Hailo queue — a latency priority inversion. v2.0 closes that gap with a **cooperative yield at every long-running milestone**:
 
 | Checkpoint | Where in `_proactive_research` | Behaviour when `brain.is_foreground_busy()` is true |
 |---|---|---|
@@ -1148,7 +1149,7 @@ OpenCrayFish separates *what the agent can decide to do* from *what the agent ca
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-This split is the single most important architectural change between v1 and Phase 3.1, because it makes **the PLAN-stage menu pluggable** — adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from, without touching `cognition.py`.
+This split is the single most important architectural change between v1 and v2.0, because it makes **the PLAN-stage menu pluggable** — adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from, without touching `cognition.py`.
 
 #### Tier A — Skills (the registry)
 
@@ -1372,7 +1373,7 @@ The three high-frequency feeds — `deliberation`, `skills`, `reflection` — ar
 - `<memory.log_path>/YYYY-MM-DD.log` — per-day heartbeat telemetry (PULSE / PROACTIVE / Sleep Metabolism). Default `logs/daily/`. Written synchronously by [core/heartbeat.py](core/heartbeat.py)'s `_append_log()`.
 - `state/*-YYYY-MM-DD.jsonl` — date-rotated structured audit feeds (see [§ JSONL Rotation & Retention](#jsonl-rotation--retention)).
 
-##### Phase 4 instrumentation (foreground priority)
+##### v2.0 instrumentation (foreground priority)
 
 Every live conversation turn now bookends itself in `state/logs/agent.log`, and every yielded background cycle leaves a single explanatory line:
 
@@ -1693,7 +1694,7 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 ## Roadmap
 
-The current codebase (Phase 3.1) is a **complete v1+**: every subsystem in this README is implemented, tested with smoke scripts, and Pylance-clean. The pluggable Skill layer (Phase 1–3) and the JSONL rotation utility (Phase 3.1) have shipped. The natural next directions:
+The current codebase is **v2.0**: every subsystem in this README is implemented, tested with smoke scripts, and Pylance-clean. v2.0 consolidates the pluggable Skill layer, the date-rotated JSONL audit feeds, the Architect-priority cooperative yield between live `think()` and autonomous proactive research, and the atomic-swap write path for `soul.md`. The natural next directions:
 
 - **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs), `mcp_bridge` (turn any MCP server into a Skill).
 - **GPIO / I²C sensor library** — temperature/humidity (BME680), motion (PIR), light (TSL2591), gas (CCS811/MQ-2), heart rate (MAX30102), motion (MPU6050) feeding straight into `VitalSigns` and `MoodTuning`.

@@ -1,4 +1,4 @@
-"""Phase 3 smoke test: dynamic PLAN menu + ACT dispatch through registry.
+"""Smoke test: dynamic PLAN menu + ACT dispatch through `SkillRegistry`.
 
 Boots a minimal CognitiveLoop with a stub provider that hands back
 canned SLM output, plus a stub Monitor + tripped-circuit Provider, and
@@ -147,7 +147,7 @@ def _make_loop(
         stm=None,         # type: ignore[arg-type]
         monitor=None,     # type: ignore[arg-type]
         provider=provider,  # type: ignore[arg-type]
-        archive_path="/tmp/_phase3_smoke_archive.md",
+        archive_path="/tmp/_cognition_dispatch_smoke_archive.md",
         designation="TestAgent",
         architect_name="Tester",
         architect_honorific="Friend",
@@ -160,7 +160,7 @@ def _make_loop(
         cost_tier_cap="expensive",
         auto_offline_filter=True,
         dispatch_answer_via_skill=dispatch_answer_via_skill,
-        feed_path=Path("/tmp/_phase3_smoke_feed.jsonl"),
+        feed_path=Path("/tmp/_cognition_dispatch_smoke_feed.jsonl"),
         timezone="UTC",
     )
 
@@ -268,7 +268,7 @@ async def main() -> int:
     for label, fn in tests:
         print(f"[{label}]")
         await fn()
-    print("\nALL PHASE 3 SMOKE TESTS PASSED")
+    print("\nALL COGNITION-DISPATCH SMOKE TESTS PASSED")
     return 0
 
 

@@ -1,7 +1,7 @@
 """Smoke test: soul.md atomic write + crash-safety.
 
-Phase 1 wired four in-memory dry-run defences into `SoulHandler._append`
-(input sanitize → empty-after-sanitize reject → immutable-fingerprint
+`SoulHandler._append` runs four in-memory dry-run defences
+(sanitize → empty-after-sanitize reject → immutable-fingerprint
 re-parse → marker-count check). Those guarantee the candidate string is
 structurally valid before it touches disk. This test covers the
 remaining disk-side hazard: the actual write step.

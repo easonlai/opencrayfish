@@ -211,8 +211,8 @@ async def amain() -> None:
     # legacy direct readers used, so the canonical snapshot is unchanged.
     tool_registry.register(ArchiveRead(archive_path=cfg.memory.archive_path))
     # Re-publish the tools inventory whenever the registry changes so
-    # the dashboard's Tool panel stays accurate even when Phase 2 / 3
-    # registers tools at runtime (e.g. ToolboxSkill discovery).
+    # the dashboard's Tool panel stays accurate even when Skills
+    # register tools at runtime (e.g. ToolboxSkill discovery).
     tool_registry.set_change_listener(
         lambda: _publish_tools_inventory(tool_registry)
     )

@@ -1191,8 +1191,8 @@ def main() -> None:
     st.caption(
         "Capabilities registered with `core.skills.SkillRegistry` at boot. "
         "A Skill is the agent-facing layer above Tools — it composes 0..N "
-        "Tool calls + its own policy. Phase 2 will dispatch the Cognitive "
-        "Loop's PLAN-stage verbs through this registry. Source: "
+        "Tool calls + its own policy. The Cognitive Loop's PLAN-stage "
+        "verbs are dispatched through this registry. Source: "
         "`state/skills.json` + `state/skills-YYYY-MM-DD.jsonl` (published + appended "
         "by `main.py` / `SkillRegistry.invoke`)."
     )

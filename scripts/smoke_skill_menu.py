@@ -1,4 +1,4 @@
-"""Phase 3 smoke test: SkillRegistry.plan_menu() filter matrix.
+"""Smoke test: `SkillRegistry.plan_menu()` filter matrix.
 
 Verifies that the dynamic PLAN menu correctly:
   * lists only Skills that declared `plan_verb`

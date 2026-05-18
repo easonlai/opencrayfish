@@ -49,9 +49,9 @@ class ResearchSkill:
     requires_network: bool = True
     side_effects: bool = False
     requires_confirmation: bool = False
-    # Phase 3 PLAN-menu exposure. `SEARCH "<3-8 keywords>"` is the
-    # historical SLM verb so we keep it byte-identical; the parser
-    # extracts the quoted query and we dispatch through this Skill.
+    # PLAN-menu exposure. `SEARCH "<3-8 keywords>"` is the historical
+    # SLM verb so we keep it byte-identical; the parser extracts the
+    # quoted query and we dispatch through this Skill.
     plan_verb: str | None = "SEARCH"
     plan_arg_hint: str | None = '"<3-8 keywords>"'
 
@@ -85,8 +85,8 @@ class ResearchSkill:
             )
 
         # Mirror the formatting Brain._do_search and cognition._do_search
-        # use today so Phase 2 swap is visually identical in the system
-        # prompt.
+        # use today so the registry-mediated path is visually identical
+        # in the system prompt.
         lines = [f"Query: {q!r}"]
         for h in hits:
             title = (h.get("title") or "").strip()

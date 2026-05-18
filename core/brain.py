@@ -314,12 +314,11 @@ class Brain:
         self._provider = provider
         self._stm = stm
         # Skill dispatch — every web search / LTM lookup / reflection
-        # goes through the registry. The legacy `searxng=` /
-        # `archive_path=` / `reflection=` kwargs were removed in Phase 2;
-        # the equivalent capability is reached via the registry ("research",
-        # "recall", "self_reflect"). Construction-time gating: callers
-        # can pass `reflection_enabled=False` to suppress the fire-and-
-        # forget self_reflect dispatch when ReflectionEngine isn't wired.
+        # goes through the registry. The capability is reached via the
+        # registry ("research", "recall", "self_reflect"). Construction-
+        # time gating: callers can pass `reflection_enabled=False` to
+        # suppress the fire-and-forget self_reflect dispatch when
+        # ReflectionEngine isn't wired.
         self._skill_registry = skill_registry
         self._skill_ctx = skill_ctx
         self._architect_name = (architect_name or "Architect").strip() or "Architect"
@@ -1689,12 +1688,12 @@ class Brain:
         match any short-circuit pattern (caller falls through to the
         normal cognition / triage / synth pipeline).
 
-        Phase 3.1: `_AGENT_NAME_RE` and `_CREATOR_QUESTION_RE` now
-        delegate to `IdentitySkill` via the registry so the persona
-        block lives in ONE place. The other two branches stay inline
-        because they need vitals/mood/architect-name that the Skill
-        doesn't see. Skill failures fall back to the previous inline
-        templates so this path can never regress.
+        `_AGENT_NAME_RE` and `_CREATOR_QUESTION_RE` delegate to
+        `IdentitySkill` via the registry so the persona block lives in
+        ONE place. The other two branches stay inline because they need
+        vitals / mood / architect-name that the Skill doesn't see. Skill
+        failures fall back to the previous inline templates so this path
+        can never regress.
 
         Important guards:
         * Skipped when the operator explicitly asked to search — they
@@ -1932,7 +1931,7 @@ class Brain:
     async def _do_search(self, query: str, *, reason: str) -> str:
         """Run the `research` Skill and format hits for the system prompt's KNOWLEDGE block.
 
-        Phase 2: dispatches via SkillRegistry instead of touching SearXNG
+        Dispatches via `SkillRegistry` instead of touching SearXNG
         directly. The Skill's `evidence` is iterated here so the output
         format stays byte-identical to the legacy path (the SLM's prompt
         is sensitive to the `[i] title\n    URL: url\n    snippet` shape).
@@ -2199,7 +2198,7 @@ class Brain:
         The score is consumed by `_cycle` to decide whether to short-circuit
         the SLM web-search triage — strong LTM hit → skip the web round-trip.
 
-        Phase 2: dispatches via the `recall` Skill instead of reading the
+        Dispatches via the `recall` Skill instead of reading the
         archive file directly. The Skill returns evidence sorted by score
         (`[{"line": str, "score": int}, ...]`); we extract `top_score` and
         join lines to preserve the legacy `(text, top_score)` shape.
