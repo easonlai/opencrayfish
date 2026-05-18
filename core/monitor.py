@@ -95,7 +95,7 @@ class Monitor:
         thermal_release_c: float | None = None,
         ram_release_pct: float | None = None,
         cache_ttl_s: float = 5.0,
-        provider: "Provider | None" = None,
+        provider: Provider | None = None,
     ) -> None:
         self._thermal_enter = float(thermal_limit_c)
         self._ram_enter = float(ram_limit_pct)
@@ -125,9 +125,9 @@ class Monitor:
         # reports the SLM's life signs (online / backend / last error).
         # Kept optional so unit tests and tools can build a Monitor
         # without spinning up a Provider.
-        self._provider: "Provider | None" = provider
+        self._provider: Provider | None = provider
 
-    def attach_provider(self, provider: "Provider") -> None:
+    def attach_provider(self, provider: Provider) -> None:
         """Late-bind a Provider so brain vitals show up in subsequent samples.
 
         Useful when subsystem construction order makes injection at

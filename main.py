@@ -238,8 +238,16 @@ async def amain() -> None:
     # can choose with zero edits to the orchestrators.
     #
     # SkillContext is BUILT ONCE at boot and reused for every
-    # invocation \u2014 it's a frozen dataclass of shared subsystem
+    # invocation — it's a frozen dataclass of shared subsystem
     # references, NOT per-call mutable state.
+    #
+    # ``extras`` is the optional extension slot (see SkillContext
+    # docstring). We seed it with the cross-cutting mood/affect
+    # subsystems that don't yet warrant their own typed field — they
+    # exist for the future EmpathyResonance / SelfRegulation Skills.
+    # Wrapped in MappingProxyType so Skills cannot mutate the originals
+    # through ctx.extras (the field itself is on a frozen dataclass).
+    from types import MappingProxyType
     skill_ctx = SkillContext(
         tools=tool_registry,
         soul=soul,
@@ -250,6 +258,10 @@ async def amain() -> None:
         designation=cfg.system.individual_designation,
         architect_name=cfg.system.architect_name,
         architect_honorific=cfg.system.architect_honorific,
+        extras=MappingProxyType({
+            "emotions": emotions,
+            "empathy": empathy,
+        }),
     )
     skill_registry = SkillRegistry()
     # The skill enable-map lets operators opt OUT of specific skills

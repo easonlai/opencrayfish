@@ -1,0 +1,136 @@
+# pyproject.toml — OpenCrayFish project metadata, dependencies, dev tooling.
+#
+# Authoritative source for everything pip / pytest / ruff need to know.
+# Generated as part of P2.1 (the "toolchain triple": pyproject + pytest + CI).
+# The pre-existing ``requirements.txt`` is kept ONLY as a convenience for
+# operators provisioning a Raspberry Pi 5 who don't want to learn editable
+# installs — the dependency list below is the canonical one.
+#
+# Conventions:
+#   * No Python 3.13 -> 3.11 backport. The runtime target is 3.13 exclusively
+#     because (a) ``soul_handler.py`` relies on the os.replace fsync guarantees
+#     that were tightened in 3.13, and (b) the AI HAT+ 2 Pi 5 image ships 3.13.
+#   * No build = pure-Python source layout, ``setuptools`` for the rare
+#     ``pip install -e .`` use case (mostly for editable dev installs and CI).
+#   * Optional ``[dev]`` extra pulls in pytest + ruff so CI can install just
+#     what it needs without dragging the SLM / search runtime onto the runner.
+
+[project]
+name = "open-crayfish"
+version = "2.0.0"
+description = "Edge-native, biologically-inspired AI companion for Raspberry Pi 5 + AI HAT+ 2 (Hailo-10H NPU)."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Eason Lai" }]
+keywords = ["ai-agent", "edge-ai", "raspberry-pi", "slm", "biologically-inspired"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Runtime dependencies. Pinned to lower bounds only — Pi 5 image management
+# (apt + pip) tends to bring slightly older builds than fresh PyPI; the
+# project is conservative about new APIs so any 8.x telegram bot release
+# works. If you bump a lower bound here, document why in the commit message
+# AND update CONTRIBUTING.md if it changes the supported deployment matrix.
+dependencies = [
+    "PyYAML>=6.0.1",       # config.yaml + soul.md frontmatter parsing
+    "psutil>=5.9.8",       # core/monitor.py vitals (CPU temp / load / mem)
+    "httpx>=0.27.0",       # async HTTP for hailo-ollama + ollama providers
+    "aiohttp>=3.9.0",      # connectors/web_chat.py in-process REST bridge
+    "python-telegram-bot>=21.0",  # connectors/telegram.py
+    "streamlit>=1.32.0",   # ui/dashboard.py + ui/web_chat.py
+]
+
+# Dev-only extras. Installed by CI and by contributors but NEVER required
+# at runtime on the Pi 5 — the operator deployment script (`./deploy.sh`)
+# does `pip install -e .` WITHOUT the `[dev]` qualifier.
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",          # canonical test runner
+    "pytest-asyncio>=0.24", # ``async def test_*`` without per-test asyncio.run
+    "pytest-cov>=5.0",      # coverage report in CI
+    "ruff>=0.6",            # linter + formatter (replaces black + flake8)
+]
+
+[project.urls]
+Homepage = "https://github.com/easonlai/OpenCrayFish"
+Documentation = "https://github.com/easonlai/OpenCrayFish#readme"
+Issues = "https://github.com/easonlai/OpenCrayFish/issues"
+
+# ----------------------------------------------------------------------------
+# Build / packaging
+# ----------------------------------------------------------------------------
+# Even though OpenCrayFish ships as a checkout (not a wheel), we still need a
+# build backend so ``pip install -e .`` can produce the egg-info entry that
+# resolves the dependency tree. setuptools is the most boring choice.
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Discover the three runtime packages (core / connectors / ui / tools) but
+# explicitly EXCLUDE tests + scripts so they never end up in a wheel.
+include = ["core*", "connectors*", "ui*", "tools*"]
+exclude = ["tests*", "scripts*"]
+
+# ----------------------------------------------------------------------------
+# pytest
+# ----------------------------------------------------------------------------
+# Test discovery covers BOTH the new ``tests/`` directory AND the existing
+# ``scripts/smoke_*.py`` scripts — the latter were written as standalone
+# ``python scripts/smoke_X.py`` runners, so pytest treats them as opaque
+# top-level test modules. The ``smoke_*`` glob below is what lets pytest
+# pick them up without us renaming a single file.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"               # ``async def test_*`` works without decorators
+testpaths = ["tests"]
+python_files = ["test_*.py"]        # smokes are run separately in CI (see ci.yml)
+addopts = [
+    "-ra",                          # short summary for skips/xfails/errors
+    "--strict-markers",             # typos in @pytest.mark.X are errors
+    "--tb=short",                   # tracebacks are noisy enough already
+]
+filterwarnings = [
+    # Suppress noisy telegram / aiohttp deprecation warnings that we can't
+    # control from here. If a real OpenCrayFish-originating warning shows up
+    # it will still surface as ``-W default`` for our own modules.
+    "ignore::DeprecationWarning:telegram.*",
+    "ignore::DeprecationWarning:aiohttp.*",
+]
+
+# ----------------------------------------------------------------------------
+# ruff (linter + formatter, replaces black + flake8)
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+extend-exclude = ["scripts/__pycache__", "**/__pycache__"]
+
+[tool.ruff.lint]
+# Conservative rule set — we want CI to catch obvious bugs without forcing
+# a stylistic rewrite of the whole codebase. Expand opportunistically.
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes (undefined names, unused imports)
+    "W",    # pycodestyle warnings
+    "I",    # isort import ordering
+    "B",    # flake8-bugbear (likely bugs)
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line too long — line-length above handles it; let long strings be
+    "B008",  # function call in default arg — used intentionally in some skill defs
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The smoke scripts intentionally use ``assert`` for fast-fail behaviour,
+# and they sometimes shadow names from setup/teardown sections. Keep them
+# lenient — we trust the smokes as a regression contract, not as exemplars.
+"scripts/smoke_*.py" = ["E402", "F401", "F841", "B011"]
+"tests/**" = ["E402", "F401"]

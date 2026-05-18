@@ -80,7 +80,7 @@ class SelfReflectSkill:
     side_effects: bool = True   # writes to state/reflection.jsonl
     requires_confirmation: bool = False
 
-    def __init__(self, *, engine: "ReflectionEngine | None" = None) -> None:
+    def __init__(self, *, engine: ReflectionEngine | None = None) -> None:
         # `engine` is None when cfg.reflection.enabled is false. In that
         # case execute() returns a graceful no-op rather than an error.
         self._engine = engine

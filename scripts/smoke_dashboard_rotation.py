@@ -8,17 +8,17 @@ dashboard MUST fan its reads across them (plus any legacy file an older
 operator left behind) without picking up foreign files in the same
 directory.
 
-This script validates the three helpers added to `ui/dashboard.py`:
-  * `_rotated_jsonl_paths(base)` — discovery + filename guard
-  * `_rotated_jsonl_tail(base, limit)` — newest-N reader
-  * `_rotated_jsonl_all(base)` — full scan for time-bounded slices
+This script validates the three helpers in `ui/panels/_readers.py`
+(which back the live dashboard panels):
+  * `rotated_jsonl_paths(base)` — discovery + filename guard
+  * `rotated_jsonl_tail(base, limit)` — newest-N reader
+  * `rotated_jsonl_all(base)` — full scan for time-bounded slices
 
 Run:
     python scripts/smoke_dashboard_rotation.py
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import sys
 import tempfile
@@ -27,19 +27,17 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
-# Import the dashboard module by file path so we don't trigger Streamlit's
-# script-runner. The streamlit warning about "missing ScriptRunContext"
-# is expected and harmless when we use the module purely as a library.
-_spec = importlib.util.spec_from_file_location(
-    "_dash_smoke_mod", _REPO_ROOT / "ui" / "dashboard.py",
+# Import directly from the panels._readers module — no need to load the
+# full dashboard script (which would trigger Streamlit's script-runner).
+from ui.panels._readers import (  # noqa: E402
+    rotated_jsonl_all as rotated_all,
 )
-assert _spec is not None and _spec.loader is not None
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-
-rotated_paths = _mod._rotated_jsonl_paths
-rotated_tail = _mod._rotated_jsonl_tail
-rotated_all = _mod._rotated_jsonl_all
+from ui.panels._readers import (
+    rotated_jsonl_paths as rotated_paths,
+)
+from ui.panels._readers import (
+    rotated_jsonl_tail as rotated_tail,
+)
 
 
 def main() -> int:

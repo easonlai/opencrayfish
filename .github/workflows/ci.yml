@@ -1,0 +1,138 @@
+# .github/workflows/ci.yml — OpenCrayFish v2.0 continuous-integration pipeline.
+#
+# Three jobs, all on ubuntu-latest with Python 3.13:
+#
+#   1. lint   — ``ruff check`` + ``ruff format --check``
+#                Catches style drift before review. Zero cost: ruff is
+#                fast and runs on the full tree (no per-file budget).
+#
+#   2. test   — ``pytest -q`` (unit suite under ``tests/``)
+#                Fast (currently 61 tests in <0.2 s). Runs even if lint
+#                fails so a single ruff fix doesn't block a useful test
+#                signal.
+#
+#   3. smoke  — runs all six ``scripts/smoke_*.py`` scripts in sequence
+#                These are the pre-v2.0 regression contract: every smoke
+#                self-stubs its provider, so no network / no Hailo NPU /
+#                no Ollama is required. If any smoke fails, the agent's
+#                behaviour has drifted in a way unit tests didn't catch.
+#
+# Pip cache is keyed on ``pyproject.toml`` (NOT requirements.txt — the
+# latter is now the legacy runtime manifest; pyproject.toml is the
+# canonical source of dev + runtime deps as of v2.0 / P2.1).
+#
+# Trigger matrix: every PR + every push to main. We intentionally do NOT
+# gate on tags — releases are cut manually after a green main.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel a stale run if a newer commit on the same ref comes in. Avoids
+# stacking up minutes when a contributor pushes a fixup commit while CI
+# is still grinding on the previous SHA.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------------------------- lint
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          # setup-python's built-in pip cache uses pyproject.toml's hash
+          # when no requirements file is named — exactly what we want.
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ruff only
+        # Only ruff is needed for lint; skip the rest of the dev extras
+        # so the lint job stays under ~15 seconds end-to-end.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "ruff>=0.6"
+
+      - name: ruff check
+        run: ruff check .
+
+      # NOTE: ``ruff format --check`` is intentionally NOT in this job yet.
+      # The pre-v2.0 codebase was never formatted by ruff, so a check
+      # would fail on ~49 files. The format pass is a separate dedicated
+      # commit that we'll schedule after P2.3 — bundling a 49-file
+      # reformat with the CI introduction would obscure both diffs.
+      # When the format pass lands, re-enable with:
+      #   - name: ruff format --check
+      #     run: ruff format --check .
+
+  # --------------------------------------------------------------------- test
+  test:
+    name: pytest (unit)
+    runs-on: ubuntu-latest
+    # ``needs`` deliberately omitted: tests are independent of lint
+    # outcome — a green test signal is useful even when ruff is unhappy.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev extras
+        # ``-e .[dev]`` is the canonical install: editable mode lets the
+        # tests import ``core``/``connectors``/``ui``/``tools`` without
+        # the conftest sys.path hack ever firing.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: pytest
+        # -q: terse output. Coverage is reported but not gated — gating
+        # coverage on a 61-test baseline would just incentivise padding
+        # tests, not improving them. Add a threshold once the suite is
+        # large enough that a meaningful target exists.
+        run: pytest -q --cov=core --cov=connectors --cov=tools --cov-report=term
+
+  # -------------------------------------------------------------------- smoke
+  smoke:
+    name: Smoke scripts (regression contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run all 6 smoke scripts
+        # ``set -e`` so a single smoke failure fails the whole job.
+        # We print the script name before each run for log-readability
+        # in the GitHub Actions UI (otherwise a failure mid-loop is
+        # hard to attribute).
+        run: |
+          set -e
+          for s in scripts/smoke_*.py; do
+            echo "===== $s ====="
+            python "$s"
+          done

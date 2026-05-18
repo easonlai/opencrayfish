@@ -33,7 +33,6 @@ from core.skills.direct_answer import DirectAnswerSkill
 from core.skills.recall import RecallSkill
 from core.skills.research import ResearchSkill
 
-
 # ---------------------------------------------------------------------------
 # Stubs
 # ---------------------------------------------------------------------------
@@ -242,7 +241,7 @@ async def test_run_step_answer_legacy_noop() -> None:
     ev = await loop._run_step(step)
     assert "no retrieval performed" in ev.content
     assert ev.hits == 0
-    print(f"  run_step ANSWER (legacy) → noop marker ✓")
+    print("  run_step ANSWER (legacy) → noop marker ✓")
 
 
 async def test_run_step_unknown_skill_degrades() -> None:
@@ -252,7 +251,7 @@ async def test_run_step_unknown_skill_degrades() -> None:
     step = PlanStep(sub_q="??", verb="GHOST", query="", skill_name="ghost")
     ev = await loop._run_step(step)
     assert "no retrieval performed" in ev.content
-    print(f"  run_step unknown skill → degrades to ANSWER marker ✓")
+    print("  run_step unknown skill → degrades to ANSWER marker ✓")
 
 
 async def main() -> int:

@@ -84,15 +84,15 @@ class ReflectionEngine:
     def __init__(
         self,
         *,
-        provider: "Provider",
+        provider: Provider,
         timezone: str = "UTC",
         feed_path: Path | str = REFLECTION_FEED,
         dropped_feed_path: Path | str = REFLECTION_DROPPED_FEED,
         skills_feed_path: Path | str = SKILLS_AUDIT_FEED,
         retain_days: int = 60,
     ) -> None:
-        from .provider import ChatMessage  # local import; avoid cycle on type stub
         from .jsonl_writer import RotatingJsonlWriter
+        from .provider import ChatMessage  # local import; avoid cycle on type stub
 
         self._provider = provider
         self._ChatMessage = ChatMessage

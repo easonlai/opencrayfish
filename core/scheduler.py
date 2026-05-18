@@ -45,10 +45,12 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, time as dt_time, timedelta
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
-from typing import Awaitable, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import yaml
@@ -283,7 +285,7 @@ def extract_explicit_interval(text: str) -> int | None:
     return n * base
 
 
-def render_task_list(tasks: list["Task"], *, channel: str = "telegram") -> str:
+def render_task_list(tasks: list[Task], *, channel: str = "telegram") -> str:
     """Operator-friendly markdown rendering of the active task set.
 
     Used by both connectors so the Telegram, web-chat, and slash-command
@@ -442,11 +444,11 @@ class TaskScheduler:
     def __init__(
         self,
         *,
-        config: "Config",
-        brain: "Brain",
+        config: Config,
+        brain: Brain,
         skill_registry: SkillRegistry,
         skill_ctx: SkillContext,
-        heartbeat: "Heartbeat",
+        heartbeat: Heartbeat,
         state_path: str | Path = "state/tasks.yaml",
         max_active_tasks: int = 16,
         results_per_query: int = 5,
@@ -770,7 +772,8 @@ class TaskScheduler:
             for p in pending:
                 p.cancel()
         except Exception:
-            stop_t.cancel(); wake_t.cancel()
+            stop_t.cancel()
+            wake_t.cancel()
             raise
 
     async def stop(self) -> None:

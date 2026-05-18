@@ -32,7 +32,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -99,7 +99,7 @@ class ShortTermMemory:
             self._buf.append(turn)
             if self._journal is not None:
                 self._pending.append(_PendingRecord(
-                    ts=datetime.now(tz=timezone.utc).isoformat(),
+                    ts=datetime.now(tz=UTC).isoformat(),
                     role=role,
                     content=content,
                 ))

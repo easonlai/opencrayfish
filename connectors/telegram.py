@@ -22,6 +22,7 @@ from telegram.ext import (
 if TYPE_CHECKING:
     from core.brain import Brain
     from core.heartbeat import Heartbeat
+    from core.intent_router import IntentOutcome, IntentRouter
     from core.scheduler import TaskScheduler
     from core.stm import ShortTermMemory
 
@@ -40,9 +41,9 @@ class TelegramConnector:
         *,
         token: str,
         user_id: str,
-        brain: "Brain",
-        heartbeat: "Heartbeat",
-        stm: "ShortTermMemory",
+        brain: Brain,
+        heartbeat: Heartbeat,
+        stm: ShortTermMemory,
         architect_name: str = "Architect",
         architect_honorific: str = "Boss",
     ) -> None:
@@ -57,7 +58,11 @@ class TelegramConnector:
         # Optional — attached after construction by main.py if the task
         # scheduler is enabled. None means /tasks /cancel /pause /resume
         # respond with a "scheduler disabled" message.
-        self._scheduler: "TaskScheduler | None" = None
+        self._scheduler: TaskScheduler | None = None
+        # Task-intent router. Created in attach_scheduler once the
+        # scheduler is known; None when the scheduler is disabled so
+        # _on_message skips the task pipeline entirely.
+        self._intent_router: IntentRouter | None = None
         # Cached chat_id of the architect, populated on first message so
         # the deliver callback can push reports without needing the live
         # Update object. For 1:1 DMs (the OpenCrayFish single-architect
@@ -82,7 +87,7 @@ class TelegramConnector:
                 self._user_id,
             )
 
-    def attach_scheduler(self, scheduler: "TaskScheduler") -> None:
+    def attach_scheduler(self, scheduler: TaskScheduler) -> None:
         """Wire in the scheduler and register the deliver callback.
 
         Reports go via `bot.send_message(chat_id, text)`. Until the
@@ -93,6 +98,13 @@ class TelegramConnector:
         """
         self._scheduler = scheduler
         scheduler.bind_deliver(_ORIGIN, self._deliver_report)
+        # Build the shared intent router now that we know the scheduler.
+        # See core/intent_router.py for the 4-stage classification logic
+        # this connector used to inline directly in _on_message.
+        from core.intent_router import IntentRouter
+        self._intent_router = IntentRouter(
+            brain=self._brain, scheduler=scheduler, origin=_ORIGIN,
+        )
 
     async def _deliver_report(self, report: str) -> None:
         """Push a scheduled-task report to the architect's Telegram chat."""
@@ -140,9 +152,10 @@ class TelegramConnector:
         # text.
         try:
             # Absolute import: connectors run as top-level modules.
-            from core.brain import _extract_identity  # local import to avoid cycle
+            # Public name post v2.0 split (used to be ``_extract_identity``).
+            from core.brain import extract_identity  # local import to avoid cycle
             soul_block = await self._brain._soul.render_identity_block()  # type: ignore[attr-defined]
-            designation, _, _ = _extract_identity(soul_block)
+            designation, _, _ = extract_identity(soul_block)
         except Exception:
             designation = "I"
         await update.effective_chat.send_message(
@@ -221,138 +234,17 @@ class TelegramConnector:
         self._heartbeat.mark_interaction()
         await self._stm.append("architect", clean)
 
-        # Task intent — cheap regex pre-filter inside parse_task_intent
-        # short-circuits non-task messages before any SLM call. The
-        # listing short-circuit ("show me my tasks") fires FIRST so an
-        # operator query never spawns a useless SLM intent-parse.
-        if self._scheduler is not None:
-            # Absolute import: connectors are loaded as top-level modules.
-            from core.scheduler import (
-                looks_like_task_action_request,
-                looks_like_task_query,
-                render_task_list,
-                format_interval as _fmt_iv,
-            )
-            if looks_like_task_query(clean):
-                tasks = await self._scheduler.list_tasks()
-                reply = render_task_list(tasks)
-                await self._stm.append("agent", reply)
-                await update.effective_chat.send_message(
-                    reply, parse_mode="Markdown",
-                )
-                log.info("TG task list query — returned %d task(s)", len(tasks))
-                return
-            current_tasks = await self._scheduler.list_tasks()
-            # ACTION path — cancel/pause/resume via natural language.
-            # Runs BEFORE the modify path because the verb classes are
-            # disjoint (action vs modify) but the action regex is the
-            # tighter pre-filter.
-            if looks_like_task_action_request(clean):
-                action_req = await self._brain.parse_task_action_intent(
-                    clean, current_tasks,
-                )
-                if action_req is not None:
-                    if action_req.action == "cancel":
-                        removed = await self._scheduler.cancel_task(action_req.task_id)
-                        if removed is None:
-                            msg = f"No task with id `{action_req.task_id}` to cancel."
-                        else:
-                            msg = (
-                                f"❌ Cancelled task `{removed.id}` — *{removed.topic}*."
-                            )
-                    else:
-                        paused = action_req.action == "pause"
-                        task = await self._scheduler.pause_task(
-                            action_req.task_id, paused=paused,
-                        )
-                        if task is None:
-                            msg = (
-                                f"No task with id `{action_req.task_id}` to "
-                                f"{action_req.action}."
-                            )
-                        else:
-                            verb = "⏸ Paused" if paused else "▶ Resumed"
-                            msg = (
-                                f"{verb} task `{task.id}` — *{task.topic}* "
-                                f"(every {_fmt_iv(task.interval_seconds)})."
-                            )
-                    await self._stm.append("agent", msg)
-                    await update.effective_chat.send_message(
-                        msg, parse_mode="Markdown",
-                    )
-                    log.info(
-                        "TG task action id=%s action=%s",
-                        action_req.task_id, action_req.action,
-                    )
-                    return
-            # Modify intent BEFORE create intent — a request like
-            # "change task t8f3a to every 2 hours" contains an interval
-            # phrase that would otherwise look like a fresh schedule.
-            update_req = await self._brain.parse_task_modify_intent(
-                clean, current_tasks,
-            )
-            if update_req is not None:
-                try:
-                    task = await self._scheduler.update_task(
-                        update_req.task_id,
-                        topic=update_req.new_topic,
-                        interval_seconds=update_req.new_interval_seconds,
-                        queries=update_req.new_queries,
-                        description=update_req.new_description,
-                    )
-                except ValueError as exc:
-                    await update.effective_chat.send_message(
-                        f"Could not update that task: {exc}"
-                    )
-                    return
-                if task is None:
-                    msg = f"No task with id `{update_req.task_id}` to update."
-                else:
-                    parts = [f"✏️ Updated task `{task.id}` — *{task.topic}*\n"]
-                    if update_req.new_interval_seconds is not None:
-                        parts.append(
-                            f"• Cadence: every {_fmt_iv(task.interval_seconds)}"
-                        )
-                    if update_req.new_topic is not None:
-                        parts.append(f"• Topic: {task.topic}")
-                    if update_req.new_queries is not None:
-                        parts.append(f"• Queries: {len(task.queries)}")
-                    parts.append("\nNext fire uses the new settings.")
-                    msg = "\n".join(parts)
-                await self._stm.append("agent", msg)
-                await update.effective_chat.send_message(
-                    msg, parse_mode="Markdown",
-                )
-                log.info("TG task updated id=%s", update_req.task_id)
-                return
-            spec = await self._brain.parse_task_intent(clean)
-            if spec is not None:
-                try:
-                    task = await self._scheduler.add_task(
-                        spec, origin=_ORIGIN,
-                    )
-                except ValueError as exc:
-                    await update.effective_chat.send_message(
-                        f"Could not schedule that task: {exc}"
-                    )
-                    return
-                # Note the broadcast model in the confirmation so the
-                # operator isn't confused when the same report shows up
-                # in the web UI as well.
-                confirm = (
-                    f"✅ Scheduled task `{task.id}` — *{task.topic}*\n\n"
-                    f"• Cadence: every {_fmt_iv(task.interval_seconds)}\n"
-                    f"• Queries: {len(task.queries)}\n"
-                    f"• First report incoming within ~{getattr(self._scheduler, '_tick', 30)}s.\n"
-                    f"• Reports go to all connected channels (Telegram + web).\n\n"
-                    f"Manage: /tasks  ·  /cancel {task.id}  ·  /pause {task.id}"
-                )
-                await self._stm.append("agent", confirm)
-                await update.effective_chat.send_message(confirm)
-                log.info(
-                    "TG task scheduled id=%s topic=%r interval=%ds",
-                    task.id, task.topic, task.interval_seconds,
-                )
+        # Task intent — delegated to the shared IntentRouter so this
+        # connector and the web_chat connector stay in lockstep. The
+        # router classifies the message against 4 stages (list / action /
+        # modify / create) and returns a structured IntentOutcome; we
+        # render it here with Telegram's emoji + Markdown style. When
+        # the scheduler is disabled, _intent_router is None and we fall
+        # straight through to Brain.think.
+        if self._intent_router is not None:
+            outcome = await self._intent_router.route(clean)
+            if outcome.handled:
+                await self._render_intent_outcome(update, outcome)
                 return
 
         try:
@@ -445,3 +337,120 @@ class TelegramConnector:
         await update.effective_chat.send_message(
             f"{verb} task `{task.id}` — *{task.topic}*."
         )
+
+    # ---------- intent-router rendering --------------------------------------
+
+    async def _render_intent_outcome(
+        self, update: Update, outcome: IntentOutcome,
+    ) -> None:
+        """Render a structured ``IntentOutcome`` into Telegram messages.
+
+        Wording preserved verbatim from the pre-refactor v1 connector so
+        the operator sees the exact same emoji + Markdown they're used
+        to. All STM appends happen here (the router never touches STM).
+        """
+        # Absolute import: connectors are loaded as top-level modules.
+        from core.scheduler import format_interval as _fmt_iv
+        from core.scheduler import render_task_list
+
+        kind = outcome.kind
+        if kind == "list":
+            assert outcome.list_result is not None
+            tasks = outcome.list_result.tasks
+            reply = render_task_list(tasks)
+            await self._stm.append("agent", reply)
+            await update.effective_chat.send_message(
+                reply, parse_mode="Markdown",
+            )
+            log.info("TG task list query — returned %d task(s)", len(tasks))
+            return
+
+        if kind == "action":
+            assert outcome.action_result is not None
+            ar = outcome.action_result
+            if ar.action == "cancel":
+                if ar.removed is None:
+                    msg = f"No task with id `{ar.task_id}` to cancel."
+                else:
+                    msg = (
+                        f"❌ Cancelled task `{ar.removed.id}` "
+                        f"— *{ar.removed.topic}*."
+                    )
+            else:
+                # pause / resume
+                if ar.task is None:
+                    msg = (
+                        f"No task with id `{ar.task_id}` to {ar.action}."
+                    )
+                else:
+                    verb = "⏸ Paused" if ar.action == "pause" else "▶ Resumed"
+                    msg = (
+                        f"{verb} task `{ar.task.id}` — *{ar.task.topic}* "
+                        f"(every {_fmt_iv(ar.task.interval_seconds)})."
+                    )
+            await self._stm.append("agent", msg)
+            await update.effective_chat.send_message(msg, parse_mode="Markdown")
+            log.info("TG task action id=%s action=%s", ar.task_id, ar.action)
+            return
+
+        if kind == "modify":
+            assert outcome.update_result is not None
+            ur = outcome.update_result
+            if ur.error is not None:
+                # Match v1 behaviour: send the error string raw (no
+                # Markdown parse) and DO NOT append to STM. The original
+                # connector returned immediately on ValueError without
+                # logging an agent turn.
+                await update.effective_chat.send_message(ur.error)
+                return
+            if ur.task is None:
+                msg = f"No task with id `{ur.task_id}` to update."
+            else:
+                parts = [f"✏️ Updated task `{ur.task.id}` — *{ur.task.topic}*\n"]
+                if ur.changed_interval:
+                    parts.append(
+                        f"• Cadence: every {_fmt_iv(ur.task.interval_seconds)}"
+                    )
+                if ur.changed_topic:
+                    parts.append(f"• Topic: {ur.task.topic}")
+                if ur.changed_queries:
+                    parts.append(f"• Queries: {len(ur.task.queries)}")
+                parts.append("\nNext fire uses the new settings.")
+                msg = "\n".join(parts)
+            await self._stm.append("agent", msg)
+            await update.effective_chat.send_message(msg, parse_mode="Markdown")
+            log.info("TG task updated id=%s", ur.task_id)
+            return
+
+        if kind == "create":
+            assert outcome.create_result is not None
+            cr = outcome.create_result
+            if cr.error is not None:
+                # Match v1: raw error, no STM append on add_task failure.
+                await update.effective_chat.send_message(cr.error)
+                return
+            task = cr.task
+            assert task is not None  # success path
+            tick = getattr(self._scheduler, "_tick", 30)
+            # Note the broadcast model in the confirmation so the
+            # operator isn't confused when the same report shows up in
+            # the web UI as well.
+            confirm = (
+                f"✅ Scheduled task `{task.id}` — *{task.topic}*\n\n"
+                f"• Cadence: every {_fmt_iv(task.interval_seconds)}\n"
+                f"• Queries: {len(task.queries)}\n"
+                f"• First report incoming within ~{tick}s.\n"
+                f"• Reports go to all connected channels (Telegram + web).\n\n"
+                f"Manage: /tasks  ·  /cancel {task.id}  ·  /pause {task.id}"
+            )
+            await self._stm.append("agent", confirm)
+            await update.effective_chat.send_message(confirm)
+            log.info(
+                "TG task scheduled id=%s topic=%r interval=%ds",
+                task.id, task.topic, task.interval_seconds,
+            )
+            return
+
+        # kind == "noop" should never reach here (caller gates on .handled),
+        # but log defensively rather than silently dropping the message.
+        log.warning("TG intent outcome dropped: unexpected kind=%s", kind)

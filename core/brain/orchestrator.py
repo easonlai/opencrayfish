@@ -35,19 +35,26 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .emotions import Emotions, EmotionVector
-from .empathy import EmpathyEngine, EmpathyReading
-from .monitor import Monitor, VitalSigns
-from .positive_filter import FilterResult, PositiveFilter
-from .provider import ChatMessage, Provider, ProviderUnavailable
-from .skills import SkillContext, SkillRegistry
-from .soul_handler import SoulHandler
-from .stm import ShortTermMemory
+from ..emotions import Emotions
+from ..empathy import EmpathyEngine, EmpathyReading
+from ..monitor import Monitor, VitalSigns
+from ..positive_filter import FilterResult, PositiveFilter
+from ..provider import ChatMessage, Provider, ProviderUnavailable
+from ..skills import SkillContext, SkillRegistry
+from ..soul_handler import SoulHandler
+from ..stm import ShortTermMemory
+from .identity_responder import IdentityResponder, extract_identity
+from .prompt_assembly import (
+    assemble_system_prompt,
+    build_minimal_retry_prompt,
+    format_task_block,
+)
+from .task_parsing import TaskIntentParser
 
 if TYPE_CHECKING:
-    from .cognition import CognitiveLoop, CognitiveTrace
-    from .scheduler import Task, TaskAction, TaskSpec, TaskUpdate
-    from .stm import Turn
+    from ..cognition import CognitiveLoop, CognitiveTrace
+    from ..scheduler import Task, TaskAction, TaskSpec, TaskUpdate
+    from ..stm import Turn
 
 log = logging.getLogger(__name__)
 
@@ -98,81 +105,11 @@ def _build_chitchat_re(designation: str) -> re.Pattern[str]:
         re.IGNORECASE,
     )
 
-# ---------------------------------------------------------------------------
-# Identity short-circuit
-# ---------------------------------------------------------------------------
-# The small SLM (qwen2:1.5b) reliably mishandles the most basic identity
-# questions. From production logs:
-#   "what is your name"  -> triage decides SEARCH, query="name"  -> Netflix
-#                           "My Name" + Wikipedia "Your Name" anime polluted
-#                           the synth context, output became junk
-#   "did you know my name" -> triage decided SEARCH on "know my name"
-#   "how are you"          -> triage emitted query="<your name>" (literal)
-# Even though the IDENTITY block is part of every system prompt, qwen2:1.5b
-# attends to the LIVE KNOWLEDGE block more strongly than the persona block
-# when the input is short and ambiguous, so polluted web hits win.
-#
-# Fix: detect a small set of unambiguous identity-class questions with
-# regex BEFORE any cognition / triage / search runs, and return a
-# templated reply built from soul.md + config.yaml + live vitals/mood.
-# Deterministic. Zero SLM round-trip. Zero web hit. Zero hallucination.
-# Compound questions (e.g. "what's your name and what can you do?") are
-# NOT short-circuited because they're anchored with `^...$` end markers.
-_IDENT_END = r"[\s!?\.\u3002\uff01\uff1f]*$"  # tolerate ASCII + CJK terminators
-
-# "What is your name?" / "Who are you?" / "Tell me your name" / "Introduce yourself"
-_AGENT_NAME_RE = re.compile(
-    r"^\s*(?:hi|hey|hello|so|please|can\s+you|could\s+you)?\s*"
-    r"(?:tell\s+me\s+(?:what(?:'?s|\s+is)\s+)?your\s+(?:name|designation))" + _IDENT_END
-    + r"|^\s*(?:hi|hey|hello|so|please|can\s+you|could\s+you)?\s*"
-    r"(?:what(?:'?s|\s+is|\s+are)|whats|wat\s+is)\s+"
-    r"(?:your|ur)\s+(?:name|designation)" + _IDENT_END
-    + r"|^\s*who\s+(?:are|r)\s+(?:you|u)" + _IDENT_END
-    + r"|^\s*(?:your|ur)\s+name\s*\??\s*$"
-    + r"|^\s*introduce\s+(?:yourself|urself)" + _IDENT_END
-    + r"|^\s*你叫(?:咩|乜|什麼|甚麼)?名" + _IDENT_END
-    + r"|^\s*你係邊個" + _IDENT_END
-    + r"|^\s*你是誰" + _IDENT_END,
-    re.IGNORECASE,
-)
-
-# "Do you know my name?" / "What's my name?" / "Who am I?"
-_USER_NAME_RE = re.compile(
-    r"^\s*(?:do|did|does)\s+(?:you|u)\s+(?:know|remember|recall)\s+"
-    r"(?:my|the\s+architect'?s|the\s+operator'?s)\s+name" + _IDENT_END
-    + r"|^\s*(?:you|u)\s+know\s+my\s+name" + _IDENT_END
-    + r"|^\s*what(?:'?s|\s+is)\s+my\s+name" + _IDENT_END
-    + r"|^\s*who\s+am\s+i" + _IDENT_END
-    + r"|^\s*remember\s+me" + _IDENT_END
-    + r"|^\s*你(?:仲|還)?記(?:得|唔記得)?我(?:嘅|個|的)?名" + _IDENT_END
-    + r"|^\s*我叫(?:咩|乜|什麼|甚麼)?名" + _IDENT_END,
-    re.IGNORECASE,
-)
-
-# "Who created you?" / "Who is your creator?" — already mostly works through
-# the soul prompt but short-circuit makes it deterministic + cheap.
-_CREATOR_QUESTION_RE = re.compile(
-    r"^\s*who\s+(?:created|made|built|developed|wrote|designed|coded|programmed)\s+"
-    r"(?:you|u)" + _IDENT_END
-    + r"|^\s*who(?:'?s|\s+is)\s+your\s+"
-    r"(?:creator|maker|developer|architect|author|coder|designer|builder)"
-    + _IDENT_END
-    + r"|^\s*who\s+create\s+you" + _IDENT_END
-    + r"|^\s*你(?:嘅|的)?(?:創造者|創建者|作者|開發者)係(?:邊個|誰)" + _IDENT_END
-    + r"|^\s*邊個(?:創造|建立|開發|寫|做)(?:咗|了)?(?:你|您)" + _IDENT_END,
-    re.IGNORECASE,
-)
-
-# "How are you?" / "Are you ok?" — status query; uses live vitals + mood.
-_STATUS_QUESTION_RE = re.compile(
-    r"^\s*how\s+(?:are|r)\s+(?:you|u)(?:\s+(?:doing|today|feeling))?" + _IDENT_END
-    + r"|^\s*how(?:'?s|\s+is)\s+(?:it\s+going|your\s+day|life|everything)"
-    + _IDENT_END
-    + r"|^\s*are\s+(?:you|u)\s+(?:ok|okay|alright|good|fine|well)" + _IDENT_END
-    + r"|^\s*how\s+do\s+(?:you|u)\s+feel" + _IDENT_END
-    + r"|^\s*你(?:今日)?(?:點|怎麼樣?|還好嗎?|好嗎)" + _IDENT_END,
-    re.IGNORECASE,
-)
+# Identity short-circuit machinery (regexes, soul-block parser, dispatcher)
+# lives in ``core/brain/identity_responder.py``; ``Brain.__init__`` builds
+# ``self._identity_responder`` and ``_cycle`` calls
+# ``self._identity_responder.try_handle(...)`` BEFORE any cognition / triage /
+# SLM call.
 
 # Cap on triage output length — protects against runaway generation.
 _MAX_TRIAGE_TOKENS_HINT: int = 40
@@ -304,7 +241,7 @@ class Brain:
         ltm_short_circuit_enabled: bool = True,
         ltm_short_circuit_min_score: int = 2,
         reflection_enabled: bool = True,
-        cognition: "CognitiveLoop | None" = None,
+        cognition: CognitiveLoop | None = None,
     ) -> None:
         self._soul = soul
         self._monitor = monitor
@@ -323,6 +260,18 @@ class Brain:
         self._skill_ctx = skill_ctx
         self._architect_name = (architect_name or "Architect").strip() or "Architect"
         self._architect_honorific = (architect_honorific or "").strip()
+        # Identity short-circuit dispatcher. Handed the skill registry +
+        # context once; the orchestrator only ever passes the live
+        # vitals / mood / salutation per turn. See
+        # ``core/brain/identity_responder.py``.
+        self._identity_responder = IdentityResponder(
+            skill_registry=self._skill_registry,
+            skill_ctx=self._skill_ctx,
+            architect_name=self._architect_name,
+        )
+        # Recurring-research task intent parser. Stateless; holds only
+        # the SLM provider. See ``core/brain/task_parsing.py``.
+        self._task_parser = TaskIntentParser(provider=self._provider)
         self._triage_enabled = web_search_triage_enabled
         self._ltm_short_circuit_enabled = bool(ltm_short_circuit_enabled)
         self._ltm_short_circuit_min_score = max(1, int(ltm_short_circuit_min_score))
@@ -423,528 +372,36 @@ class Brain:
         return await self._cycle(user_input=None, mission=mission)
 
     # ---------- recurring task pipeline (core/scheduler.py) ------------------
+    # The 3 intent parsers (create / modify / action) moved to
+    # ``core/brain/task_parsing.py`` during the v2.0 split (P1.1d).
+    # ``Brain._task_parser`` holds a ``TaskIntentParser`` instance and
+    # the methods below are thin compatibility wrappers so existing
+    # connector / scheduler call sites (``brain.parse_task_intent(...)``,
+    # ``brain.parse_task_modify_intent(...)``,
+    # ``brain.parse_task_action_intent(...)``) keep working unchanged.
+    # ``synthesize_task_report`` stays on ``Brain`` because it
+    # orchestrates a full ``proactive_thought`` cycle (mood + identity
+    # + reflection), which is a Brain-level concern.
 
-    async def parse_task_intent(self, user_input: str) -> "TaskSpec | None":
-        """Decide whether `user_input` is a recurring-task request.
-
-        Two-stage parser:
-          1. Cheap regex pre-filter (`scheduler.looks_like_task_request`).
-             If the message contains no interval-words ("every X hours",
-             "hourly", "daily", "every minute", …) we return None
-             immediately — no SLM call. This means a normal chat message
-             never pays the parse cost.
-          2. SLM intent extraction. If the pre-filter matched, ask the
-             SLM to extract topic + interval + queries in a strict format.
-             We then validate every field; any failure → None (the
-             connector falls back to normal `think()`).
-
-        Returns a `TaskSpec` ready for `TaskScheduler.add_task`, or None
-        when the message is not a scheduling request (or could not be
-        parsed safely). Callers MUST treat None as "fall back to chat".
-        """
-        # Local import: scheduler imports Brain via TYPE_CHECKING; doing
-        # the same here would only be cosmetic, so we just import inside
-        # the function (called rarely — once per chat turn at most).
-        from .scheduler import (
-            TaskSpec,
-            extract_explicit_interval,
-            looks_like_task_request,
-            parse_interval_spec,
-        )
-
-        if not user_input or not looks_like_task_request(user_input):
-            return None
-
-        system = (
-            "You are an INTENT PARSER for a personal AI agent. The operator "
-            "may be requesting a RECURRING research task (something the agent "
-            "should run on a schedule and report back) or just chatting.\n\n"
-            "Your job: decide which, and if it IS a recurring task, extract "
-            "the schedule and the search queries.\n\n"
-            "Output EXACTLY one of these two forms — nothing else, no preamble:\n\n"
-            "  NOT_TASK\n\n"
-            "  TASK\n"
-            "  TOPIC: <short label, ≤ 8 words>\n"
-            "  INTERVAL: <number><unit>  (units: m / h / d / w; e.g. 1h, 30m, 1d)\n"
-            "  QUERIES:\n"
-            "    - <one search query per line, 2–5 queries total>\n\n"
-            "RULES:\n"
-            "  • TASK only when the operator clearly asks for something\n"
-            "    REPEATING on a schedule. One-off questions are NOT_TASK.\n"
-            "  • INTERVAL must use a numeric unit. 'hourly' → 1h, 'daily' → 1d.\n"
-            "  • QUERIES are what you would type into a web search engine\n"
-            "    to gather the information needed. Be specific. Include\n"
-            "    company names / ticker symbols / topic keywords explicitly.\n"
-            "  • If you cannot confidently extract all three fields, emit\n"
-            "    NOT_TASK — the agent will then handle the message as\n"
-            "    normal chat. Better to miss a task than to schedule\n"
-            "    something the operator didn't want.\n\n"
-            "EXAMPLES:\n\n"
-            "  Operator: \"check the Microsoft stock price and news every "
-            "hour and give me an insight summary\"\n"
-            "  →\n"
-            "  TASK\n"
-            "  TOPIC: Microsoft stock + news\n"
-            "  INTERVAL: 1h\n"
-            "  QUERIES:\n"
-            "    - Microsoft MSFT stock price today\n"
-            "    - Microsoft latest news\n\n"
-            "  Operator: \"every morning summarise top AI research papers\"\n"
-            "  →\n"
-            "  TASK\n"
-            "  TOPIC: Daily AI research digest\n"
-            "  INTERVAL: 1d\n"
-            "  QUERIES:\n"
-            "    - top AI research papers this week\n"
-            "    - latest LLM research arxiv\n\n"
-            "  Operator: \"hello, how are you doing today\"\n"
-            "  → NOT_TASK\n\n"
-            "  Operator: \"what is the capital of France\"\n"
-            "  → NOT_TASK"
-        )
-        try:
-            raw = await self._provider.generate(
-                system,
-                [ChatMessage(role="user", content=user_input.strip())],
-            )
-        except Exception:
-            log.exception("parse_task_intent: provider call failed")
-            return None
-        text = (raw or "").strip()
-        if not text:
-            return None
-        # Cheap rejection paths.
-        upper_first = text.splitlines()[0].strip().upper()
-        if upper_first.startswith("NOT_TASK") or "NOT_TASK" in upper_first:
-            log.info("TASK parse: SLM returned NOT_TASK")
-            return None
-        if not upper_first.startswith("TASK"):
-            log.info("TASK parse: SLM did not start with TASK or NOT_TASK — "
-                     "falling back to chat. raw=%r", text[:200])
-            return None
-
-        # Field extraction. Tolerant: tokens may be in any order, may have
-        # extra whitespace, queries may use various bullet markers.
-        topic_m = re.search(r"^\s*TOPIC\s*:\s*(?P<v>.+)$", text, re.IGNORECASE | re.MULTILINE)
-        interval_m = re.search(r"^\s*INTERVAL\s*:\s*(?P<v>.+)$", text, re.IGNORECASE | re.MULTILINE)
-        queries_block_m = re.search(
-            r"^\s*QUERIES\s*:\s*\n(?P<v>(?:\s*[-*•]?\s*.+\n?)+)\s*$",
-            text, re.IGNORECASE | re.MULTILINE,
-        )
-        if not (topic_m and interval_m and queries_block_m):
-            log.info(
-                "TASK parse: missing fields topic=%s interval=%s queries=%s",
-                bool(topic_m), bool(interval_m), bool(queries_block_m),
-            )
-            return None
-        topic = topic_m.group("v").strip().strip("\"'`")
-        interval_seconds = parse_interval_spec(interval_m.group("v").strip())
-        if interval_seconds is None:
-            log.info("TASK parse: bad interval %r", interval_m.group("v"))
-            return None
-        # Deterministic override — qwen2:1.5b copies the prompt example
-        # ("INTERVAL: 1h") rather than respecting the operator's literal
-        # cadence ("every 10 minutes"). When the operator's text contains
-        # an explicit cadence phrase, trust THAT over whatever the SLM
-        # emitted. See `extract_explicit_interval` in scheduler.py for
-        # the supported phrasings.
-        explicit = extract_explicit_interval(user_input)
-        if explicit is not None and explicit != interval_seconds:
-            log.info(
-                "TASK parse: SLM emitted %ds but operator said %ds — using operator's value",
-                interval_seconds, explicit,
-            )
-            interval_seconds = explicit
-        queries: list[str] = []
-        for line in queries_block_m.group("v").splitlines():
-            ln = line.strip()
-            ln = re.sub(r"^[-*•]\s*", "", ln).strip().strip("\"'`")
-            if ln:
-                queries.append(ln)
-        # Cap to 5 — anything beyond is excess SLM cost per fire.
-        queries = queries[:5]
-        if not queries:
-            log.info("TASK parse: no queries extracted")
-            return None
-        log.info(
-            "TASK parse OK topic=%r interval=%ds queries=%d",
-            topic, interval_seconds, len(queries),
-        )
-        return TaskSpec(
-            topic=topic,
-            queries=queries,
-            interval_seconds=interval_seconds,
-            description=user_input.strip(),
-        )
+    async def parse_task_intent(self, user_input: str) -> TaskSpec | None:
+        """Wrapper for ``TaskIntentParser.parse_create`` (kept for compat)."""
+        return await self._task_parser.parse_create(user_input)
 
     async def parse_task_modify_intent(
         self,
         user_input: str,
-        current_tasks: list["Task"],
-    ) -> "TaskUpdate | None":
-        """Decide whether `user_input` asks to MODIFY an existing task.
-
-        Two-stage parser, mirrors `parse_task_intent`:
-          1. Cheap regex pre-filter (`scheduler.looks_like_task_modify_request`).
-             Skips the SLM call when the message has no update verbs.
-          2. SLM resolves the operator's reference ("the MSFT task",
-             "t8f3a", "my hourly one") against the live task list and
-             extracts which fields are being changed.
-
-        Returns a `TaskUpdate` (with task_id + only the fields that change)
-        ready for `TaskScheduler.update_task(...)`. Returns None when the
-        message is not a modify request, when no live tasks exist, or
-        when the SLM cannot safely resolve the target. Callers MUST treat
-        None as "fall back to the next intent path".
-        """
-        from .scheduler import (
-            TaskUpdate,
-            extract_explicit_interval,
-            looks_like_task_modify_request,
-            parse_interval_spec,
-        )
-
-        if not user_input or not looks_like_task_modify_request(user_input):
-            return None
-        if not current_tasks:
-            # Nothing to modify — don't waste an SLM call. The connector
-            # will fall through to chat and the operator will see a
-            # "no tasks" reply via Brain.think.
-            log.info("TASK modify parse: no live tasks — skipping SLM")
-            return None
-
-        # Compact task table for the prompt. Keep it short so the SLM
-        # doesn't drown in context: id, topic, current interval.
-        from .scheduler import format_interval as _fmt_iv
-        task_table = "\n".join(
-            f"  {t.id}  |  {t.topic}  |  every {_fmt_iv(t.interval_seconds)}"
-            for t in current_tasks
-        )
-
-        system = (
-            "You are an INTENT PARSER for a personal AI agent. The operator "
-            "may be asking to MODIFY one of their existing recurring tasks "
-            "(change its cadence, topic, or search queries) or just chatting.\n\n"
-            "Here are the operator's CURRENT tasks (id | topic | cadence):\n"
-            f"{task_table}\n\n"
-            "Your job: decide whether the operator is editing one of these, "
-            "and if so, identify which task and which fields they're changing.\n\n"
-            "Output EXACTLY one of these two forms \u2014 nothing else, no preamble:\n\n"
-            "  NOT_MODIFY\n\n"
-            "  MODIFY\n"
-            "  TARGET_ID: <one of the ids above, exact match>\n"
-            "  INTERVAL: <number><unit>  (omit line entirely if unchanged)\n"
-            "  TOPIC: <new short label>  (omit line entirely if unchanged)\n"
-            "  QUERIES:                  (omit BLOCK entirely if unchanged)\n"
-            "    - <one search query per line, 2\u20135 queries>\n\n"
-            "RULES:\n"
-            "  \u2022 MODIFY only when the operator clearly references an EXISTING\n"
-            "    task above. \"Schedule a new task to ...\" is NOT_MODIFY.\n"
-            "  \u2022 TARGET_ID must be an exact id from the table. If you can\n"
-            "    not unambiguously pick one, emit NOT_MODIFY.\n"
-            "  \u2022 Emit ONLY the fields the operator is changing. Omitted\n"
-            "    lines mean \"keep current value\".\n"
-            "  \u2022 INTERVAL uses a numeric unit. 'hourly' \u2192 1h, 'daily' \u2192 1d.\n"
-            "  \u2022 If unsure, emit NOT_MODIFY \u2014 better to ignore than to\n"
-            "    silently rewrite the operator's task.\n\n"
-            "EXAMPLES (with current tasks t8f3a=Microsoft stock + news every 1h, "
-            "taa12=Daily AI digest every 1 day):\n\n"
-            "  Operator: \"change task t8f3a to every 2 hours\"\n"
-            "  \u2192\n"
-            "  MODIFY\n"
-            "  TARGET_ID: t8f3a\n"
-            "  INTERVAL: 2h\n\n"
-            "  Operator: \"update the Microsoft task to also track Azure news\"\n"
-            "  \u2192\n"
-            "  MODIFY\n"
-            "  TARGET_ID: t8f3a\n"
-            "  QUERIES:\n"
-            "    - Microsoft MSFT stock price today\n"
-            "    - Microsoft latest news\n"
-            "    - Microsoft Azure news\n\n"
-            "  Operator: \"rename the AI digest to Morning AI brief\"\n"
-            "  \u2192\n"
-            "  MODIFY\n"
-            "  TARGET_ID: taa12\n"
-            "  TOPIC: Morning AI brief\n\n"
-            "  Operator: \"thanks!\"  \u2192 NOT_MODIFY\n"
-            "  Operator: \"schedule a new task to track gold prices hourly\"  \u2192 NOT_MODIFY"
-        )
-        try:
-            raw = await self._provider.generate(
-                system,
-                [ChatMessage(role="user", content=user_input.strip())],
-            )
-        except Exception:
-            log.exception("parse_task_modify_intent: provider call failed")
-            return None
-        text = (raw or "").strip()
-        if not text:
-            return None
-        upper_first = text.splitlines()[0].strip().upper()
-        if upper_first.startswith("NOT_MODIFY") or "NOT_MODIFY" in upper_first:
-            log.info("TASK modify parse: SLM returned NOT_MODIFY")
-            return None
-        if not upper_first.startswith("MODIFY"):
-            log.info("TASK modify parse: SLM did not start with MODIFY/NOT_MODIFY \u2014 "
-                     "falling back. raw=%r", text[:200])
-            return None
-
-        # Tolerant field extraction \u2014 same approach as parse_task_intent.
-        target_m = re.search(r"^\s*TARGET_ID\s*:\s*(?P<v>\S+)\s*$",
-                             text, re.IGNORECASE | re.MULTILINE)
-        if not target_m:
-            log.info("TASK modify parse: missing TARGET_ID")
-            return None
-        target_id = target_m.group("v").strip().strip("\"'`")
-        # Reject ids the SLM hallucinated.
-        valid_ids = {t.id for t in current_tasks}
-        if target_id not in valid_ids:
-            log.info("TASK modify parse: SLM returned unknown id %r (have %s)",
-                     target_id, sorted(valid_ids))
-            return None
-
-        new_topic: str | None = None
-        new_interval_seconds: int | None = None
-        new_queries: list[str] | None = None
-
-        topic_m = re.search(r"^\s*TOPIC\s*:\s*(?P<v>.+)$",
-                            text, re.IGNORECASE | re.MULTILINE)
-        if topic_m:
-            cand = topic_m.group("v").strip().strip("\"'`")
-            if cand:
-                new_topic = cand
-
-        interval_m = re.search(r"^\s*INTERVAL\s*:\s*(?P<v>.+)$",
-                               text, re.IGNORECASE | re.MULTILINE)
-        if interval_m:
-            secs = parse_interval_spec(interval_m.group("v").strip())
-            if secs is None:
-                log.info("TASK modify parse: bad interval %r", interval_m.group("v"))
-                return None
-            new_interval_seconds = secs
-        # Deterministic override — same rationale as parse_task_intent.
-        # If the operator's modify request contains an explicit cadence
-        # phrase ("change t8f3a to every 10 minutes"), trust THAT over the
-        # SLM, even when the SLM omitted INTERVAL entirely.
-        explicit = extract_explicit_interval(user_input)
-        if explicit is not None and explicit != new_interval_seconds:
-            if new_interval_seconds is not None:
-                log.info(
-                    "TASK modify parse: SLM emitted %ds but operator said %ds — using operator's value",
-                    new_interval_seconds, explicit,
-                )
-            else:
-                log.info(
-                    "TASK modify parse: SLM omitted INTERVAL but operator said %ds — applying it",
-                    explicit,
-                )
-            new_interval_seconds = explicit
-
-        queries_block_m = re.search(
-            r"^\s*QUERIES\s*:\s*\n(?P<v>(?:\s*[-*\u2022]?\s*.+\n?)+)\s*$",
-            text, re.IGNORECASE | re.MULTILINE,
-        )
-        if queries_block_m:
-            qs: list[str] = []
-            for line in queries_block_m.group("v").splitlines():
-                ln = line.strip()
-                ln = re.sub(r"^[-*\u2022]\s*", "", ln).strip().strip("\"'`")
-                if ln:
-                    qs.append(ln)
-            qs = qs[:5]
-            if qs:
-                new_queries = qs
-
-        if new_topic is None and new_interval_seconds is None and new_queries is None:
-            # SLM identified a target but extracted no actual changes\u2014
-            # treat as a no-op rather than triggering a registry write.
-            log.info("TASK modify parse: no changed fields for id=%s", target_id)
-            return None
-        log.info(
-            "TASK modify parse OK id=%s topic=%s interval=%s queries=%s",
-            target_id,
-            "yes" if new_topic else "no",
-            f"{new_interval_seconds}s" if new_interval_seconds else "no",
-            len(new_queries) if new_queries else "no",
-        )
-        return TaskUpdate(
-            task_id=target_id,
-            new_topic=new_topic,
-            new_interval_seconds=new_interval_seconds,
-            new_queries=new_queries,
-            new_description=user_input.strip(),
-        )
+        current_tasks: list[Task],
+    ) -> TaskUpdate | None:
+        """Wrapper for ``TaskIntentParser.parse_modify`` (kept for compat)."""
+        return await self._task_parser.parse_modify(user_input, current_tasks)
 
     async def parse_task_action_intent(
         self,
         user_input: str,
-        current_tasks: list["Task"],
-    ) -> "TaskAction | None":
-        """Decide whether `user_input` asks to CANCEL / PAUSE / RESUME a task.
-
-        Two-stage parser, mirrors `parse_task_modify_intent`:
-          1. Cheap regex pre-filter (`scheduler.looks_like_task_action_request`).
-             Skips the SLM call when the message has no action verbs.
-          2. SLM resolves which task the operator means ("the MSFT one",
-             "t8f3a", "my hourly task") against the live task list and
-             picks one of the three canonical actions.
-
-        Fast-path before the SLM: when the operator's message contains
-        an explicit task id token (`t[0-9a-f]{4}`) AND the action verb
-        is unambiguous, dispatch directly. This makes "/cancel-style"
-        NL phrases ("cancel t091f", "pause t091f") deterministic and
-        zero-cost.
-
-        Returns a `TaskAction` (with task_id + action) ready for
-        `TaskScheduler.cancel_task` / `TaskScheduler.pause_task`. Returns
-        None when the message is not an action request, when no live tasks
-        exist, or when the SLM cannot safely resolve the target. Callers
-        MUST treat None as "fall back to the next intent path".
-        """
-        from .scheduler import TaskAction, looks_like_task_action_request
-
-        if not user_input or not looks_like_task_action_request(user_input):
-            return None
-        if not current_tasks:
-            log.info("TASK action parse: no live tasks — skipping SLM")
-            return None
-
-        valid_ids = {t.id for t in current_tasks}
-
-        # Fast-path: explicit id + unambiguous action verb. Skips the SLM
-        # entirely. We classify the verb by which group matches first in
-        # a tight regex; if the message somehow contains BOTH a cancel
-        # AND a pause verb we fall through to the SLM for arbitration.
-        text_lc = user_input.lower()
-        id_m = re.search(r"\bt[0-9a-f]{4}\b", text_lc)
-        if id_m and id_m.group(0) in valid_ids:
-            cancel_hit = bool(re.search(
-                r"\b(cancel|stop|delete|remove|kill|abort|terminate|end)\b",
-                text_lc,
-            ))
-            pause_hit = bool(re.search(
-                r"\b(pause|suspend|halt|freeze)\b", text_lc,
-            ))
-            resume_hit = bool(re.search(
-                r"\b(resume|unpause|restart|continue|reactivate|re-?enable)\b",
-                text_lc,
-            ))
-            hits = sum([cancel_hit, pause_hit, resume_hit])
-            if hits == 1:
-                action = (
-                    "cancel" if cancel_hit
-                    else ("pause" if pause_hit else "resume")
-                )
-                log.info(
-                    "TASK action parse OK (fast-path) id=%s action=%s",
-                    id_m.group(0), action,
-                )
-                return TaskAction(task_id=id_m.group(0), action=action)
-
-        # Compact task table for the prompt — same shape as modify path.
-        from .scheduler import format_interval as _fmt_iv
-        task_table = "\n".join(
-            f"  {t.id}  |  {t.topic}  |  every {_fmt_iv(t.interval_seconds)}"
-            f"  |  {'paused' if t.paused else 'active'}"
-            for t in current_tasks
-        )
-
-        system = (
-            "You are an INTENT PARSER for a personal AI agent. The operator "
-            "may be asking to CANCEL, PAUSE, or RESUME one of their existing "
-            "recurring tasks, or just chatting.\n\n"
-            "Here are the operator's CURRENT tasks (id | topic | cadence | state):\n"
-            f"{task_table}\n\n"
-            "Your job: decide whether the operator is asking for one of the "
-            "three actions, identify which task, and which action.\n\n"
-            "Output EXACTLY one of these two forms — nothing else, no preamble:\n\n"
-            "  NOT_ACTION\n\n"
-            "  ACTION\n"
-            "  TARGET_ID: <one of the ids above, exact match>\n"
-            "  VERB: <one of: cancel, pause, resume>\n\n"
-            "RULES:\n"
-            "  • ACTION only when the operator clearly references an EXISTING\n"
-            "    task above AND uses an action verb. Modify requests like\n"
-            "    'change the cadence' are NOT_ACTION.\n"
-            "  • TARGET_ID must be an exact id from the table. If you can\n"
-            "    not unambiguously pick one, emit NOT_ACTION.\n"
-            "  • VERB must be exactly one of: cancel, pause, resume.\n"
-            "    Map operator synonyms:\n"
-            "      cancel ← stop, delete, remove, kill, abort, terminate, end\n"
-            "      pause  ← pause, suspend, halt, freeze\n"
-            "      resume ← resume, unpause, restart, continue, reactivate\n"
-            "  • If unsure, emit NOT_ACTION — better to ignore than to\n"
-            "    silently delete the operator's task.\n\n"
-            "EXAMPLES (with current tasks t8f3a=Microsoft stock + news every 1h "
-            "active, taa12=Daily AI digest every 1 day paused):\n\n"
-            "  Operator: \"cancel the MSFT task\"\n"
-            "  →\n"
-            "  ACTION\n"
-            "  TARGET_ID: t8f3a\n"
-            "  VERB: cancel\n\n"
-            "  Operator: \"pause my hourly one\"\n"
-            "  →\n"
-            "  ACTION\n"
-            "  TARGET_ID: t8f3a\n"
-            "  VERB: pause\n\n"
-            "  Operator: \"resume the AI digest\"\n"
-            "  →\n"
-            "  ACTION\n"
-            "  TARGET_ID: taa12\n"
-            "  VERB: resume\n\n"
-            "  Operator: \"thanks\"  → NOT_ACTION\n"
-            "  Operator: \"change t8f3a to every 2 hours\"  → NOT_ACTION"
-        )
-        try:
-            raw = await self._provider.generate(
-                system,
-                [ChatMessage(role="user", content=user_input.strip())],
-            )
-        except Exception:
-            log.exception("parse_task_action_intent: provider call failed")
-            return None
-        text = (raw or "").strip()
-        if not text:
-            return None
-        upper_first = text.splitlines()[0].strip().upper()
-        if upper_first.startswith("NOT_ACTION") or "NOT_ACTION" in upper_first:
-            log.info("TASK action parse: SLM returned NOT_ACTION")
-            return None
-        if not upper_first.startswith("ACTION"):
-            log.info(
-                "TASK action parse: SLM did not start with ACTION/NOT_ACTION — "
-                "falling back. raw=%r", text[:200],
-            )
-            return None
-
-        target_m = re.search(
-            r"^\s*TARGET_ID\s*:\s*(?P<v>\S+)\s*$",
-            text, re.IGNORECASE | re.MULTILINE,
-        )
-        verb_m = re.search(
-            r"^\s*VERB\s*:\s*(?P<v>\S+)\s*$",
-            text, re.IGNORECASE | re.MULTILINE,
-        )
-        if not (target_m and verb_m):
-            log.info(
-                "TASK action parse: missing fields target=%s verb=%s",
-                bool(target_m), bool(verb_m),
-            )
-            return None
-        target_id = target_m.group("v").strip().strip("\"'`")
-        if target_id not in valid_ids:
-            log.info(
-                "TASK action parse: SLM returned unknown id %r (have %s)",
-                target_id, sorted(valid_ids),
-            )
-            return None
-        verb = verb_m.group("v").strip().strip("\"'`").lower()
-        if verb not in {"cancel", "pause", "resume"}:
-            log.info("TASK action parse: SLM returned invalid verb %r", verb)
-            return None
-        log.info("TASK action parse OK id=%s action=%s", target_id, verb)
-        return TaskAction(task_id=target_id, action=verb)
+        current_tasks: list[Task],
+    ) -> TaskAction | None:
+        """Wrapper for ``TaskIntentParser.parse_action`` (kept for compat)."""
+        return await self._task_parser.parse_action(user_input, current_tasks)
 
     async def synthesize_task_report(
         self,
@@ -1252,13 +709,24 @@ class Brain:
         # "who created you") deterministically from soul.md +
         # config.yaml + live vitals/mood. Bypasses cognition / web
         # triage / search / synth entirely. The qwen2:1.5b SLM
-        # mishandles these consistently (see the regex block at module
-        # top for the failure modes from production logs). Returns
-        # None when the input doesn't match — falls through to the
-        # normal pipeline. Skipped on proactive turns (no user_input).
-        if is_user_turn and user_input:
-            shortcut_reply = await self._handle_identity_question(
-                user_input, soul_block, vitals, mood,
+        # mishandles these consistently (see the regex block in
+        # ``core/brain/identity_responder.py`` for the failure modes
+        # from production logs). Returns None when the input doesn't
+        # match — falls through to the normal pipeline. Skipped on
+        # proactive turns (no user_input), and skipped when the
+        # operator explicitly asked to search (they want fresh data,
+        # not the persona block).
+        if (
+            is_user_turn
+            and user_input
+            and not _SEARCH_INTENT_RE.search(user_input)
+        ):
+            shortcut_reply = await self._identity_responder.try_handle(
+                user_input=user_input,
+                soul_block=soul_block,
+                vitals=vitals,
+                mood=mood,
+                salutation=self._salutation(),
             )
             if shortcut_reply is not None:
                 # Run through the positive filter for consistency with
@@ -1318,7 +786,7 @@ class Brain:
         # Engaged only on real user turns where we have something worth
         # deliberating about. All bypass conditions log explicit reasons so
         # the dashboard / agent.log can show *why* the loop was/wasn't used.
-        cognitive_trace: "CognitiveTrace | None" = None
+        cognitive_trace: CognitiveTrace | None = None
         cognitive_engaged = False
         bypass_reason = ""
         if not is_user_turn:
@@ -1405,14 +873,14 @@ class Brain:
         knowledge = "\n\n".join(knowledge_parts)
 
         # 6. Task Execution
-        task_block = self._format_task_block(
+        task_block = format_task_block(
             user_input=user_input,
             mission=mission,
+            salutation=self._salutation(),
             web_searched=bool(web_hits) or cognitive_engaged,
-            soul_block=soul_block,
         )
 
-        system_prompt = self._assemble(
+        system_prompt = assemble_system_prompt(
             soul_block=soul_block,
             physical_state_text=physical_state_text,
             mood_text=mood.describe(),
@@ -1476,7 +944,7 @@ class Brain:
                 leak_fp,
                 len(raw or ""),
             )
-            retry_prompt = self._build_minimal_retry_prompt(
+            retry_prompt = build_minimal_retry_prompt(
                 user_input=user_input,
                 mission=mission,
                 knowledge=knowledge,
@@ -1535,128 +1003,11 @@ class Brain:
         )
 
     # ---------- prompt assembly ----------------------------------------------
-
-    @staticmethod
-    def _user_mentions_codename(user_input: str | None, codename: str) -> bool:
-        """True if the operator's message references the framework codename.
-
-        Word-boundary, case-insensitive substring check. Used by `_assemble`
-        to decide whether to include the codename-vs-name disambiguation
-        clause. Keeping this conditional avoids poisoning every turn with a
-        rule that only matters when the operator brings the codename up.
-        """
-        if not user_input or not codename:
-            return False
-        pattern = rf"\b{re.escape(codename)}\b"
-        return re.search(pattern, user_input, re.IGNORECASE) is not None
-
-    @staticmethod
-    def _assemble(
-        *,
-        soul_block: str,
-        physical_state_text: str,
-        mood_text: str,
-        empathy_directive: str,
-        knowledge: str,
-        task_block: str,
-        architect_name: str = "Architect",
-        architect_honorific: str = "Boss",
-        user_input: str | None = None,
-    ) -> str:
-        """Compose the system prompt.
-
-        Design notes for future maintainers — read this before adding rules:
-          * The IDENTITY of the agent is asserted EXACTLY ONCE — in the soul
-            block (which carries `**Designation**:` injected from
-            `cfg.system.individual_designation`). Do NOT add a duplicate
-            identity line above the soul block; small SLMs treat duplication
-            as emphasis and start echoing the phrasing.
-          * Per-deployment context (operator name + salutation) is asserted
-            in the OPERATOR block, in FIRST-PERSON framing the model can
-            adopt verbatim into the assistant role.
-          * Avoid negative imperatives ("NEVER do X", "do NOT do X"). On
-            small models they often drop the negation and retain the noun.
-            Prefer positive few-shot anchors instead ("Operator: hi.  You: hi,
-            <salutation>!").
-          * Codename-vs-name disambiguation is CONDITIONAL — only included
-            when the operator's message mentions the codename. See
-            `_user_mentions_codename`.
-        """
-        designation, codename, _creator = _extract_identity(soul_block)
-        salutation = (
-            f"{architect_honorific} {architect_name}".strip()
-            if architect_honorific
-            else (architect_name or "operator")
-        )
-        operator_block = (
-            f"You are speaking with {architect_name}. Address {architect_name} "
-            f"as \"{salutation}\" in your replies, or simply by name."
-        )
-        # Conditional codename disambiguation — only when the user actually
-        # mentioned the codename. Phrased as a positive instruction (one line)
-        # rather than a wall of negatives.
-        if Brain._user_mentions_codename(user_input, codename):
-            operator_block += (
-                f"\n\nNote: the operator just mentioned \"{codename}\". That is "
-                f"the software project you run on, not your name. When asked "
-                f"who you are, answer with your own name ({designation}); "
-                f"mention {codename} only as the project, never as a name."
-            )
-        return (
-            "## SOUL CONTEXT (READ-ONLY — your identity, laws, and persona)\n"
-            f"{soul_block}\n\n"
-            "## OPERATOR\n"
-            f"{operator_block}\n\n"
-            "## PHYSICAL STATE\n"
-            f"{physical_state_text}\n\n"
-            "## INTERNAL MOOD\n"
-            f"{mood_text}\n\n"
-            "## USER EMPATHY\n"
-            f"{empathy_directive}\n\n"
-            "## KNOWLEDGE\n"
-            f"{knowledge or '(no relevant archive entries)'}\n\n"
-            "## THIS TURN\n"
-            f"{task_block}\n\n"
-            "Reply now as the agent. The Positive Anchor MUST hold: even when "
-            "internal emotions are negative, every output must be constructive."
-        )
-
-    def _format_task_block(
-        self,
-        *,
-        user_input: str | None,
-        mission: str | None,
-        web_searched: bool = False,
-        soul_block: str = "",
-    ) -> str:
-        """Build the per-turn task block.
-
-        For user turns, uses a tiny positive few-shot anchor instead of a
-        rules list. Small SLMs follow examples better than negative
-        imperatives. The previous version's "NEVER address the operator by
-        your own name / NEVER end with your own name as a sign-off" rules
-        were a known anti-pattern — the model would echo the very nouns
-        the rules were trying to prohibit.
-        """
-        suffix = ""
-        if web_searched:
-            suffix = (
-                "\n\nLive SearXNG results have been pre-fetched for this turn "
-                "(see KNOWLEDGE above). Synthesize a concise, accurate answer "
-                "grounded in those results. Cite source URLs inline. "
-                "Do NOT refuse — the search has already been performed for you. "
-                "If the results don't actually contain the answer, say so plainly "
-                "and suggest a refined query rather than guessing."
-            )
-        salutation = self._salutation()
-        if user_input is not None:
-            return (
-                f"Operator ({salutation}): {user_input.strip()}\n"
-                f"You:{suffix}"
-            )
-        if mission is not None:
-            return f"Heartbeat-triggered mission: {mission.strip()}{suffix}"
-        return "Idle pulse — produce a brief situational reflection."
+    # The prompt-assembly helpers (``_assemble``, ``_format_task_block``,
+    # ``_user_mentions_codename``, ``_build_minimal_retry_prompt``) moved to
+    # ``core/brain/prompt_assembly.py`` during the v2.0 split (P1.1c). They
+    # are pure functions and unit-testable without a real Brain instance;
+    # ``_cycle`` calls them directly via the module-level imports.
 
     def _salutation(self) -> str:
         """Render the operator salutation from configured honorific + name.
@@ -1672,156 +1023,11 @@ class Brain:
             return f"{honor} {name}"
         return name or "operator"
 
-    async def _handle_identity_question(
-        self,
-        user_input: str,
-        soul_block: str,
-        vitals: VitalSigns,
-        mood: EmotionVector,
-    ) -> str | None:
-        """Short-circuit deterministic identity-class questions.
-
-        See the `_AGENT_NAME_RE` / `_USER_NAME_RE` / `_CREATOR_QUESTION_RE`
-        / `_STATUS_QUESTION_RE` block at module top for the failure modes
-        this routes around. Returns a templated reply built from soul.md +
-        config.yaml + live vitals/mood, OR None when the input does NOT
-        match any short-circuit pattern (caller falls through to the
-        normal cognition / triage / synth pipeline).
-
-        `_AGENT_NAME_RE` and `_CREATOR_QUESTION_RE` delegate to
-        `IdentitySkill` via the registry so the persona block lives in
-        ONE place. The other two branches stay inline because they need
-        vitals / mood / architect-name that the Skill doesn't see. Skill
-        failures fall back to the previous inline templates so this path
-        can never regress.
-
-        Important guards:
-        * Skipped when the operator explicitly asked to search — they
-          want fresh data, not the persona block.
-        * Anchored regexes only fire on STANDALONE identity questions,
-          not on compound messages like "what's your name and what
-          time is it" — those go through the full pipeline so the
-          time portion is answered correctly.
-        """
-        text = (user_input or "").strip()
-        if not text:
-            return None
-        # Don't shortcut when the operator explicitly asked to search.
-        if _SEARCH_INTENT_RE.search(text):
-            return None
-
-        designation, _codename, creator = _extract_identity(soul_block)
-        sal = self._salutation()
-        op_name = (self._architect_name or "operator").strip() or "operator"
-
-        if _AGENT_NAME_RE.search(text):
-            skill_reply = await self._try_identity_skill(kind="name")
-            if skill_reply:
-                return f"{skill_reply.rstrip('.')}, {sal}. Standing by — how can I help?"
-            return (
-                f"I'm **{designation}**, {sal}. Standing by — how can I help?"
-            )
-        if _USER_NAME_RE.search(text):
-            return (
-                f"Of course, {sal}. You're **{op_name}** — my Architect for "
-                f"this deployment. What can I do for you?"
-            )
-        if _CREATOR_QUESTION_RE.search(text):
-            skill_reply = await self._try_identity_skill(kind="creator")
-            if skill_reply:
-                return (
-                    f"{skill_reply} Each running instance serves one "
-                    f"Architect; mine is you, {sal}."
-                )
-            creator_str = creator or "the OpenCrayFish project author"
-            return (
-                f"I was built by **{creator_str}**, the author of the "
-                f"OpenCrayFish project. Each running instance serves one "
-                f"Architect; mine is you, {sal}."
-            )
-        if _STATUS_QUESTION_RE.search(text):
-            # Status reflects ACTUAL hardware + emotional state. This is
-            # the one identity-class question whose answer changes
-            # turn-to-turn, so we pull from the live vitals + mood
-            # snapshot rather than a canned phrase.
-            if vitals.is_stressed:
-                vitals_summary = (
-                    "a bit warm and pushing my limits, but holding"
-                )
-            else:
-                vitals_summary = "running smoothly"
-            # Use the non-baseline dominant channel — `calm` is the
-            # baseline so dominant() is almost always `calm` and would
-            # be uninformative here.
-            active_channel, intensity = mood.dominant_excluding_baseline()
-            if intensity >= 0.25:
-                mood_label = active_channel
-            else:
-                mood_label = "calm"
-            return (
-                f"Doing well, {sal} — {vitals_summary}, mood feels "
-                f"**{mood_label}**. Ready for your next directive."
-            )
-        return None
-
-    async def _try_identity_skill(self, *, kind: str) -> str | None:
-        """Invoke `IdentitySkill` via the registry; return its summary or None.
-
-        Centralises the registry call + failure handling so the identity
-        shortcut can delegate to a real `Skill` without risking a
-        regression: any exception, missing registry, or non-OK result
-        returns None and the caller falls back to the inline template.
-        """
-        if self._skill_registry is None or self._skill_ctx is None:
-            return None
-        if not self._skill_registry.has("identity"):
-            return None
-        try:
-            result = await self._skill_registry.invoke(
-                "identity", self._skill_ctx, kind=kind,
-            )
-        except Exception:
-            log.exception("CHAT identity-skill dispatch failed kind=%s", kind)
-            return None
-        if not result.ok:
-            log.info(
-                "CHAT identity-skill kind=%s returned ok=False error=%r",
-                kind, (result.error or "")[:120],
-            )
-            return None
-        summary = (result.summary or "").strip()
-        return summary or None
-
-    @staticmethod
-    def _build_minimal_retry_prompt(
-        *,
-        user_input: str | None,
-        mission: str | None,
-        knowledge: str,
-    ) -> str:
-        """Construct a stripped-down system prompt for leak-recovery retry.
-
-        Used after `_looks_like_prompt_leak` flags the first synthesis output.
-        Deliberately omits soul/mood/empathy/section-header scaffolding and
-        the imperative directives that small SLMs love to echo verbatim. Just
-        the reference material and the question, in plain prose.
-        """
-        parts: list[str] = []
-        if knowledge:
-            parts.append("Reference information:\n" + knowledge.strip())
-        if user_input:
-            parts.append(
-                f"Answer this question concisely, using the reference "
-                f"information above when relevant.\n\nQuestion: {user_input.strip()}"
-            )
-        elif mission:
-            parts.append(
-                f"Briefly address the following, using the reference "
-                f"information above when relevant.\n\n{mission.strip()}"
-            )
-        else:
-            parts.append("Provide one short sentence describing the current moment.")
-        return "\n\n".join(parts)
+    # Identity short-circuit (``_handle_identity_question`` /
+    # ``_try_identity_skill``) moved to
+    # ``core/brain/identity_responder.py``; ``Brain._identity_responder``
+    # holds the dispatcher and ``_cycle`` calls
+    # ``self._identity_responder.try_handle(...)`` directly.
 
     # ---------- empathy → mood feedback (Pillar 4) ---------------------------
 
@@ -1876,14 +1082,16 @@ class Brain:
 
         # Path 1: explicit user request — always search.
         if _SEARCH_INTENT_RE.search(text):
-            query = _QUERY_STRIP_RE.sub("", text).strip(" ?。?！!.,，。:：")
+            # ``.strip("...")`` takes a SET of characters — intentional here
+            # to peel any mix of trailing CJK + ASCII punctuation.
+            query = _QUERY_STRIP_RE.sub("", text).strip(" ?。?！!.,，。:：")  # noqa: B005
             log.info("CHAT search PATH=explicit query=%r", (query or text)[:120])
             return await self._do_search(query or text, reason="explicit")
 
         # Path 2: chitchat / non-question — don't burn a triage call.
         if self._chitchat_re is None:
             soul_block = await self._soul.render_identity_block()
-            designation, _, _ = _extract_identity(soul_block)
+            designation, _, _ = extract_identity(soul_block)
             self._chitchat_re = _build_chitchat_re(designation)
         if self._chitchat_re.match(text):
             log.info("CHAT search PATH=chitchat (skipped) input=%r", text[:80])
@@ -1976,7 +1184,7 @@ class Brain:
         return "\n".join(lines)
 
     @staticmethod
-    def _render_triage_context(stm_context: list["Turn"]) -> str:
+    def _render_triage_context(stm_context: list[Turn]) -> str:
         """Render a tiny "Recent conversation" block for prompt context.
 
         Shared by the legacy web triage AND the cognitive loop's THINK/PLAN
@@ -2015,7 +1223,7 @@ class Brain:
         self,
         user_input: str,
         *,
-        stm_context: list["Turn"] | None = None,
+        stm_context: list[Turn] | None = None,
     ) -> str | None:
         """Ask the SLM to classify whether SearXNG should be queried.
 
@@ -2181,7 +1389,8 @@ class Brain:
         the query stays inside SearXNG's reasonable bounds.
         """
         cleaned = re.sub(r"\s+", " ", user_input or "").strip()
-        cleaned = cleaned.strip(" ?。?！!.,，。:：")
+        # SET of characters — intentional, peels mixed CJK/ASCII punctuation.
+        cleaned = cleaned.strip(" ?。?！!.,，。:：")  # noqa: B005
         return cleaned[:120] or "general knowledge"
 
     # ---------- knowledge retrieval ------------------------------------------
@@ -2219,46 +1428,7 @@ class Brain:
         return text, top_score
 
 
-# ---------- module-level helpers ---------------------------------------------
-
-_DESIGNATION_RE = re.compile(r"\*\*Designation\*\*\s*:\s*(?P<value>.+)", re.IGNORECASE)
-_CODENAME_RE = re.compile(r"\*\*Codename\*\*\s*:\s*(?P<value>.+)", re.IGNORECASE)
-_CREATOR_RE = re.compile(r"\*\*Creator\*\*\s*:\s*(?P<value>.+)", re.IGNORECASE)
-
-
-def _extract_identity(soul_block: str) -> tuple[str, str, str]:
-    """Pull Designation, Codename, and Creator out of the IMMUTABLE_CORE soul block.
-
-    Returns ``(designation, codename, creator)``. All three are PURELY sourced
-    from soul.md (designation is itself injected by SoulHandler from
-    ``cfg.system.individual_designation`` at runtime). When a field is
-    missing we return a NEUTRAL, non-branded placeholder — NEVER a
-    project-specific literal — so a fork that renames everything cannot
-    accidentally surface this project's name through a fallback.
-
-    Codename in particular falls back to an EMPTY string (not a
-    descriptive phrase like "the framework") so the conditional
-    codename-disambiguation block in `_compose_identity_response` is
-    skipped entirely when soul.md doesn't carry a codename, and so the
-    codename never appears in any prompt as a fallback noun.
-    """
-    designation = "the Agent"
-    codename = ""
-    creator = ""
-    if (m := _DESIGNATION_RE.search(soul_block)):
-        candidate = m.group("value").strip()
-        # Strip trailing parenthetical hints, e.g. "Cray-01 (set by The Architect)".
-        candidate = re.sub(r"\s*\(.*?\)\s*$", "", candidate).strip()
-        if candidate and "{{" not in candidate:
-            designation = candidate
-    if (m := _CODENAME_RE.search(soul_block)):
-        candidate = m.group("value").strip()
-        if candidate and "{{" not in candidate:
-            codename = candidate
-    if (m := _CREATOR_RE.search(soul_block)):
-        candidate = m.group("value").strip()
-        # Strip trailing parenthetical hints, e.g. "Eason Lai (author of ...)".
-        candidate = re.sub(r"\s*\(.*?\)\s*$", "", candidate).strip()
-        if candidate and "{{" not in candidate:
-            creator = candidate
-    return designation, codename, creator
+# Module-level helpers — soul-block parsing (``_extract_identity`` /
+# ``_DESIGNATION_RE`` / ``_CODENAME_RE`` / ``_CREATOR_RE``) moved to
+# ``core/brain/identity_responder.py``; this module imports
+# ``extract_identity`` from there for the prompt-assembly call sites.

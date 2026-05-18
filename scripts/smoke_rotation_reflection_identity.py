@@ -23,9 +23,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from core.jsonl_writer import RotatingJsonlWriter, _FILENAME_RE  # type: ignore
+from core.jsonl_writer import _FILENAME_RE, RotatingJsonlWriter  # type: ignore
 from core.reflection import ReflectionEngine  # type: ignore
-
 
 # ---------------------------------------------------------------------------
 # A4 — rotation utility
@@ -220,8 +219,8 @@ async def test_a3_summarise_skills_recent(tmp: Path) -> None:
 async def test_a2_try_identity_skill(tmp: Path) -> None:
     """End-to-end-ish test: real SkillRegistry + IdentitySkill + Brain helper."""
     # Late imports so the A4 tests can run even if Brain has a heavy dep tree.
-    from core.skills.registry import SkillRegistry
     from core.skills.identity import IdentitySkill
+    from core.skills.registry import SkillRegistry
 
     audit = tmp / "skills.jsonl"
     reg = SkillRegistry(audit_feed=audit, audit_retain_days=7, audit_tz="UTC")
@@ -256,23 +255,24 @@ async def test_a2_try_identity_skill(tmp: Path) -> None:
     assert "Test Harness" in (r_creator.summary or "")
     print(f"[a2-registry] IdentitySkill name={r_name.summary!r} creator={r_creator.summary!r} ✓")
 
-    # Brain helper indirection. We don't construct a real Brain (too
-    # many deps); we instead build a minimal duck-type carrying just
-    # the attributes `_try_identity_skill` reads + the method itself,
-    # bound from Brain's class.
-    from core.brain import Brain
+    # IdentityResponder indirection. The dispatch helper that used to
+    # live on Brain (``_try_identity_skill``) was extracted into
+    # ``core/brain/identity_responder.py`` during the v2.0 brain-package
+    # split (P1.1). We instantiate the responder directly here — it
+    # only needs the registry, the skill context, and the architect
+    # name — and exercise the now-public skill dispatcher.
+    from core.brain.identity_responder import IdentityResponder
 
-    class _BrainShim:
-        _skill_registry = reg
-        _skill_ctx = ctx
-
-    # Bind the unbound method onto the shim.
-    helper = Brain._try_identity_skill.__get__(_BrainShim(), _BrainShim)  # type: ignore[attr-defined]
-    name = await helper(kind="name")
-    creator = await helper(kind="creator")
+    responder = IdentityResponder(
+        skill_registry=reg,
+        skill_ctx=ctx,  # type: ignore[arg-type]
+        architect_name="Test Architect",
+    )
+    name = await responder._try_skill(kind="name")
+    creator = await responder._try_skill(kind="creator")
     assert name and "Test-Agent" in name
     assert creator and "Test Harness" in creator
-    print(f"[a2-helper] Brain._try_identity_skill name={name!r} creator={creator!r} ✓")
+    print(f"[a2-helper] IdentityResponder._try_skill name={name!r} creator={creator!r} ✓")
 
     # Verify the audit feed was written via the rotating writer.
     rotated = list(tmp.glob("skills-*.jsonl"))
@@ -286,16 +286,21 @@ async def test_a2_try_identity_skill(tmp: Path) -> None:
 
 
 async def test_a2_fallback_no_registry(tmp: Path) -> None:
-    """Brain helper returns None when registry/ctx are missing — caller falls back."""
-    from core.brain import Brain
+    """IdentityResponder helper returns None when registry/ctx are missing.
 
-    class _BrainShim:
-        _skill_registry = None
-        _skill_ctx = None
+    The caller (``Brain._cycle`` via
+    ``IdentityResponder.try_handle``) then falls back to the inline
+    template path.
+    """
+    from core.brain.identity_responder import IdentityResponder
 
-    helper = Brain._try_identity_skill.__get__(_BrainShim(), _BrainShim)  # type: ignore[attr-defined]
-    assert await helper(kind="name") is None
-    assert await helper(kind="creator") is None
+    responder = IdentityResponder(
+        skill_registry=None,
+        skill_ctx=None,
+        architect_name="Test Architect",
+    )
+    assert await responder._try_skill(kind="name") is None
+    assert await responder._try_skill(kind="creator") is None
     print("[a2-fallback] missing registry → helper returns None (caller falls back) ✓")
 
 

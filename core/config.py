@@ -278,7 +278,7 @@ class Config:
     skills: SkillsCfg = SkillsCfg()
 
     @classmethod
-    def load(cls, path: str | Path = "config.yaml") -> "Config":
+    def load(cls, path: str | Path = "config.yaml") -> Config:
         raw: dict[str, Any] = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls(
             system=SystemCfg(**raw["system"]),

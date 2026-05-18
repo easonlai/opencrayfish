@@ -261,10 +261,10 @@ class CognitiveLoop:
     def __init__(
         self,
         *,
-        provider: "Provider",
+        provider: Provider,
         skill_registry: SkillRegistry,
         skill_ctx: SkillContext,
-        monitor: "Monitor | None" = None,
+        monitor: Monitor | None = None,
         max_subquestions: int = 3,
         max_act_rounds: int = 2,    # 1 = no refine; 2 = one refine allowed
         refine_enabled: bool = True,
@@ -275,8 +275,8 @@ class CognitiveLoop:
         feed_retain_days: int = 14,
         timezone: str = "UTC",
     ) -> None:
-        from .provider import ChatMessage  # local import to avoid cycle on type stub
         from .jsonl_writer import RotatingJsonlWriter
+        from .provider import ChatMessage  # local import to avoid cycle on type stub
         self._ChatMessage = ChatMessage
 
         self._provider = provider
@@ -736,7 +736,9 @@ class CognitiveLoop:
         coros = [self._run_step(s) for s in steps]
         results = await asyncio.gather(*coros, return_exceptions=True)
         evidence: list[Evidence] = []
-        for s, r in zip(steps, results):
+        # ``strict=True`` is safe: ``coros`` was built one-to-one from ``steps``
+        # immediately above and ``gather`` preserves order + length.
+        for s, r in zip(steps, results, strict=True):
             if isinstance(r, BaseException):
                 log.warning(
                     "CHAT cognition ACT step verb=%s sub_q=%r failed: %s",

@@ -37,11 +37,11 @@ def main() -> int:
     def show(label: str, entries: list[object]) -> None:
         print(f"=== {label} ===")
         for e in entries:
-            verb = getattr(e, "verb")
-            skill = getattr(e, "skill_name")
-            cost = getattr(e, "cost_tier")
-            net = getattr(e, "requires_network")
-            hint = getattr(e, "arg_hint")
+            verb = e.verb
+            skill = e.skill_name
+            cost = e.cost_tier
+            net = e.requires_network
+            hint = e.arg_hint
             print(
                 "  verb=" + verb.ljust(7)
                 + " skill=" + skill.ljust(14)

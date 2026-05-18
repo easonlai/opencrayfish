@@ -45,7 +45,6 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from core.soul_handler import SoulHandler, SoulProtectionError  # noqa: E402
 
-
 # Minimal but valid soul.md — mirrors the on-disk file's region structure
 # without depending on the operator's actual identity content.
 _TEMPLATE = """\

@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from aiohttp import web
 
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from core.config import WebChatCfg
     from core.emotions import Emotions
     from core.heartbeat import Heartbeat
+    from core.intent_router import IntentOutcome, IntentRouter
     from core.monitor import Monitor
     from core.scheduler import TaskScheduler
     from core.stm import ShortTermMemory
@@ -65,12 +66,12 @@ class WebChatConnector:
     def __init__(
         self,
         *,
-        cfg: "WebChatCfg",
-        brain: "Brain",
-        heartbeat: "Heartbeat",
-        stm: "ShortTermMemory",
-        emotions: "Emotions",
-        monitor: "Monitor",
+        cfg: WebChatCfg,
+        brain: Brain,
+        heartbeat: Heartbeat,
+        stm: ShortTermMemory,
+        emotions: Emotions,
+        monitor: Monitor,
         designation: str,
     ) -> None:
         self._cfg = cfg
@@ -85,11 +86,15 @@ class WebChatConnector:
         # Optional — attached after construction by main.py if the task
         # scheduler is enabled. When None, /chat just runs normal think()
         # and the /tasks endpoints return 503.
-        self._scheduler: "TaskScheduler | None" = None
+        self._scheduler: TaskScheduler | None = None
+        # Task-intent router. Created in attach_scheduler once the
+        # scheduler is known; None when the scheduler is disabled so
+        # /chat skips the task pipeline entirely.
+        self._intent_router: IntentRouter | None = None
 
     # ---------- lifecycle / wiring -------------------------------------------
 
-    def attach_scheduler(self, scheduler: "TaskScheduler") -> None:
+    def attach_scheduler(self, scheduler: TaskScheduler) -> None:
         """Wire in the task scheduler and rebind any recovered web_chat tasks.
 
         Connectors call this once at boot. The deliver callback below is
@@ -100,6 +105,13 @@ class WebChatConnector:
         """
         self._scheduler = scheduler
         scheduler.bind_deliver(_ORIGIN, self._deliver_report)
+        # Build the shared intent router now that we know the scheduler.
+        # See core/intent_router.py for the 4-stage classification logic
+        # this connector used to inline directly in _handle_chat.
+        from core.intent_router import IntentRouter
+        self._intent_router = IntentRouter(
+            brain=self._brain, scheduler=scheduler, origin=_ORIGIN,
+        )
 
     async def _deliver_report(self, report: str) -> None:
         """Inject a scheduled-task report into STM as if the agent spoke it.
@@ -271,190 +283,17 @@ class WebChatConnector:
         self._heartbeat.mark_interaction()
         await self._stm.append("architect", message)
 
-        # Task pipeline (only when scheduler is enabled). Four intent
-        # paths, ordered by cost so the cheapest filter wins:
-        #   1. LIST   ("show me my tasks")            — no SLM call
-        #   2. ACTION ("cancel/pause/resume task X")  — SLM only on action verbs
-        #   3. MODIFY ("change t8f3a to 2h")          — SLM only on update verbs
-        #   4. CREATE ("check news every hour")       — SLM only on interval words
-        # Action precedes MODIFY because the verb classes are disjoint
-        # but action regex is tighter (its pre-filter requires a task
-        # noun OR id token AND a cancel/pause/resume verb). Modify must
-        # precede CREATE because a modify request usually contains an
-        # interval phrase that would otherwise look like a new
-        # scheduling request.
-        if self._scheduler is not None:
-            # Absolute import: connectors are loaded as top-level modules
-            # (`connectors.web_chat`), not from a parent package.
-            from core.scheduler import (
-                looks_like_task_action_request,
-                looks_like_task_query,
-                render_task_list,
-                format_interval as _fmt_iv,
-            )
-            if looks_like_task_query(message):
-                tasks = await self._scheduler.list_tasks()
-                reply = render_task_list(tasks, channel=_ORIGIN)
-                await self._stm.append("agent", reply)
-                log.info("WEB task list query — returned %d task(s)", len(tasks))
-                return web.json_response({
-                    "reply": reply,
-                    "backend": "scheduler",
-                    "stressed": False,
-                    "elapsed_ms": 0,
-                    "mood_dominant": "n/a",
-                    "mood_active_channel": "",
-                    "mood_active_intensity": 0.0,
-                    "tasks_count": len(tasks),
-                })
-            current_tasks = await self._scheduler.list_tasks()
-            # ACTION path — cancel / pause / resume via natural language.
-            if looks_like_task_action_request(message):
-                action_req = await self._brain.parse_task_action_intent(
-                    message, current_tasks,
-                )
-                if action_req is not None:
-                    if action_req.action == "cancel":
-                        removed = await self._scheduler.cancel_task(action_req.task_id)
-                        if removed is None:
-                            reply = (
-                                f"No task with id `{action_req.task_id}` to cancel."
-                            )
-                        else:
-                            reply = (
-                                f"❌ Cancelled task `{removed.id}` — *{removed.topic}*."
-                            )
-                    else:
-                        paused = action_req.action == "pause"
-                        task = await self._scheduler.pause_task(
-                            action_req.task_id, paused=paused,
-                        )
-                        if task is None:
-                            reply = (
-                                f"No task with id `{action_req.task_id}` to "
-                                f"{action_req.action}."
-                            )
-                        else:
-                            verb = "⏸ Paused" if paused else "▶ Resumed"
-                            reply = (
-                                f"{verb} task `{task.id}` — *{task.topic}* "
-                                f"(every {_fmt_iv(task.interval_seconds)})."
-                            )
-                    await self._stm.append("agent", reply)
-                    log.info(
-                        "WEB task action id=%s action=%s",
-                        action_req.task_id, action_req.action,
-                    )
-                    return web.json_response({
-                        "reply": reply,
-                        "backend": "scheduler",
-                        "stressed": False,
-                        "elapsed_ms": 0,
-                        "mood_dominant": "n/a",
-                        "mood_active_channel": "",
-                        "mood_active_intensity": 0.0,
-                        "task_id": action_req.task_id,
-                        "task_action": action_req.action,
-                    })
-            update = await self._brain.parse_task_modify_intent(
-                message, current_tasks,
-            )
-            if update is not None:
-                try:
-                    task = await self._scheduler.update_task(
-                        update.task_id,
-                        topic=update.new_topic,
-                        interval_seconds=update.new_interval_seconds,
-                        queries=update.new_queries,
-                        description=update.new_description,
-                    )
-                except ValueError as exc:
-                    reply = f"Could not update that task: {exc}"
-                    await self._stm.append("agent", reply)
-                    return web.json_response({
-                        "reply": reply,
-                        "backend": "scheduler",
-                        "stressed": False,
-                        "elapsed_ms": 0,
-                        "mood_dominant": "n/a",
-                        "mood_active_channel": "",
-                        "mood_active_intensity": 0.0,
-                    })
-                if task is None:
-                    reply = f"No task with id `{update.task_id}` to update."
-                else:
-                    parts = [f"Updated task **{task.id}** — *{task.topic}*\n"]
-                    if update.new_interval_seconds is not None:
-                        parts.append(
-                            f"• Cadence: every {_fmt_iv(task.interval_seconds)}"
-                        )
-                    if update.new_topic is not None:
-                        parts.append(f"• Topic: {task.topic}")
-                    if update.new_queries is not None:
-                        parts.append(f"• Queries: {len(task.queries)}")
-                    parts.append("\nNext fire uses the new settings.")
-                    reply = "\n".join(parts)
-                await self._stm.append("agent", reply)
-                log.info("WEB task updated id=%s", update.task_id)
-                return web.json_response({
-                    "reply": reply,
-                    "backend": "scheduler",
-                    "stressed": False,
-                    "elapsed_ms": 0,
-                    "mood_dominant": "n/a",
-                    "mood_active_channel": "",
-                    "mood_active_intensity": 0.0,
-                    "task_id": update.task_id,
-                })
-            spec = await self._brain.parse_task_intent(message)
-            if spec is not None:
-                try:
-                    task = await self._scheduler.add_task(
-                        spec, origin=_ORIGIN,
-                    )
-                except ValueError as exc:
-                    reply = f"Could not schedule that task: {exc}"
-                    await self._stm.append("agent", reply)
-                    return web.json_response({
-                        "reply": reply,
-                        "backend": "scheduler",
-                        "stressed": False,
-                        "elapsed_ms": 0,
-                        "mood_dominant": "n/a",
-                        "mood_active_channel": "",
-                        "mood_active_intensity": 0.0,
-                    })
-                # Format an operator-facing confirmation. First fire is
-                # imminent (next scheduler tick); reports broadcast to
-                # every bound connector so mention it here. The web
-                # surface has no slash commands, so the management hint
-                # below points at natural-language phrasing and the REST
-                # endpoint — NOT `/cancel <id>` (which only exists in
-                # the Telegram connector).
-                reply = (
-                    f"Scheduled task **{task.id}** — *{task.topic}*\n\n"
-                    f"• Cadence: every {_fmt_iv(task.interval_seconds)}\n"
-                    f"• Queries: {len(task.queries)}\n"
-                    f"• First report: within ~{self._scheduler_tick_hint()} seconds\n"
-                    f"• Reports go to all connected channels (web + Telegram).\n\n"
-                    f"To stop it: say *\"cancel {task.id}\"* in chat, or POST "
-                    f"`/tasks/cancel` with `{{\"id\": \"{task.id}\"}}`."
-                )
-                await self._stm.append("agent", reply)
-                log.info(
-                    "WEB task scheduled id=%s topic=%r interval=%ds",
-                    task.id, task.topic, task.interval_seconds,
-                )
-                return web.json_response({
-                    "reply": reply,
-                    "backend": "scheduler",
-                    "stressed": False,
-                    "elapsed_ms": 0,
-                    "mood_dominant": "n/a",
-                    "mood_active_channel": "",
-                    "mood_active_intensity": 0.0,
-                    "task_id": task.id,
-                })
+        # Task pipeline — delegated to the shared IntentRouter so this
+        # connector and the telegram connector stay in lockstep. The
+        # router classifies the message against 4 stages (list / action /
+        # modify / create) and returns a structured IntentOutcome; we
+        # render it here with web's JSON + Markdown style. When the
+        # scheduler is disabled, _intent_router is None and we fall
+        # straight through to Brain.think.
+        if self._intent_router is not None:
+            outcome = await self._intent_router.route(message)
+            if outcome.handled:
+                return await self._render_intent_outcome(outcome)
 
         t0 = time.perf_counter()
         try:
@@ -497,6 +336,142 @@ class WebChatConnector:
         SearXNG + SLM round-trip, not the tick).
         """
         return getattr(self._scheduler, "_tick", 30) if self._scheduler else 30
+
+    # ---------- intent-router rendering --------------------------------------
+
+    async def _render_intent_outcome(
+        self, outcome: IntentOutcome,
+    ) -> web.Response:
+        """Render a structured ``IntentOutcome`` into a /chat JSON response.
+
+        Wording preserved verbatim from the pre-refactor v1 connector so
+        the web UI sees the exact same Markdown text it always did
+        (different style from Telegram — bold instead of code-quotes,
+        no emoji prefix on success, REST hint in the create confirmation).
+        All STM appends happen here (the router never touches STM).
+        """
+        # Absolute import: connectors are loaded as top-level modules.
+        from core.scheduler import format_interval as _fmt_iv
+        from core.scheduler import render_task_list
+
+        # Canonical "scheduler-handled" envelope shared by every non-chat
+        # response. Connector-specific fields (task_id, tasks_count, etc.)
+        # are merged in per-kind below.
+        base = {
+            "backend": "scheduler",
+            "stressed": False,
+            "elapsed_ms": 0,
+            "mood_dominant": "n/a",
+            "mood_active_channel": "",
+            "mood_active_intensity": 0.0,
+        }
+        kind = outcome.kind
+
+        if kind == "list":
+            assert outcome.list_result is not None
+            tasks = outcome.list_result.tasks
+            reply = render_task_list(tasks, channel=_ORIGIN)
+            await self._stm.append("agent", reply)
+            log.info("WEB task list query — returned %d task(s)", len(tasks))
+            return web.json_response({
+                **base, "reply": reply, "tasks_count": len(tasks),
+            })
+
+        if kind == "action":
+            assert outcome.action_result is not None
+            ar = outcome.action_result
+            if ar.action == "cancel":
+                if ar.removed is None:
+                    reply = f"No task with id `{ar.task_id}` to cancel."
+                else:
+                    reply = (
+                        f"❌ Cancelled task `{ar.removed.id}` "
+                        f"— *{ar.removed.topic}*."
+                    )
+            else:
+                if ar.task is None:
+                    reply = (
+                        f"No task with id `{ar.task_id}` to {ar.action}."
+                    )
+                else:
+                    verb = "⏸ Paused" if ar.action == "pause" else "▶ Resumed"
+                    reply = (
+                        f"{verb} task `{ar.task.id}` — *{ar.task.topic}* "
+                        f"(every {_fmt_iv(ar.task.interval_seconds)})."
+                    )
+            await self._stm.append("agent", reply)
+            log.info("WEB task action id=%s action=%s", ar.task_id, ar.action)
+            return web.json_response({
+                **base, "reply": reply,
+                "task_id": ar.task_id, "task_action": ar.action,
+            })
+
+        if kind == "modify":
+            assert outcome.update_result is not None
+            ur = outcome.update_result
+            if ur.error is not None:
+                # v1 behaviour: append error to STM (so the web log shows
+                # what happened) and return it as the reply.
+                await self._stm.append("agent", ur.error)
+                return web.json_response({**base, "reply": ur.error})
+            if ur.task is None:
+                reply = f"No task with id `{ur.task_id}` to update."
+            else:
+                parts = [f"Updated task **{ur.task.id}** — *{ur.task.topic}*\n"]
+                if ur.changed_interval:
+                    parts.append(
+                        f"• Cadence: every {_fmt_iv(ur.task.interval_seconds)}"
+                    )
+                if ur.changed_topic:
+                    parts.append(f"• Topic: {ur.task.topic}")
+                if ur.changed_queries:
+                    parts.append(f"• Queries: {len(ur.task.queries)}")
+                parts.append("\nNext fire uses the new settings.")
+                reply = "\n".join(parts)
+            await self._stm.append("agent", reply)
+            log.info("WEB task updated id=%s", ur.task_id)
+            return web.json_response({
+                **base, "reply": reply, "task_id": ur.task_id,
+            })
+
+        if kind == "create":
+            assert outcome.create_result is not None
+            cr = outcome.create_result
+            if cr.error is not None:
+                await self._stm.append("agent", cr.error)
+                return web.json_response({**base, "reply": cr.error})
+            task = cr.task
+            assert task is not None
+            # Format an operator-facing confirmation. First fire is
+            # imminent (next scheduler tick); reports broadcast to
+            # every bound connector so mention it here. The web
+            # surface has no slash commands, so the management hint
+            # below points at natural-language phrasing and the REST
+            # endpoint — NOT `/cancel <id>` (which only exists in
+            # the Telegram connector).
+            reply = (
+                f"Scheduled task **{task.id}** — *{task.topic}*\n\n"
+                f"• Cadence: every {_fmt_iv(task.interval_seconds)}\n"
+                f"• Queries: {len(task.queries)}\n"
+                f"• First report: within ~{self._scheduler_tick_hint()} seconds\n"
+                f"• Reports go to all connected channels (web + Telegram).\n\n"
+                f"To stop it: say *\"cancel {task.id}\"* in chat, or POST "
+                f"`/tasks/cancel` with `{{\"id\": \"{task.id}\"}}`."
+            )
+            await self._stm.append("agent", reply)
+            log.info(
+                "WEB task scheduled id=%s topic=%r interval=%ds",
+                task.id, task.topic, task.interval_seconds,
+            )
+            return web.json_response({
+                **base, "reply": reply, "task_id": task.id,
+            })
+
+        # kind == "noop" should never reach here (caller gates on .handled).
+        # Defensive fallback: return an empty scheduler envelope so the
+        # client doesn't see a 500.
+        log.warning("WEB intent outcome dropped: unexpected kind=%s", kind)
+        return web.json_response({**base, "reply": ""})
 
     # ---------- task-management endpoints ------------------------------------
 

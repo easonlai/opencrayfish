@@ -51,7 +51,9 @@ Design notes
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -130,11 +132,11 @@ class SkillContext:
         its constructor; not every Skill needs it.
     """
 
-    tools: "ToolRegistry"
-    soul: "SoulHandler"
-    stm: "ShortTermMemory"
-    monitor: "Monitor"
-    provider: "Provider"
+    tools: ToolRegistry
+    soul: SoulHandler
+    stm: ShortTermMemory
+    monitor: Monitor
+    provider: Provider
     # Path to memory/archive.md. Skills that need to read LTM use this
     # (or, better, dispatch through the `archive_read` Tool which wraps
     # the read with its own validation + telemetry).
@@ -145,6 +147,26 @@ class SkillContext:
     designation: str
     architect_name: str
     architect_honorific: str
+
+    # Optional extension slot for cross-cutting subsystems that don't
+    # warrant their own typed field yet (emotions snapshot, empathy
+    # directive, deliberation budget, future RAG retriever, …). Keeping
+    # this as a ``Mapping[str, Any]`` rather than a typed dataclass
+    # field means new collaborators can be wired through to a Skill
+    # WITHOUT a coordinated refactor of every existing Skill — only the
+    # Skill that needs the new key reads it. Once a key proves stable
+    # across multiple Skills it should graduate to a typed field of its
+    # own (and be removed from ``extras``).
+    #
+    # Frozen-by-construction: ``main.py`` should pass a ``MappingProxyType``
+    # wrapping the underlying dict so Skills cannot mutate the original
+    # via the context (the field itself is on a frozen dataclass, so
+    # ``ctx.extras = ...`` is blocked, but the wrapped dict would
+    # otherwise still be mutable). The default factory below uses an
+    # EMPTY read-only mapping so the no-extras case is also immutable.
+    extras: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({}),
+    )
 
 
 @runtime_checkable

@@ -276,7 +276,7 @@ class Provider:
         )
 
     @classmethod
-    def from_config(cls, hardware_cfg: Any) -> "Provider":
+    def from_config(cls, hardware_cfg: Any) -> Provider:
         fallback = OllamaBackend(
             base_url=hardware_cfg.cpu_fallback_url,
             model=hardware_cfg.cpu_fallback_model,

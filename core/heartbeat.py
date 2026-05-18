@@ -82,14 +82,14 @@ class Heartbeat:
         self,
         *,
         config: Config,
-        brain: "Brain",
-        soul: "SoulHandler",
-        monitor: "Monitor",
-        emotions: "Emotions",
-        stm: "ShortTermMemory",
+        brain: Brain,
+        soul: SoulHandler,
+        monitor: Monitor,
+        emotions: Emotions,
+        stm: ShortTermMemory,
         skill_registry: SkillRegistry,
         skill_ctx: SkillContext,
-        reflection: "ReflectionEngine | None" = None,
+        reflection: ReflectionEngine | None = None,
     ) -> None:
         self._cfg = config
         self._brain = brain
@@ -191,7 +191,7 @@ class Heartbeat:
                         self._stop.wait(),
                         timeout=self._pulse_interval_seconds,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
         finally:
             log.info("Heartbeat stopped.")
