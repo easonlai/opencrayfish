@@ -24,6 +24,7 @@
 - [Quick Start](#quick-start)
 - [SearXNG Setup (Local Web Search)](#searxng-setup-local-web-search)
 - [Deep Dive: How Everything Works](#deep-dive-how-everything-works)
+  - [0. The Brain Stack — Plain-English Tour](#0-the-brain-stack--plain-english-tour)
   - [1. The Soul — `soul.md`](#1-the-soul--soulmd)
   - [2. The Heartbeat — Time, Rhythm, and Metabolism](#2-the-heartbeat--time-rhythm-and-metabolism)
   - [3. The Vital Signs — `Monitor` & Homeostasis](#3-the-vital-signs--monitor--homeostasis)
@@ -640,6 +641,104 @@ No auth, no API key. OpenCrayFish always sends `q=<query>&format=json&safesearch
 
 This is the comprehensive section. It documents every major subsystem in the order they are wired together in `main.py`, with file links into the codebase.
 
+> **First time here?** Read [§ 0 The Brain Stack — Plain-English Tour](#0-the-brain-stack--plain-english-tour) below for a 5-minute orientation to how Brain, Skills, Tools, and Memory hand work to each other. Then come back to § 1 — § 14 for the full depth.
+
+---
+
+### 0. The Brain Stack — Plain-English Tour
+
+Before the 14 subsystem deep-dives, here is the single mental model that ties them all together. **Four concepts, four jobs, one direction of flow.**
+
+#### The four big ideas (one sentence each)
+
+| Layer | What it is, in one sentence | Where it lives |
+|---|---|---|
+| **Brain** | The orchestrator that runs every reply through a fixed pipeline (gather context → think → plan → act → synthesize → filter → remember). It owns no facts, no I/O, no policy — it just sequences the other three. | [core/brain/orchestrator.py](core/brain/orchestrator.py) |
+| **Skills** | The agent's *menu of decisions* — named verbs like `RECALL`, `SEARCH`, `ANSWER` that the SLM picks from during PLAN. Each Skill knows when it's worth picking, how expensive it is, and which Tools to compose. | [core/skills/](core/skills/) |
+| **Tools** | The agent's *hands* — mechanical I/O primitives (web fetch, file read, future GPIO) with no policy, no fallback, no SLM. Skills compose Tools; the SLM never names a Tool directly. | [tools/](tools/) |
+| **Memory** | The agent's *substrate of self* — a four-tier hierarchy from working RAM (the last 12 turns) through a disk journal up to nightly-distilled long-term archive and finally the soul itself. Every layer above (Brain, Skills, Tools) reads from or writes to this. | [core/stm.py](core/stm.py), [memory/archive.md](memory/archive.md), [soul.md](soul.md) |
+
+#### How they talk to each other
+
+```text
+             one user message arrives
+                       │
+                       ▼
+           ┌────────────────────────────────┐
+           │           BRAIN (orchestrator)         │     reads:  soul.md, STM, vitals, mood
+           │  Brain._cycle()  in core/brain/        │     writes: STM (turns), trace, reflection
+           │    ┌──────────────────────┐         │
+           │    │  COGNITIVE LOOP        │         │     decides WHICH Skill to call,
+           │    │ THINK→PLAN→ACT→REFINE  │         │     and assembles the final prompt
+           │    └──┬───────────────────┘         │
+           └───────┼───────────────────────────┘
+                   │ invoke("verb", ctx, **kwargs)
+                   ▼
+           ┌────────────────────────────────┐
+           │           SKILLS (decisions)           │     7 today: identity, recall,
+           │  core/skills/* — each Skill knows:    │       direct_answer, research,
+           │    • plan_verb  (how SLM names it)     │       self_reflect, proactive_learning,
+           │    • cost_tier  (free/cheap/expensive)  │       recurring_research
+           │    • requires_network (PLAN filter)    │
+           │    • trigger_hints (WHEN to pick)      │     audit:  state/skills-*.jsonl
+           └───────┬───────────────────────────┘
+                   │ await ctx.tools.call("web_search", q="...")
+                   ▼
+           ┌────────────────────────────────┐
+           │           TOOLS (hands)                │     2 today: web_search (SearXNG),
+           │  tools/* — stateless I/O, no policy.  │                archive_read (LTM)
+           └───────┬───────────────────────────┘
+                   │ read/write
+                   ▼
+           ┌────────────────────────────────┐
+           │           MEMORY (substrate)           │     T1: deque   (last 12 turns, RAM)
+           │  Four tiers, oldest at the bottom:    │     T2: pending (RAM, flushed @30s idle)
+           │    T1  deque (working set)             │     T3: journal (state/stm_journal.jsonl)
+           │    T2  pending buffer                  │     T4: archive.md (nightly distill)
+           │    T3  stm_journal.jsonl               │         + soul.md (promoted facts)
+           │    T4  archive.md  +  soul.md          │
+           └────────────────────────────────┘
+```
+
+#### The contracts between layers (read these in order)
+
+1. **Brain doesn't know what Skills exist.** It asks `SkillRegistry.plan_menu(...)` at PLAN time and renders whatever it gets back into the SLM's prompt. Add a new Skill, restart, and the Brain immediately considers it — no Brain code change.
+2. **Skills don't know what Tools exist.** They go through `ctx.tools.call("web_search", …)` by name. Replace SearXNG with a future Tool that satisfies the same Protocol, and every Skill that uses it keeps working with zero changes.
+3. **Tools don't know about the SLM, the user, or policy.** They just do their one I/O job (HTTP GET, file read) and return a typed result. This is what makes them trivially unit-testable.
+4. **Memory is read-many, write-few.** Brain and Skills read freely (cheap). Writes happen on tightly defined triggers: each user/agent turn (T1+T2), 30 s of idle (T3), and nightly Sleep Metabolism (T4). The hot path does zero disk I/O.
+
+#### A worked example, layer by layer
+
+The Architect types: **"Compare the Hailo-10H to the Hailo-8 for LLMs."**
+
+| Step | Layer | What happens |
+|---|---|---|
+| 1 | Brain | Gathers soul + vitals + mood; the identity regex doesn't match, so cognition will run. |
+| 2 | Brain | LTM short-circuit scan over `archive.md` — only 1 keyword hit, below the 2-hit floor, so cognition continues. |
+| 3 | Brain → Cognitive Loop | Asks `SkillRegistry.plan_menu(cost_cap, exclude_network)` for the live menu — gets `[ANSWER, RECALL, SEARCH]` sorted free→expensive. |
+| 4 | Cognitive Loop | THINK call → splits the question into Q1 (specs), Q2 (why H8 unsuitable), Q3 (which HAT). |
+| 5 | Cognitive Loop | PLAN call → SLM picks `SEARCH "Hailo-10H specs"` for Q1, `RECALL` for Q2, `ANSWER` for Q3. |
+| 6 | Skills | ACT dispatches concurrently: `research.execute()` (Q1), `recall.execute()` (Q2), `direct_answer.execute()` (Q3). Each Skill invocation is timed and appended to `state/skills-*.jsonl`. |
+| 7 | Tools | `research` calls `ctx.tools.call("web_search", …)` → the SearXNG Tool hits `http://localhost:8080/search?format=json`. `recall` calls `ctx.tools.call("archive_read", …)` → reads `memory/archive.md` line by line. |
+| 8 | Memory → Brain | All evidence is folded into the synth prompt alongside the last 12 STM turns. Brain calls `provider.generate()` to compose the final answer. |
+| 9 | Brain | Runs the Positive Filter, appends both turns to STM (T1 + T2), fires reflection in the background. |
+| 10 | Memory | The pending buffer flushes to `state/stm_journal.jsonl` (T3) after 30 s of silence. Tonight at 02:00, Sleep Metabolism will distill it into `archive.md` (T4). |
+
+That's the whole agent in one trace. Every other deep-dive section below zooms into one layer of this picture.
+
+#### How to extend each layer (the one-line guide)
+
+- **Add a new Skill** → drop a file in [core/skills/](core/skills/) that satisfies the Skill Protocol, register it in [main.py](main.py). See [§ 12 Hello-World Skill — Step by Step](#hello-world-skill--step-by-step).
+- **Add a new Tool** → drop a file in [tools/](tools/) that satisfies the Tool Protocol, register it in [main.py](main.py). See [§ Adding a new tool](#adding-a-new-tool).
+- **Add a new memory shelf** → don't, usually. Promote facts to `soul.md [CORE_MEMORIES]` via Sleep Metabolism instead.
+- **Add a new connector** → wrap `Brain.think(…)` and stream the `ThoughtTrace` back. See [§ Adding a new connector](#adding-a-new-connector).
+
+#### What this design buys you
+
+- **The SLM is small (1.5B) and unreliable.** Brain compensates by splitting the work into four short prompts (each ≤120 tokens) instead of one giant chain-of-thought — each prompt has exactly one job and is parsed with regex, not JSON.
+- **The PLAN menu is the only "intelligence routing" surface.** Adding a Skill is the only way to expand what the agent can choose to do. Everything else — Tools, Memory, Provider — is plumbing.
+- **Layer isolation is enforced by contract, not by language tricks.** Skill execution is wrapped in a try/except in `SkillRegistry.invoke()` so a plugin crash can never escape into the Brain. A failed Tool call returns a typed error — it never raises into the calling Skill. A SLM timeout returns `backend="offline"` — it never raises into the connector. **Every interface is a graceful degradation point.** See [§ Failure-Mode Matrix](#failure-mode-matrix) for the full contract.
+
 ---
 
 ### 1. The Soul — `soul.md`
@@ -846,6 +945,8 @@ ProviderHealth(
 
 **Modules:** [core/stm.py](core/stm.py) · [core/heartbeat.py](core/heartbeat.py) (metabolism)
 
+> **Plain English.** Memory is a four-tier waterfall. The newest turn lands in a 12-slot RAM ring (T1), is mirrored to a pending buffer (T2), and after 30 s of silence is flushed to a disk journal (T3) so a crash never loses it. Every night at 02:00, the day's journal is distilled into long-term prose in `archive.md` (T4), the most identity-shaping facts are promoted into `soul.md`, and T1/T2/T3 are wiped clean for tomorrow. The hot reply path **never** touches disk — only Heartbeat does.
+
 OpenCrayFish has a **three-tier memory hierarchy**, modeled after the biological brain:
 
 ```text
@@ -923,6 +1024,8 @@ Rotation + retention details live in [§ JSONL Rotation & Retention](#jsonl-rota
 ### 6. The Thinking Process — Brain & Cognitive Loop
 
 **Modules:** [core/brain/orchestrator.py](core/brain/orchestrator.py) · [core/brain/prompt_assembly.py](core/brain/prompt_assembly.py) · [core/brain/identity_responder.py](core/brain/identity_responder.py) · [core/cognition.py](core/cognition.py)
+
+> **Plain English.** Brain is a *sequencer*, not a thinker. For every reply it walks a fixed 11-step pipeline: read the soul, sample the body, feel the mood, read the user's tone, try a deterministic identity shortcut, try an LTM shortcut, otherwise spin up the Cognitive Loop (one prompt for THINK, one for PLAN, fan out the chosen Skills in ACT, optionally one REFINE round). The evidence is then folded into one final synth prompt, the SLM speaks, the Positive Filter scrubs it, the turn is committed to memory, and a self-critique fires in the background. **No single SLM call does more than one job, and every step has an explicit failure mode.**
 
 Every reply the agent produces — whether triggered by a user message, a heartbeat proactive thought, or a scheduled task — flows through `Brain._cycle()`. The cycle is a strict pipeline:
 
@@ -1275,6 +1378,8 @@ NL list/cancel/pause/resume use cheap regex pre-filters (`looks_like_task_query`
 ### 12. Skills & Tools — The Two-Tier Capability Stack
 
 **Modules:** [core/skills/](core/skills/) · [core/skills/base.py](core/skills/base.py) · [core/skills/registry.py](core/skills/registry.py) · [tools/base.py](tools/base.py) · [tools/registry.py](tools/registry.py)
+
+> **Plain English.** A **Skill** is something the agent can *decide* to do (a named verb the SLM picks during PLAN, like `RECALL` or `SEARCH`). A **Tool** is something the agent can *mechanically poke* (an HTTP call, a file read). Skills compose Tools; Tools never know about Skills. The SLM only ever names Skills — it never sees Tools at all. Add a Skill and the PLAN menu grows for free; add a Tool and existing Skills can compose it without the Brain changing one line.
 
 OpenCrayFish separates *what the agent can decide to do* from *what the agent can mechanically poke*:
 
