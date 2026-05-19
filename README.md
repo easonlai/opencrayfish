@@ -2,7 +2,7 @@
 
 > **An edge-native, biologically-inspired AI companion that lives on a single Raspberry Pi 5 — fully offline, powered by a 1.5B-parameter local SLM, with a heart that beats, a brain that sleeps, and a soul you can read.**
 >
-> **v3 also ships a fully pluggable framework**: Skills, Tools, Connectors, and Provider Backends are four symmetric plug-in surfaces — every one auto-discoverable via Python entry-points, every one declared by a frozen `*Manifest`, every one validated at boot. A third-party `pip install opencrayfish-skill-translate` (or `-tool-weather`, or `-connector-discord`, or `-backend-vllm-cuda`) extends the agent with **zero edits to `main.py` and zero fork of OpenCrayFish itself**.
+> **OpenCrayFish is a fully pluggable framework**: Skills, Tools, Connectors, and Provider Backends are four symmetric plug-in surfaces — every one auto-discoverable via Python entry-points, every one declared by a frozen `*Manifest`, every one validated at boot. A third-party `pip install opencrayfish-skill-translate` (or `-tool-weather`, or `-connector-discord`, or `-backend-vllm-cuda`) extends the agent with **zero edits to `main.py` and zero fork of OpenCrayFish itself**.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-1f8a4f.svg)](#roadmap)
@@ -19,7 +19,7 @@
 - [60-Second Mental Model (The Crayfish in Its Burrow)](#60-second-mental-model-the-crayfish-in-its-burrow)
 - [Why This Project Exists](#why-this-project-exists)
 - [Design Pillars](#design-pillars)
-- [Framework & Design Principles (v3)](#framework--design-principles-v3)
+- [Framework & Design Principles](#framework--design-principles)
   - [The Four Plug-in Surfaces](#the-four-plug-in-surfaces)
   - [The Manifest + Registry + Discovery Doctrine](#the-manifest--registry--discovery-doctrine)
   - [How the System Auto-Adapts](#how-the-system-auto-adapts)
@@ -52,7 +52,7 @@
     - [`bootstrap_validate` — Fail Loud at Boot](#bootstrap_validate--fail-loud-at-boot)
     - [The `ToolManifest` Contract](#the-toolmanifest-contract)
     - [Third-Party Tool Packages (`pip install`)](#third-party-tool-packages-pip-install)
-    - [Hello-World Tool — Step by Step (v3 `bind_context`)](#hello-world-tool--step-by-step-v3-bind_context)
+    - [Hello-World Tool — Step by Step (`bind_context`)](#hello-world-tool--step-by-step-bind_context)
     - [Argspec Runtime Validation](#argspec-runtime-validation)
     - [Plugin Config Namespace (`cfg.plugins.*`)](#plugin-config-namespace-cfgplugins)
     - [The `ConnectorManifest` Contract](#the-connectormanifest-contract)
@@ -178,9 +178,9 @@ The agent does not stop between user turns. Driven entirely from `config.yaml`:
 
 ---
 
-## Framework & Design Principles (v3)
+## Framework & Design Principles
 
-OpenCrayFish v3 promotes the project from "biological agent with some hooks" to **a real plug-in framework**. Everything that talks to the outside world — every reflex the SLM can pick, every device the agent can poke, every channel a human can chat through, every model the brain can run on — is a third-party-replaceable plug-in. The core stays small, opinionated, and biologically-grounded; the periphery is yours.
+OpenCrayFish is built as **a real plug-in framework**. Everything that talks to the outside world — every reflex the SLM can pick, every device the agent can poke, every channel a human can chat through, every model the brain can run on — is a third-party-replaceable plug-in. The core stays small, opinionated, and biologically-grounded; the periphery is yours.
 
 ### The Four Plug-in Surfaces
 
@@ -1206,7 +1206,7 @@ Every reply the agent produces — whether triggered by a user message, a heartb
 
 The qwen2:1.5b model **reliably mishandles** the most basic identity questions ("what is your name", "do you know my name", "how are you", "who created you"). From production logs, "what is your name" used to triage as a SEARCH and pollute the synth with Netflix's "My Name" + the anime "Your Name". Fix: detect a small set of unambiguous identity-class regexes BEFORE any cognition runs, and return a templated reply built from soul.md + config.yaml + live vitals/mood. **Deterministic. Zero round-trip. Zero hallucination.**
 
-Since v2.0, the "what is your name / who created you" branches delegate the actual templating to `IdentitySkill` via `skill_registry.invoke("identity", ctx, kind="name"|"creator")`. The Skill reads the IDENTITY block from `soul.md` and returns a short factual line; Brain wraps it with the live salutation/status sentence. If the registry call fails (no registry, exception, `ok=False`, empty summary), Brain falls back to the previous inline template — strictly additive, zero regression risk. The `who am I` and `how are you` branches stay inline because they need vitals / mood / architect-name that `IdentitySkill` doesn't see.
+The "what is your name / who created you" branches delegate the actual templating to `IdentitySkill` via `skill_registry.invoke("identity", ctx, kind="name"|"creator")`. The Skill reads the IDENTITY block from `soul.md` and returns a short factual line; Brain wraps it with the live salutation/status sentence. If the registry call fails (no registry, exception, `ok=False`, empty summary), Brain falls back to an inline template — strictly additive, zero regression risk. The `who am I` and `how are you` branches stay inline because they need vitals / mood / architect-name that `IdentitySkill` doesn't see.
 
 #### Cognitive Loop — THINK → PLAN → ACT → REFINE
 
@@ -1421,7 +1421,7 @@ The result: **the agent gets smarter while the Architect sleeps**. Every morning
 
 #### Architect-priority cooperative yield
 
-The autonomous research cycle holds the NPU for several seconds per SLM call (topic-selection triage → SearXNG → synthesis → REFINE). If the Architect speaks while a cycle is in flight, the live `think()` would otherwise queue behind the autonomous work on the single Hailo queue — a latency priority inversion. v2.0 closes that gap with a **cooperative yield at every long-running milestone**:
+The autonomous research cycle holds the NPU for several seconds per SLM call (topic-selection triage → SearXNG → synthesis → REFINE). If the Architect speaks while a cycle is in flight, the live `think()` would otherwise queue behind the autonomous work on the single Hailo queue — a latency priority inversion. OpenCrayFish closes that gap with a **cooperative yield at every long-running milestone**:
 
 | Checkpoint | Where in `_proactive_research` | Behaviour when `brain.is_foreground_busy()` is true |
 |---|---|---|
@@ -1543,7 +1543,7 @@ OpenCrayFish separates *what the agent can decide to do* from *what the agent ca
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-This split is the single most important architectural change between v1 and v2.0 (the PLAN-stage menu became pluggable), and v3 closes the symmetry by giving Tools the same **`bind_context`** seam Skills have always had — so a third-party Tool can take its operator config and shared subsystem handles without any factory-closure dance. Adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from; adding a new Tool with a `config_key` automatically wires it into operator config — neither requires touching `cognition.py` or `main.py`.
+This split is the central architectural choice of the framework: the PLAN-stage menu is pluggable, and Tools have the same **`bind_context`** seam Skills have — so a third-party Tool can take its operator config and shared subsystem handles without any factory-closure dance. Adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from; adding a new Tool with a `config_key` automatically wires it into operator config — neither requires touching `cognition.py` or `main.py`.
 
 #### Tier A — Skills (the registry)
 
@@ -1747,7 +1747,7 @@ Two things the manifest unlocks that the scattered-attribute style cannot:
 
 #### Third-Party Skill Packages (`pip install`)
 
-Editing `main.py` to register each new skill works fine in the monorepo, but it doesn't scale to **a community of plug-in authors**. v2 added a standard Python plug-in mechanism: the **`opencrayfish.skills` entry-point group**. Any installed package that declares an entry in this group is auto-discovered at boot via `importlib.metadata.entry_points(group="opencrayfish.skills")`.
+Editing `main.py` to register each new skill works fine in the monorepo, but it doesn't scale to **a community of plug-in authors**. The framework uses the standard Python plug-in mechanism: the **`opencrayfish.skills` entry-point group**. Any installed package that declares an entry in this group is auto-discovered at boot via `importlib.metadata.entry_points(group="opencrayfish.skills")`.
 
 To ship a third-party skill, the author publishes a normal Python package whose `pyproject.toml` looks like this:
 
@@ -1867,14 +1867,14 @@ opencrayfish tool validate opencrayfish_tool_weather:WeatherTool
 
 The reference implementation lives at [`examples/opencrayfish-skill-echo/`](examples/opencrayfish-skill-echo/) for the Skill side; copy-paste-adapt it as the canonical "hello world" for new plugins.
 
-#### Hello-World Tool — Step by Step (v3 `bind_context`)
+#### Hello-World Tool — Step by Step (`bind_context`)
 
-The Skill side has a full hello-world walkthrough above. The Tool side is the same shape with one important addition: **`bind_context`**. v3 makes Tools symmetric with Skills for config injection — instead of the v2 factory-closure dance (where you'd write a `make_weather_tool(api_key)` factory and stuff it into the entry-point), a v3 Tool simply implements `bind_context(ctx: ToolContext)` and the `ToolRegistry` delivers operator config + shared subsystem handles automatically.
+The Skill side has a full hello-world walkthrough above. The Tool side is the same shape with one important addition: **`bind_context`**. Tools are symmetric with Skills for config injection — a Tool simply implements `bind_context(ctx: ToolContext)` and the `ToolRegistry` delivers operator config + shared subsystem handles automatically. No factory-closure dance required.
 
 **Step 1. Create the Tool class** (e.g. inside your `opencrayfish_tool_weather` package):
 
 ```python
-"""Hello-World Tool — minimal example of the v3 Tool plug-in contract."""
+"""Hello-World Tool — minimal example of the Tool plug-in contract."""
 
 from __future__ import annotations
 
@@ -1909,7 +1909,7 @@ class WeatherTool:
         self._client: httpx.AsyncClient | None = None
         self._units = "metric"  # default until bind_context overrides it
 
-    # ── v3 opt-in: receive operator config + shared handles at boot ─────────
+    # ── opt-in: receive operator config + shared handles at boot ───────────
     def bind_context(self, ctx: ToolContext) -> None:
         cfg = ctx.plugins_config.get(self.manifest.config_key or self.name, {})
         self._units = cfg.get("units", "metric")
@@ -1961,7 +1961,7 @@ RuntimeError: ToolRegistry.bootstrap_validate: tool 'weather' declares
 config_key='weather' but cfg.plugins.weather is missing.
 ```
 
-That's the v3 Tool contract end-to-end: **one Manifest, one optional `bind_context`, one `call`, one entry-point line, one YAML block**.
+That's the Tool contract end-to-end: **one Manifest, one optional `bind_context`, one `call`, one entry-point line, one YAML block**.
 
 #### Argspec Runtime Validation
 
@@ -1995,7 +1995,7 @@ plugins:
 
 The core never reads inside these sub-dicts. They're forwarded verbatim to two sites:
 
-- **Tools** — two symmetric paths. (1) `ToolRegistry.bootstrap_validate(plugins_config=cfg.plugins)` fails boot if a Tool declares `config_key="weather"` but `cfg.plugins.weather` is missing. (2) `ToolRegistry.bind_context(ctx)` delivers a frozen `ToolContext` (carrying `plugins_config` + `soul` / `stm` / `monitor` / `provider` / `archive_path` / `designation` / `architect_name` / `architect_honorific`) to every registered Tool that **opts in** by implementing `bind_context(ctx)`. First-party Tools (`SearXNG`, `ArchiveRead`) don't need it — they're constructed with their config in `main.py` — but it's the documented seam by which a v3 third-party Tool reads its `cfg.plugins.<key>` slice without any factory-closure dance. See the [Hello-World Tool walkthrough](#hello-world-tool--step-by-step-v3-bind_context) above.
+- **Tools** — two symmetric paths. (1) `ToolRegistry.bootstrap_validate(plugins_config=cfg.plugins)` fails boot if a Tool declares `config_key="weather"` but `cfg.plugins.weather` is missing. (2) `ToolRegistry.bind_context(ctx)` delivers a frozen `ToolContext` (carrying `plugins_config` + `soul` / `stm` / `monitor` / `provider` / `archive_path` / `designation` / `architect_name` / `architect_honorific`) to every registered Tool that **opts in** by implementing `bind_context(ctx)`. First-party Tools (`SearXNG`, `ArchiveRead`) don't need it — they're constructed with their config in `main.py` — but it's the documented seam by which a third-party Tool reads its `cfg.plugins.<key>` slice without any factory-closure dance. See the [Hello-World Tool walkthrough](#hello-world-tool--step-by-step-bind_context) above.
 - **Skills** — via [`SkillContext.plugins_config`](core/skills/base.py) (`Mapping[str, Mapping[str, Any]]`, wrapped in `MappingProxyType` so Skills can't mutate the operator's config). A Skill retrieves its slice at call time:
 
 ```python
@@ -2055,7 +2055,7 @@ The first-party `TelegramConnector` and `WebChatConnector` are still constructed
 
 #### Provider Backends — `BackendManifest` & Discovery
 
-The Provider layer (`core/provider.py`) is the **lightest** plug-in surface today: there is no central `BackendRegistry` because the `Provider` singleton itself owns the live primary/fallback backends (the constructor is built around the Pi 5 + AI HAT+ deployment target). v3 closes the gap by making the primary/fallback slots **operator-routable** — when `cfg.hardware.primary_backend` or `cfg.hardware.fallback_backend` names a discovered backend, the `Provider.from_config()` factory swaps that slot to the discovered instance.
+The Provider layer (`core/provider.py`) is the **lightest** plug-in surface: there is no central `BackendRegistry` because the `Provider` singleton itself owns the live primary/fallback backends (the constructor is built around the Pi 5 + AI HAT+ deployment target). The primary/fallback slots are **operator-routable** — when `cfg.hardware.primary_backend` or `cfg.hardware.fallback_backend` names a discovered backend, the `Provider.from_config()` factory swaps that slot to the discovered instance.
 
 The contract ([`core/provider_manifest.py`](core/provider_manifest.py)):
 
@@ -2119,7 +2119,7 @@ Paired with the [`examples/opencrayfish-skill-echo`](examples/opencrayfish-skill
 If you're changing one of these published types and the surface test fails, the right move is almost always to revert the change. The exceptions are:
 
 1. **Adding** a new field with a default (backward-compatible) — just append it to the corresponding `EXPECTED_*` set. Document briefly in the dataclass docstring.
-2. **Renaming** or **removing** a field, or changing a default that already-shipped plugins relied on — this is a v2 break. Bump `SUPPORTED_*_PROTOCOL_VERSIONS` to add `"skill-protocol/2"` / `"tool-protocol/2"` / `"connector-protocol/2"` / `"backend-protocol/2"`, leave `"...1"` in the supported set for at least one release with a deprecation log line, and document the migration in this section.
+2. **Renaming** or **removing** a field, or changing a default that already-shipped plugins relied on — this is a breaking protocol change. Bump `SUPPORTED_*_PROTOCOL_VERSIONS` to add `"skill-protocol/2"` / `"tool-protocol/2"` / `"connector-protocol/2"` / `"backend-protocol/2"`, leave `"...1"` in the supported set for at least one release with a deprecation log line, and document the migration in this section.
 
 The four protocol-version constants live in [`core/skills/manifest.py`](core/skills/manifest.py), [`tools/manifest.py`](tools/manifest.py), [`connectors/manifest.py`](connectors/manifest.py), and [`core/provider_manifest.py`](core/provider_manifest.py) respectively.
 
@@ -2198,9 +2198,9 @@ The three high-frequency feeds — `deliberation`, `skills`, `reflection` — ar
 - `<memory.log_path>/YYYY-MM-DD.log` — per-day heartbeat telemetry (PULSE / PROACTIVE / Sleep Metabolism). Default `logs/daily/`. Written synchronously by [core/heartbeat.py](core/heartbeat.py)'s `_append_log()`.
 - `state/*-YYYY-MM-DD.jsonl` — date-rotated structured audit feeds (see [§ JSONL Rotation & Retention](#jsonl-rotation--retention)).
 
-##### v2.0 instrumentation (foreground priority)
+##### Foreground-priority instrumentation
 
-Every live conversation turn now bookends itself in `state/logs/agent.log`, and every yielded background cycle leaves a single explanatory line:
+Every live conversation turn bookends itself in `state/logs/agent.log`, and every yielded background cycle leaves a single explanatory line:
 
 | Source | Format | When |
 |---|---|---|
@@ -2231,7 +2231,7 @@ OpenCrayFish is a **single-process, single-event-loop asyncio** application. Eve
 
 Mutable state is protected by **fine-grained `asyncio.Lock`s**, not a global lock:
 
-- `Emotions._lock` — protects the 5-D vector. `nudge_many()` holds it for the duration of multi-channel updates so `decay()` can't interleave (this was the bug that motivated the v2 emotions rewrite — sequential `await nudge(); await nudge()` allowed the heartbeat to slip in mid-update).
+- `Emotions._lock` — protects the 5-D vector. `nudge_many()` holds it for the duration of multi-channel updates so `decay()` can't interleave (sequential `await nudge(); await nudge()` would otherwise let the heartbeat slip in mid-update).
 - `SoulHandler._lock` — protects every soul.md read/write so concurrent metabolism + reflection consolidation can't interleave.
 - `ShortTermMemory._lock` — protects the deque + pending buffer + journal write path.
 
@@ -2528,15 +2528,13 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 The current codebase is **v3.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (218 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean.
 
-**What v3 added on top of v2** (the framework release):
+**The framework surface** (what plug-in authors build against):
 
-- **Four symmetric plug-in surfaces** — Skills, Tools, Connectors, Provider Backends — every one with its own frozen `*Manifest`, its own `*Registry` with lifecycle + audit + opt-in `bind_context`, and its own fail-isolated `*/discovery.py` walking the matching `opencrayfish.*` entry-point group. Adding any plug-in is now `pip install` + (optional) `cfg.plugins.<key>:` block + restart, with zero edits to OpenCrayFish itself.
-- **`ToolContext` + `bind_context`** ([tools/base.py](tools/base.py), [tools/registry.py](tools/registry.py)) — Tools now have the same opt-in config injection seam Skills always had. A v3 third-party Tool reads `cfg.plugins.<key>` from a frozen, shared context object instead of a factory-closure dance. First-party Tools (`SearXNG`, `ArchiveRead`) are untouched — `bind_context` is purely additive.
+- **Four symmetric plug-in surfaces** — Skills, Tools, Connectors, Provider Backends — every one with its own frozen `*Manifest`, its own `*Registry` with lifecycle + audit + opt-in `bind_context`, and its own fail-isolated `*/discovery.py` walking the matching `opencrayfish.*` entry-point group. Adding any plug-in is `pip install` + (optional) `cfg.plugins.<key>:` block + restart, with zero edits to OpenCrayFish itself.
+- **`ToolContext` + `bind_context`** ([tools/base.py](tools/base.py), [tools/registry.py](tools/registry.py)) — Tools have an opt-in config-injection seam matching Skills. A third-party Tool reads `cfg.plugins.<key>` from a frozen, shared context object instead of a factory-closure dance. First-party Tools (`SearXNG`, `ArchiveRead`) are untouched — `bind_context` is purely additive.
 - **Operator-routable Provider backends** ([core/provider.py](core/provider.py)) — `cfg.hardware.primary_backend` and `cfg.hardware.fallback_backend` accept the name of any discovered backend manifest and the `Provider.from_config()` factory swaps the matching slot. Unknown name → fail-loud boot with the list of available names.
-- **Operator-configurable web-search Skill** — `cfg.cognition.web_search_skill` (default `"research"`) decides which Skill the Brain's web triage + the Cognitive Loop's `SEARCH` verb + the REFINE gap closure dispatch to. A third-party `perplexity_research` (or similar) replacement now drops in without core edits.
+- **Operator-configurable web-search Skill** — `cfg.cognition.web_search_skill` (default `"research"`) decides which Skill the Brain's web triage + the Cognitive Loop's `SEARCH` verb + the REFINE gap closure dispatch to. A third-party `perplexity_research` (or similar) replacement drops in without core edits.
 - **Tested protocol surface** — `tests/test_skill_protocol_surface_v1.py` + the four `SUPPORTED_*_PROTOCOL_VERSIONS` constants are snapshot-frozen. Any breaking edit to a published `*Manifest` / `*Context` / `*Result` either restores the surface or deliberately bumps the protocol version with a migration note in [§ Protocol Surface Stability](#protocol-surface-stability).
-
-**v2 consolidated** the pluggable Skill layer, the date-rotated JSONL audit feeds, the Architect-priority cooperative yield between live `think()` and autonomous proactive research, and the atomic-swap write path for `soul.md` — all still present in v3.
 
 The natural next directions:
 
@@ -2545,7 +2543,7 @@ The natural next directions:
 - **Local vision** — small VLM on the NPU + CSI camera, exposed as a `see` Skill.
 - **Local voice** — Whisper.cpp for in + Piper TTS for out, registered as bidirectional connectors.
 - **Output actuators** — WS2812 LED strip for mood visualization, OLED for facial expression, servos for embodied motion — these are `side_effects=True, requires_confirmation=False` Skills with policy.
-- **Sleep-time soul evolution v2** — SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve, replacing the current rule-based `_consolidate_reflections`.
+- **Sleep-time soul evolution** — SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve, replacing the current rule-based `_consolidate_reflections`.
 - **Encrypted state at rest** — for deployments in regulated environments (clinical, legal, financial).
 - **Pytest suite expansion** — coverage gaps worth filling: `Emotions` decay/nudge math, `CognitiveLoop` THINK/PLAN/REFINE parsing edge cases, `SkillRegistry.plan_menu` filtering under stressed vitals + offline brain, and `Provider`'s circuit-breaker trip / half-open / recover lifecycle. See [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
 
