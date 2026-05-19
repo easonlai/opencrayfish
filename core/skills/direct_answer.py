@@ -21,9 +21,53 @@ from __future__ import annotations
 from typing import Any
 
 from .base import SkillContext, SkillResult
+from .manifest import SkillManifest
 
 
 class DirectAnswerSkill:
+    # Declarative manifest (see ResearchSkill for the rationale). The
+    # ``plan_guidance`` block teaches the PLAN-stage SLM when to pick
+    # ANSWER (and, importantly, when NOT to — small models over-pick
+    # ANSWER and hallucinate, so the guidance steers them toward
+    # SEARCH when in doubt).
+    manifest = SkillManifest(
+        name="direct_answer",
+        description=(
+            "Ask the local SLM directly with no grounding. Use when the topic "
+            "is general knowledge the model is expected to already know."
+        ),
+        plan_verb="ANSWER",
+        plan_arg_hint="",
+        plan_guidance=(
+            "ANSWER ONLY for: stable textbook facts (arithmetic, basic "
+            "definitions, mainstream programming syntax) that DO NOT "
+            "depend on dates or versions. When in doubt, prefer SEARCH "
+            "over ANSWER. The local model is small."
+        ),
+        plan_example="Q3: ANSWER",
+        trigger_hints=(
+            "the question is general / timeless / not domain-specific",
+            "no recall or web search is needed for an adequate answer",
+            "the user wants a conversational reply",
+        ),
+        args_schema={
+            "query": {
+                "type": "string",
+                "required": True,
+                "desc": "The user question or sub-question to answer.",
+            },
+            "system": {
+                "type": "string",
+                "required": False,
+                "default": "",
+                "desc": "Optional system-prompt override. Empty = default minimal prompt.",
+            },
+        },
+        cost_tier="cheap",
+        requires_network=False,
+        requires_caps=("provider",),
+    )
+
     name: str = "direct_answer"
     description: str = (
         "Ask the local SLM directly with no grounding. Use when the topic "

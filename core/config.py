@@ -64,6 +64,16 @@ class HardwareCfg:
     # Brain re-uses the heartbeat's vitals reading if it's fresher than this
     # many seconds, avoiding a per-turn 100 ms `psutil.cpu_percent` block.
     vitals_cache_ttl_seconds: float = 5.0
+    # ---- v2.1 third-party backend routing (SMELL C fix) ---------------------
+    # When set to a discovered backend's manifest ``name``, that backend
+    # takes the matching Provider slot instead of the built-in
+    # ``HailoOllamaBackend`` / ``OllamaBackend``. Lets a third-party
+    # ``opencrayfish.provider_backends`` entry-point (e.g. a
+    # ``vllm_backend`` package) actually serve inference rather than just
+    # log its presence. ``None`` (default) keeps the legacy Pi 5 + AI HAT+
+    # wiring untouched. Fail-loud: an unknown name aborts boot.
+    primary_backend: str | None = None
+    fallback_backend: str | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +187,14 @@ class CognitionCfg:
     # true once you've measured the latency impact and decided the extra
     # grounding is worth it.
     dispatch_answer_via_skill: bool = False
+    # Name of the registered Skill used for web search (Brain's web
+    # triage fallback + Cognitive Loop's SEARCH verb + REFINE gap
+    # closure). Defaults to the in-tree "research" Skill. A third-party
+    # package can ship a replacement (e.g. "perplexity_research") and
+    # an operator points this knob at it — no code change required.
+    # The named Skill must be registered AND expose a `query: str`
+    # arg shape compatible with `research.invoke(query=..., limit=5)`.
+    web_search_skill: str = "research"
 
 
 @dataclass(frozen=True)
@@ -276,6 +294,16 @@ class Config:
     web_chat: WebChatCfg = WebChatCfg()
     tasks: TasksCfg = TasksCfg()
     skills: SkillsCfg = SkillsCfg()
+    # ``plugins.*`` is the public extension namespace for third-party
+    # Skills and Tools. Each top-level key under ``cfg.plugins``
+    # corresponds to a Skill/Tool's ``manifest.config_key`` value; the
+    # core never reads inside these dicts \u2014 they're forwarded verbatim
+    # to the plugin via ``SkillContext.plugins_config`` /
+    # ``ToolRegistry.bootstrap_validate(plugins_config=...)``. This
+    # keeps the Config dataclass open-ended (no edits required per
+    # new plugin) without losing the boot-time presence check that
+    # bootstrap_validate gives us.
+    plugins: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path = "config.yaml") -> Config:
@@ -292,4 +320,5 @@ class Config:
             web_chat=WebChatCfg(**raw.get("web_chat", {})),
             tasks=TasksCfg(**raw.get("tasks", {})),
             skills=SkillsCfg(**raw.get("skills", {})),
+            plugins=dict(raw.get("plugins", {}) or {}),
         )

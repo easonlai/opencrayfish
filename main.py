@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
+from connectors import ConnectorRegistry, discover_external_connectors
 from connectors.telegram import TelegramConnector
 from connectors.web_chat import WebChatConnector
 from core.brain import Brain
@@ -24,9 +25,10 @@ from core.heartbeat import Heartbeat
 from core.monitor import Monitor
 from core.positive_filter import PositiveFilter
 from core.provider import Provider
+from core.provider_manifest import discover_external_backends
 from core.reflection import ReflectionEngine
 from core.scheduler import TaskScheduler
-from core.skills import CostTier, SkillContext, SkillRegistry
+from core.skills import CostTier, SkillContext, SkillRegistry, discover_external_skills
 from core.skills.direct_answer import DirectAnswerSkill
 from core.skills.identity import IdentitySkill
 from core.skills.proactive_learning import ProactiveLearningSkill
@@ -39,6 +41,7 @@ from core.stm import ShortTermMemory
 from tools.archive_read import ArchiveRead
 from tools.registry import ToolRegistry
 from tools.searxng import SearXNG
+from tools import ToolContext, discover_external_tools
 
 # --- Logging setup -----------------------------------------------------------
 # Console (stdout) keeps the operator's live view; a rotating file handler
@@ -66,6 +69,10 @@ def _publish_tools_inventory(registry: ToolRegistry) -> None:
     Read by `ui/dashboard.py`. Includes name / description / args_schema /
     side_effects so the dashboard can show what's plugged in WITHOUT
     needing access to the live registry object (separate process).
+
+    Source of truth is ``registry.manifests()`` — never the live
+    instance — so a Tool may freely lazy-init its runtime state
+    without affecting what the dashboard displays.
     """
     out_path = Path("state/tools.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,16 +80,16 @@ def _publish_tools_inventory(registry: ToolRegistry) -> None:
         "published_at": datetime.now().isoformat(timespec="seconds"),
         "tools": [
             {
-                "name": getattr(t, "name", "?"),
-                "description": getattr(t, "description", ""),
-                "args_schema": getattr(t, "args_schema", {}),
-                "side_effects": bool(getattr(t, "side_effects", False)),
-                "requires_confirmation": bool(
-                    getattr(t, "requires_confirmation", False)
-                ),
+                "name": m.name,
+                "description": m.description,
+                "args_schema": dict(m.args_schema),
+                "side_effects": bool(m.side_effects),
+                "requires_confirmation": bool(m.requires_confirmation),
+                "compat_version": m.compat_version,
+                "requires_caps": list(m.requires_caps),
+                "config_key": m.config_key,
             }
-            for t in (registry.get(n) for n in registry.names())
-            if t is not None
+            for m in registry.manifests().values()
         ],
     }
     tmp = out_path.with_suffix(".json.tmp")
@@ -108,6 +115,10 @@ def _publish_skills_inventory(registry: SkillRegistry) -> None:
     network/side-effect badges, trigger hints, and the args schema
     WITHOUT needing access to the live registry object (separate
     Streamlit process).
+
+    Source of truth is ``registry.manifests()`` — never the live
+    instance — so a Skill may freely lazy-init its runtime state
+    without affecting what the dashboard displays.
     """
     out_path = Path("state/skills.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,19 +126,19 @@ def _publish_skills_inventory(registry: SkillRegistry) -> None:
         "published_at": datetime.now().isoformat(timespec="seconds"),
         "skills": [
             {
-                "name": getattr(s, "name", "?"),
-                "description": getattr(s, "description", ""),
-                "trigger_hints": list(getattr(s, "trigger_hints", []) or []),
-                "args_schema": getattr(s, "args_schema", {}),
-                "cost_tier": getattr(s, "cost_tier", "cheap"),
-                "requires_network": bool(getattr(s, "requires_network", False)),
-                "side_effects": bool(getattr(s, "side_effects", False)),
-                "requires_confirmation": bool(
-                    getattr(s, "requires_confirmation", False)
-                ),
+                "name": m.name,
+                "description": m.description,
+                "trigger_hints": list(m.trigger_hints),
+                "args_schema": dict(m.args_schema),
+                "cost_tier": m.cost_tier,
+                "requires_network": bool(m.requires_network),
+                "side_effects": bool(m.side_effects),
+                "requires_confirmation": bool(m.requires_confirmation),
+                "compat_version": m.compat_version,
+                "requires_caps": list(m.requires_caps),
+                "config_key": m.config_key,
             }
-            for s in (registry.get(n) for n in registry.names())
-            if s is not None
+            for m in registry.manifests()
         ],
     }
     tmp = out_path.with_suffix(".json.tmp")
@@ -143,6 +154,47 @@ def _publish_skills_inventory(registry: SkillRegistry) -> None:
         )
     except Exception:
         log.exception("SKILL Failed to publish skills inventory")
+
+
+def _publish_connectors_inventory(registry: ConnectorRegistry) -> None:
+    """Atomically dump the registered connector catalogue to
+    ``state/connectors.json``.
+
+    Mirror of ``_publish_tools_inventory`` / ``_publish_skills_inventory``
+    for the Connector layer so the dashboard (and any other external
+    process) can see which chat transports are loaded — including
+    third-party ones discovered via entry-points — without holding a
+    reference to the live registry. Source of truth is
+    ``registry.manifests()``.
+    """
+    out_path = Path("state/connectors.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "published_at": datetime.now().isoformat(timespec="seconds"),
+        "connectors": [
+            {
+                "name": m.name,
+                "description": m.description,
+                "compat_version": m.compat_version,
+                "requires_caps": list(m.requires_caps),
+                "config_key": m.config_key,
+            }
+            for m in registry.manifests().values()
+        ],
+    }
+    tmp = out_path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(out_path)
+        log.info(
+            "CONNECTOR Published connectors inventory to %s (count=%d)",
+            out_path, len(payload["connectors"]),
+        )
+    except Exception:
+        log.exception("CONNECTOR Failed to publish connectors inventory")
 
 
 async def amain() -> None:
@@ -181,6 +233,40 @@ async def amain() -> None:
         architect_honorific=cfg.system.architect_honorific,
     )
     provider = Provider.from_config(cfg.hardware)
+    # Third-party inference backend discovery via entry-points
+    # (``opencrayfish.provider_backends`` group). The Provider's
+    # primary/fallback slots can be routed to a discovered backend by
+    # setting ``cfg.hardware.primary_backend`` /
+    # ``cfg.hardware.fallback_backend`` to the manifest name. With both
+    # unset (default) the legacy Pi 5 + AI HAT+ wiring is used and
+    # discovered backends are only INFORMATIONAL. Same fail-isolated
+    # contract as Tool/Skill/Connector discovery: a broken third-party
+    # backend package is logged and skipped, never bubbles into the
+    # boot. The discovery+rebuild order below guarantees that ANY
+    # operator-named override takes effect BEFORE provider.health() or
+    # the heartbeat first touches the backend.
+    discovered_backends = discover_external_backends()
+    if discovered_backends:
+        log.info(
+            "BACKEND Discovered %d external backend(s) via entry-points: %s",
+            len(discovered_backends),
+            ", ".join(m.name for m, _ in discovered_backends),
+        )
+        # Rebuild the Provider when the operator has named one of the
+        # discovered backends in cfg.hardware. Closes the original
+        # Provider's httpx client to avoid socket leaks.
+        if cfg.hardware.primary_backend or cfg.hardware.fallback_backend:
+            await provider.aclose()
+            provider = Provider.from_config(
+                cfg.hardware,
+                discovered_backends=discovered_backends,
+            )
+            log.info(
+                "BACKEND Provider rerouted via cfg.hardware: primary=%s "
+                "fallback=%s",
+                cfg.hardware.primary_backend or "<built-in>",
+                cfg.hardware.fallback_backend or "<built-in>",
+            )
     # Wire the Provider into the Monitor so SLM availability shows up as
     # a vital sign (the SLM is the agent's brain — its absence is a
     # stroke-level event and must surface on the dashboard).
@@ -218,6 +304,49 @@ async def amain() -> None:
         lambda: _publish_tools_inventory(tool_registry)
     )
     _publish_tools_inventory(tool_registry)
+
+    # Third-party Tool discovery via Python entry-points
+    # (``opencrayfish.tools`` group). Same fail-isolated contract as
+    # the Skill-side discovery below: a single broken package only
+    # loses ITS tool, the boot continues. See
+    # ``tools/discovery.py`` for the protocol contract.
+    discovered_tools = discover_external_tools(tool_registry)
+    if discovered_tools:
+        log.info(
+            "TOOL Discovered %d external tool(s) via entry-points: %s",
+            len(discovered_tools), ", ".join(discovered_tools),
+        )
+
+    # Fail-loud cross-validation of every registered Tool: protocol
+    # version, declared cfg.plugins.<key> namespace presence, and
+    # capability-token sanity. Mirrors the Skill-side bootstrap a few
+    # lines further down. Default strict=True — the agent refuses to
+    # start when a third-party tool declares a config_key the
+    # operator hasn't wired up.
+    tool_registry.bootstrap_validate(plugins_config=cfg.plugins)
+
+    # Build the shared ToolContext (mirror of SkillContext minus the
+    # ToolRegistry itself to avoid self-reference) and deliver it
+    # to every Tool that opted in via ``bind_context``. First-party
+    # in-tree Tools today don't implement ``bind_context`` — it's a
+    # no-op for them — but it's the documented seam by which a
+    # third-party Tool reads its ``cfg.plugins.<key>`` slice without
+    # needing a factory-closure dance in entry-points. Future
+    # registrations (e.g. ToolboxSkill at runtime) inherit the same
+    # context automatically via ``_maybe_bind`` inside ``register``.
+    from types import MappingProxyType as _MPT_for_tool_ctx
+    tool_ctx = ToolContext(
+        soul=soul,
+        stm=stm,
+        monitor=monitor,
+        provider=provider,
+        archive_path=cfg.memory.archive_path,
+        designation=cfg.system.individual_designation,
+        architect_name=cfg.system.architect_name,
+        architect_honorific=cfg.system.architect_honorific,
+        plugins_config=_MPT_for_tool_ctx(cfg.plugins),
+    )
+    tool_registry.bind_context(tool_ctx)
 
     # Reflection engine — wired into Brain (post-reply) and Heartbeat
     # (post-proactive). Disabled cleanly when cfg.reflection.enabled is false.
@@ -263,6 +392,11 @@ async def amain() -> None:
             "emotions": emotions,
             "empathy": empathy,
         }),
+        # Per-plugin config namespace (cfg.plugins.*). Wrapped twice:
+        # the outer MappingProxyType freezes the top-level dict;
+        # individual plugin sub-dicts are passed through as-is (the
+        # config dataclass is itself frozen at construction time).
+        plugins_config=MappingProxyType(cfg.plugins),
     )
     skill_registry = SkillRegistry()
     # The skill enable-map lets operators opt OUT of specific skills
@@ -297,6 +431,29 @@ async def amain() -> None:
         ", ".join(skill_registry.names()),
     )
 
+    # Third-party Skill discovery via Python entry-points. Any
+    # installed package that declares the ``opencrayfish.skills``
+    # entry-point group gets auto-registered AFTER the first-party
+    # Skills above (so a third-party package can't accidentally
+    # shadow a built-in by name). A single broken package only loses
+    # ITS skill — the boot continues. See ``core/skills/discovery.py``
+    # for the protocol contract.
+    discovered = discover_external_skills(skill_registry)
+    if discovered:
+        log.info(
+            "SKILL Discovered %d external skill(s) via entry-points: %s",
+            len(discovered), ", ".join(discovered),
+        )
+
+    # Fail-loud cross-validation: every Skill's declared dependencies
+    # (requires_tools, plan_verb uniqueness, compat_version) are
+    # checked against the live ToolRegistry. A Skill that declares a
+    # tool it can't reach is rejected here at boot, NOT at first
+    # invocation three days into a deployment. Default strict=True so
+    # the agent refuses to start on misconfiguration — the operator
+    # sees the full problem list in one log line + traceback.
+    skill_registry.bootstrap_validate(tool_registry=tool_registry)
+
     # Cognitive loop — THINK → PLAN → ACT → REFINE deliberation in front of
     # the final synthesize call. Disabled cleanly when cfg.cognition.enabled
     # is false; Brain then falls back to the legacy single-shot path.
@@ -320,6 +477,11 @@ async def amain() -> None:
             cost_tier_cap=cast(CostTier, cfg.skills.default_cost_tier_cap),
             auto_offline_filter=cfg.skills.auto_offline_filter,
             dispatch_answer_via_skill=cfg.cognition.dispatch_answer_via_skill,
+            # Operator-overridable name of the web-search Skill. Lets
+            # a third-party "perplexity_research" / "custom_websearch"
+            # plug-in replace the in-tree "research" Skill without a
+            # source edit. See core.config.CognitionCfg.web_search_skill.
+            web_search_skill=cfg.cognition.web_search_skill,
             timezone=cfg.system.timezone,
         )
 
@@ -336,6 +498,9 @@ async def amain() -> None:
         architect_name=cfg.system.architect_name,
         architect_honorific=cfg.system.architect_honorific,
         web_search_triage_enabled=cfg.tools.web_search_triage_enabled,
+        # Same indirection as CognitiveLoop above so Brain's web triage
+        # honours the operator's chosen research-skill name.
+        web_search_skill=cfg.cognition.web_search_skill,
         ltm_short_circuit_enabled=cfg.tools.ltm_short_circuit_enabled,
         ltm_short_circuit_min_score=cfg.tools.ltm_short_circuit_min_score,
         reflection_enabled=cfg.reflection.reflect_on_user_turn,
@@ -382,6 +547,50 @@ async def amain() -> None:
             monitor=monitor,
             designation=cfg.system.individual_designation,
         )
+
+    # Connector registry — owns the lifecycle + manifest book-keeping
+    # for every Connector (chat transport, webhook server, voice loop,
+    # …). First-party connectors register here with
+    # ``external_lifecycle=True`` because main.py drives their
+    # start/stop directly (Telegram via ``tg_app.start()``, WebChat
+    # in an explicit shutdown-ordered block); third-party packages
+    # registered under the ``opencrayfish.connectors`` entry-point
+    # group are auto-discovered afterwards and get full
+    # registry-managed lifecycle (start_all / aclose_all) for free.
+    connector_registry = ConnectorRegistry()
+    connector_registry.register(telegram, external_lifecycle=True)
+    if web_chat is not None:
+        connector_registry.register(web_chat, external_lifecycle=True)
+
+    discovered_connectors = discover_external_connectors(connector_registry)
+    if discovered_connectors:
+        log.info(
+            "CONNECTOR Discovered %d external connector(s) via "
+            "entry-points: %s",
+            len(discovered_connectors), ", ".join(discovered_connectors),
+        )
+
+    # Fail-loud cross-validation of every registered Connector: protocol
+    # version, declared cfg.plugins.<key> namespace presence, and
+    # capability-token sanity. Mirrors the Tool-side bootstrap. The
+    # first-party Telegram + WebChat connectors declare config_keys
+    # (``telegram`` / ``web_chat``); the legacy config layout puts
+    # those under ``cfg.api_keys`` + ``cfg.web_chat`` rather than
+    # ``cfg.plugins.*`` so we pass plugins_config=None here to skip
+    # that one check until the operator opts into the plugins.*
+    # layout for the in-tree connectors too (third-party connectors
+    # still get validated through their entry-points config).
+    connector_registry.bootstrap_validate(
+        plugins_config=None, strict=True,
+    )
+
+    # Same pattern as tools/skills: any (re)register fires the
+    # dashboard publisher so a hot-swapped or late-bound connector
+    # immediately shows up in the Connectors panel.
+    connector_registry.set_change_listener(
+        lambda: _publish_connectors_inventory(connector_registry)
+    )
+    _publish_connectors_inventory(connector_registry)
 
     # Recurring research-task scheduler. Owns its own asyncio task running
     # in parallel to the heartbeat pulse loop. Each connector that's
@@ -437,6 +646,13 @@ async def amain() -> None:
     if web_chat is not None:
         await web_chat.start()
 
+    # Third-party connectors discovered via entry-points get their
+    # ``start()`` driven by the registry — in-tree connectors are
+    # marked ``external_lifecycle=True`` above so this loop skips
+    # them and never double-starts. A failure in one third-party
+    # connector is logged and isolated.
+    await connector_registry.start_all()
+
     try:
         await stop_event.wait()
     finally:
@@ -458,6 +674,11 @@ async def amain() -> None:
         await tg_app.updater.stop()
         await tg_app.stop()
         await tg_app.shutdown()
+        # Third-party connectors discovered via entry-points — stop
+        # before tearing down provider/skills/tools so their async
+        # callbacks don't fire against a half-closed agent. In-tree
+        # connectors above are skipped (``external_lifecycle=True``).
+        await connector_registry.aclose_all()
         await provider.aclose()
         # Skill registry first — Skills may hold references back into
         # Tools and want to release them before the tools themselves

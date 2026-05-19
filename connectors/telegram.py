@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from core.scheduler import TaskScheduler
     from core.stm import ShortTermMemory
 
+from .manifest import ConnectorManifest
+
 log = logging.getLogger(__name__)
 
 _EMERGENCY_MARKER = "/emergency"
@@ -38,6 +40,23 @@ _ORIGIN: str = "telegram"
 
 
 class TelegramConnector:
+    # Plug-in manifest — what the ConnectorRegistry reads at boot.
+    # This Connector polls the Telegram Bot API over HTTPS, so it
+    # declares the network.outbound capability and the ``telegram``
+    # config namespace it pulls credentials from (cfg.plugins.telegram
+    # in the new layout, falls back gracefully when absent because
+    # main.py still wires explicit kwargs for the in-tree case).
+    manifest = ConnectorManifest(
+        name="telegram",
+        description="Telegram Bot API neuro-link (long-polling).",
+        requires_caps=("network.outbound",),
+        config_key="telegram",
+    )
+
+    # Exposed for legacy callers and the registry's name-vs-manifest
+    # consistency check. Must match ``manifest.name``.
+    name = "telegram"
+
     def __init__(
         self,
         *,

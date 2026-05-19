@@ -18,9 +18,58 @@ from __future__ import annotations
 from typing import Any
 
 from .base import SkillContext, SkillResult
+from .manifest import SkillManifest
 
 
 class ResearchSkill:
+    # Declarative manifest — the single source of truth the registry +
+    # cognition.py PLAN renderer read from. The legacy scattered class
+    # attributes below mirror the manifest fields and are kept for any
+    # code path that still does ``getattr(skill, 'cost_tier', …)``
+    # directly (the registry no longer needs them; new code shouldn't
+    # add such reads). ``plan_guidance`` + ``plan_example`` are the
+    # NEW contributions — cognition.py composes its "VERB SELECTION
+    # RULES" block from these so adding a Skill no longer requires
+    # editing the hardcoded prompt text.
+    manifest = SkillManifest(
+        name="research",
+        description=(
+            "Live web search via SearXNG. Use for time-sensitive, niche, or "
+            "post-training-cutoff facts the SLM cannot reliably answer alone."
+        ),
+        plan_verb="SEARCH",
+        plan_arg_hint='"<3-8 keywords>"',
+        plan_guidance=(
+            "SEARCH for: time-sensitive facts, named entities, version "
+            "numbers, proper nouns you are not 100% sure of, any "
+            "'latest/recent/current' question."
+        ),
+        plan_example='Q1: SEARCH "<noun phrase from user, 3-8 keywords>"',
+        trigger_hints=(
+            "the user explicitly asked to 'search' / '搜尋'",
+            "the question is about a current event or fresh data",
+            "the topic is niche or post-training-cutoff",
+            "the SLM is not confident it knows the answer first-hand",
+        ),
+        args_schema={
+            "query": {
+                "type": "string",
+                "required": True,
+                "desc": "3-8 keywords (NOT a full sentence) to search the web for.",
+            },
+            "limit": {
+                "type": "int",
+                "required": False,
+                "default": 5,
+                "desc": "Maximum number of results to return (1-10).",
+            },
+        },
+        cost_tier="expensive",
+        requires_network=True,
+        requires_tools=("web_search",),
+        requires_caps=("network",),
+    )
+
     name: str = "research"
     description: str = (
         "Live web search via SearXNG. Use for time-sensitive, niche, or "

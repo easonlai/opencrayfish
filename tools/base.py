@@ -37,7 +37,9 @@ so it stays cheap to import and reuse.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -64,6 +66,94 @@ class ToolResult:
     error: str = ""
     latency_ms: int = 0
     meta: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolContext:
+    """Stable handles passed to Tools that opt into runtime context.
+
+    Mirrors ``core.skills.base.SkillContext`` so the Tool layer has
+    symmetric access to cross-cutting subsystems (operator
+    ``cfg.plugins.<key>`` slice, persona handle, vitals, …) WITHOUT
+    every existing Tool having to learn a new ``call()`` signature.
+
+    Opt-in model
+    ------------
+    The ``Tool`` protocol's ``call(**kwargs)`` is unchanged. A Tool
+    that wants context implements an OPTIONAL ``bind_context(ctx)``
+    method; ``ToolRegistry.bind_context(ctx)`` calls it once per Tool
+    (and again on any newly-registered Tool). The Tool stashes
+    whatever it needs on ``self`` and uses it from ``call()``. Tools
+    that don't implement ``bind_context`` are left alone \u2014 zero
+    impact on the existing in-tree Tools.
+
+    The recommended pattern is::
+
+        class MyTool:
+            manifest = ToolManifest(name="mytool", description="...",
+                                    config_key="mytool")
+            ...
+
+            def bind_context(self, ctx: ToolContext) -> None:
+                self._cfg = ctx.plugins_config.get(
+                    self.manifest.config_key or self.manifest.name, {}
+                )
+
+    Frozen so Tools cannot mutate shared state through the context.
+    All collaborators (``soul``, ``stm``, ``monitor``, ``provider``)
+    carry their own locking; the ``Mapping`` fields use
+    ``MappingProxyType`` for read-only-by-construction safety.
+
+    NOT included on purpose:
+      * ``ToolRegistry`` itself \u2014 would be self-referential, and a
+        Tool that wants to call another Tool should compose through
+        a Skill instead (the Skill IS the orchestration layer).
+      * ``Brain`` / ``Emotions`` / ``Heartbeat`` / ``Scheduler``
+        \u2014 same orchestrator-not-collaborator rule as ``SkillContext``.
+    """
+
+    soul: Any
+    """SoulHandler. ``Any`` here to avoid a hard import cycle (tools is
+    imported VERY early); concrete type is ``core.soul_handler.SoulHandler``."""
+
+    stm: Any
+    """ShortTermMemory handle. Same Any-typing reason as ``soul``."""
+
+    monitor: Any
+    """Monitor handle (vitals snapshot, stress flag). Same Any-typing."""
+
+    provider: Any
+    """Provider handle for tools that want to make an SLM call."""
+
+    archive_path: str
+    """Filesystem path to ``memory/archive.md`` for tools that need
+    direct LTM read access (most should go through the ``archive_read``
+    Tool wrapper instead)."""
+
+    designation: str
+    """The agent's own identity string (mirrors ``SkillContext.designation``)."""
+
+    architect_name: str
+    """Operator's name (e.g. ``"Eason"``)."""
+
+    architect_honorific: str
+    """Operator's salutation prefix (e.g. ``"Boss"``)."""
+
+    extras: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({}),
+    )
+    """Free-form extension slot for cross-cutting subsystems that don't
+    warrant their own typed field yet. Same convention as
+    ``SkillContext.extras``."""
+
+    plugins_config: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=lambda: MappingProxyType({}),
+    )
+    """Per-plugin configuration namespace from ``cfg.plugins``. A Tool
+    retrieves ITS slice via
+    ``ctx.plugins_config.get(self.manifest.config_key or self.manifest.name, {})``.
+    This is the seam that lets third-party authors take operator config
+    without ever touching ``core/config.py``."""
 
 
 @runtime_checkable

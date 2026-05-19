@@ -1,0 +1,22 @@
+[project]
+name = "opencrayfish-skill-echo"
+version = "0.1.0"
+description = "Reference third-party Skill for OpenCrayFish — echoes the query"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+# This is the contract that makes OpenCrayFish's third-party Skill
+# discovery work. The core walks ``importlib.metadata.entry_points``
+# for this group at boot (see ``core/skills/discovery.py``); any
+# installed package declaring an entry here is auto-registered AFTER
+# all first-party Skills, so it can never shadow a built-in by name.
+[project.entry-points."opencrayfish.skills"]
+echo = "opencrayfish_skill_echo:EchoSkill"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["opencrayfish_skill_echo*"]

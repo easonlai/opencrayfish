@@ -17,8 +17,8 @@
 
 [project]
 name = "open-crayfish"
-version = "2.0.0"
-description = "Edge-native, biologically-inspired AI companion for Raspberry Pi 5 + AI HAT+ 2 (Hailo-10H NPU)."
+version = "3.0.0"
+description = "Edge-native, biologically-inspired AI companion + pluggable plug-in framework (Skills / Tools / Connectors / Backends) for Raspberry Pi 5 + AI HAT+ 2 (Hailo-10H NPU)."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -62,6 +62,68 @@ dev = [
 Homepage = "https://github.com/easonlai/OpenCrayFish"
 Documentation = "https://github.com/easonlai/OpenCrayFish#readme"
 Issues = "https://github.com/easonlai/OpenCrayFish/issues"
+
+# ----------------------------------------------------------------------------
+# Entry-points: third-party plug-in surface
+# ----------------------------------------------------------------------------
+# OpenCrayFish discovers Skills installed in any Python environment by
+# scanning the ``opencrayfish.skills`` entry-point group at boot. Any
+# pip-installable package can declare its own Skill here and the agent
+# auto-registers it on the next start — no edits to ``main.py`` needed.
+#
+# Third-party packages opt in by adding a block like::
+#
+#   [project.entry-points."opencrayfish.skills"]
+#   translate = "opencrayfish_skill_translate:TranslateSkill"
+#   weather   = "my_pkg.weather:make_skill"
+#
+# The value is a ``module:attr`` import path that resolves to either a
+# Skill *class* (instantiated with zero args) or a *factory callable*
+# (called with zero args, must return a Skill instance). See
+# ``core/skills/discovery.py`` for the protocol + isolation guarantees.
+#
+# We do NOT register any first-party Skills here — they're imported and
+# registered explicitly in ``main.py`` because their constructors take
+# subsystem references (ReflectionEngine, etc.) that entry-points can't
+# supply. This group is for THIRD-PARTY skills only.
+[project.entry-points."opencrayfish.skills"]
+# (Intentionally empty. Third-party packages add their own entries.)
+
+# Mirror group for Tools (see ``tools/discovery.py``). Same
+# fail-isolated discovery contract — a single broken package only
+# loses ITS tool, the boot continues. First-party tools (SearXNG,
+# ArchiveRead) are registered explicitly in ``main.py``; this group
+# is for THIRD-PARTY tools only.
+[project.entry-points."opencrayfish.tools"]
+# (Intentionally empty. Third-party packages add their own entries.)
+
+# Mirror group for Connectors (see ``connectors/discovery.py``).
+# Same fail-isolated discovery contract. First-party connectors
+# (Telegram, WebChat) are constructed explicitly in ``main.py`` —
+# they need brain / heartbeat / intent_router refs an entry-point
+# can't supply. This group is for THIRD-PARTY connectors only.
+[project.entry-points."opencrayfish.connectors"]
+# (Intentionally empty. Third-party packages add their own entries.)
+
+# Mirror group for Provider backends (see
+# ``core/provider_manifest.py``). Today the Provider singleton's
+# primary/fallback wiring is hard-coded around the Pi 5 + AI HAT+
+# deployment; discovered backends are LOGGED only. A future
+# ``cfg.hardware.primary = "<name>"`` knob will route a named
+# external backend into the primary slot.
+[project.entry-points."opencrayfish.provider_backends"]
+# (Intentionally empty. Third-party packages add their own entries.)
+
+# ----------------------------------------------------------------------------
+# Scripts: operator + author CLI
+# ----------------------------------------------------------------------------
+# Once ``pip install -e .`` runs, the ``opencrayfish`` command lands
+# on PATH. It exposes Skill-author tooling (``opencrayfish skill new``,
+# ``opencrayfish skill validate``) — the agent itself is still started
+# with ``python main.py`` because the CLI deliberately doesn't pull in
+# the runtime stack (provider, monitor, connectors).
+[project.scripts]
+opencrayfish = "core.cli:main"
 
 # ----------------------------------------------------------------------------
 # Build / packaging

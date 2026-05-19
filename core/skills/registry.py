@@ -47,7 +47,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .argspec import validate_args
 from .base import CostTier, Skill, SkillContext, SkillResult
+from .manifest import (
+    SUPPORTED_PROTOCOL_VERSIONS,
+    WELL_KNOWN_CAPABILITIES,
+    SkillManifest,
+    resolve_manifest,
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,13 @@ class SkillRegistry:
         from ..jsonl_writer import RotatingJsonlWriter  # local import to avoid cycle
 
         self._skills: dict[str, Skill] = {}
+        # Parallel map: skill name -> resolved SkillManifest. Populated
+        # at register() so consumers (cognition.py PLAN renderer,
+        # dashboard catalogue) read uniform manifest objects rather
+        # than poking scattered class attributes. Legacy Skills that
+        # don't declare a `manifest` attribute get one synthesized
+        # from their scattered fields via `resolve_manifest`.
+        self._manifests: dict[str, SkillManifest] = {}
         self._audit_feed = Path(audit_feed)
         self._audit_feed.parent.mkdir(parents=True, exist_ok=True)
         # Rotate the audit feed by local date with bounded retention so
@@ -135,11 +149,29 @@ class SkillRegistry:
     def register(self, skill: Skill) -> None:
         """Add a skill. Raises ValueError on duplicate name (we'd rather
         fail loudly at boot than silently shadow a previously-registered
-        skill)."""
-        name = getattr(skill, "name", None)
-        if not name or not isinstance(name, str):
+        skill).
+
+        Resolves the Skill's manifest (declared or synthesized) and
+        stores it alongside the instance. A Skill whose manifest fails
+        validation (e.g. unsupported `compat_version`) is rejected
+        here rather than at first invocation — fail loud.
+        """
+        # Resolve manifest FIRST so a malformed Skill is rejected before
+        # it enters the live registry. Any ValueError surfaces directly
+        # to the caller (main.py at boot, or a future dynamic loader).
+        manifest = resolve_manifest(skill)
+        name = manifest.name
+        # Cross-check the legacy `name` attribute (if present) agrees
+        # with the manifest. A mismatch is a packaging error worth
+        # flagging — e.g. a Skill author renamed the class attribute
+        # but forgot to update the manifest.
+        attr_name = getattr(skill, "name", None)
+        if isinstance(attr_name, str) and attr_name and attr_name != name:
             raise ValueError(
-                f"Skill {skill!r} must expose a non-empty string `name` attribute."
+                f"Skill {skill!r}: manifest.name={name!r} disagrees with "
+                f"class attribute name={attr_name!r}. Pick one source of "
+                "truth (manifest wins, but the legacy attribute should "
+                "either match or be removed)."
             )
         if name in self._skills:
             raise ValueError(
@@ -147,14 +179,18 @@ class SkillRegistry:
                 "Pick a unique name or unregister first."
             )
         self._skills[name] = skill
+        self._manifests[name] = manifest
         log.info(
-            "SKILL registered name=%s cost_tier=%s requires_network=%s "
-            "side_effects=%s requires_confirmation=%s",
+            "SKILL registered name=%s protocol=%s cost_tier=%s "
+            "requires_network=%s side_effects=%s requires_confirmation=%s "
+            "requires_tools=%s",
             name,
-            getattr(skill, "cost_tier", "?"),
-            getattr(skill, "requires_network", False),
-            getattr(skill, "side_effects", False),
-            getattr(skill, "requires_confirmation", False),
+            manifest.compat_version,
+            manifest.cost_tier,
+            manifest.requires_network,
+            manifest.side_effects,
+            manifest.requires_confirmation,
+            ",".join(manifest.requires_tools) or "-",
         )
         self._notify_change()
 
@@ -163,6 +199,7 @@ class SkillRegistry:
         Does NOT call `aclose()` — caller decides what to do with it."""
         skill = self._skills.pop(name, None)
         if skill is not None:
+            self._manifests.pop(name, None)
             self._notify_change()
         return skill
 
@@ -208,6 +245,127 @@ class SkillRegistry:
             ),
         )
 
+    # ---------- manifest accessors -------------------------------------------
+
+    def manifest(self, name: str) -> SkillManifest | None:
+        """Return the resolved SkillManifest for ``name``, or None.
+
+        Manifests are populated at ``register()`` time so this is a
+        cheap dict lookup. Consumers (cognition.py PLAN renderer,
+        dashboard catalogue, future sandbox layer) read manifests
+        instead of poking scattered class attributes so the manifest
+        is the single source of truth at runtime.
+        """
+        return self._manifests.get(name)
+
+    def manifests(self) -> list[SkillManifest]:
+        """Return all manifests in the same stable order as ``all()``.
+
+        Sorted by (cost_tier, name) so the dashboard catalogue and
+        PLAN prompt stay deterministic across boots.
+        """
+        return sorted(
+            self._manifests.values(),
+            key=lambda m: (_COST_ORDER.get(m.cost_tier, 99), m.name),
+        )
+
+    # ---------- bootstrap validation -----------------------------------------
+
+    def bootstrap_validate(
+        self,
+        *,
+        tool_registry: Any | None = None,
+        strict: bool = True,
+    ) -> list[str]:
+        """Fail-loud cross-validation called once after all Skills + Tools
+        have been registered in ``main.py``.
+
+        Without this, a Skill that declares ``requires_tools=("http_get",)``
+        but is registered before ``http_get`` itself crashes at first
+        invocation (potentially days into a deployment). With this,
+        the operator sees the misconfiguration at boot and the agent
+        refuses to start.
+
+        Checks performed (per Skill):
+          1. ``compat_version`` in ``SUPPORTED_PROTOCOL_VERSIONS``
+             (also enforced at ``register()`` — re-checked here as a
+             belt-and-braces guard against a future dynamic-load path
+             that bypasses ``register``).
+          2. Every name in ``requires_tools`` is registered in
+             ``tool_registry`` (when one is supplied; skipped when
+             None, e.g. in unit tests that don't wire tools).
+          3. Every ``plan_verb`` is unique across all Skills — two
+             Skills claiming "SEARCH" would make the PLAN dispatch
+             table non-deterministic.
+          4. Every capability token in ``requires_caps`` is logged if
+             unknown (warning, not error — third-party packages may
+             ship their own conventions).
+
+        Returns:
+            A list of human-readable problem descriptions. Empty list
+            means everything checks out.
+
+        Raises:
+            RuntimeError: when ``strict=True`` and at least one problem
+                was found. The exception message lists every problem
+                so the operator gets the full picture in one go.
+        """
+        problems: list[str] = []
+        verbs_seen: dict[str, str] = {}  # verb -> first owning skill
+
+        for name, manifest in self._manifests.items():
+            # (1) Protocol version
+            if manifest.compat_version not in SUPPORTED_PROTOCOL_VERSIONS:
+                problems.append(
+                    f"skill {name!r}: compat_version "
+                    f"{manifest.compat_version!r} not in "
+                    f"{sorted(SUPPORTED_PROTOCOL_VERSIONS)}"
+                )
+            # (2) Required tools — cross-check against ToolRegistry
+            if tool_registry is not None and manifest.requires_tools:
+                tool_has = getattr(tool_registry, "has", None)
+                for tool_name in manifest.requires_tools:
+                    if callable(tool_has) and not tool_has(tool_name):
+                        problems.append(
+                            f"skill {name!r}: requires_tools includes "
+                            f"{tool_name!r} which is not registered in "
+                            "ToolRegistry"
+                        )
+            # (3) Unique plan_verb
+            if manifest.plan_verb:
+                verb = manifest.plan_verb.upper()
+                prior = verbs_seen.get(verb)
+                if prior is not None and prior != name:
+                    problems.append(
+                        f"skill {name!r}: plan_verb {verb!r} already "
+                        f"claimed by skill {prior!r}; verbs must be unique"
+                    )
+                else:
+                    verbs_seen[verb] = name
+            # (4) Capability tokens — warning only
+            for cap in manifest.requires_caps:
+                if cap not in WELL_KNOWN_CAPABILITIES:
+                    log.info(
+                        "SKILL bootstrap_validate name=%s unknown "
+                        "capability token %r (allowed but undocumented)",
+                        name, cap,
+                    )
+
+        if problems and strict:
+            raise RuntimeError(
+                "Skill bootstrap validation failed:\n  - "
+                + "\n  - ".join(problems)
+            )
+        if problems:
+            for p in problems:
+                log.warning("SKILL bootstrap_validate problem: %s", p)
+        else:
+            log.info(
+                "SKILL bootstrap_validate ok skills=%d verbs=%d",
+                len(self._manifests), len(verbs_seen),
+            )
+        return problems
+
     # ---------- invocation ----------------------------------------------------
 
     async def invoke(
@@ -227,6 +385,35 @@ class SkillRegistry:
             result = SkillResult(ok=False, error=f"unknown skill: {name!r}")
             await self._audit(name, result, kwargs_keys=sorted(kwargs.keys()))
             return result
+
+        # Argspec boundary check — coerce safe types, inject defaults,
+        # reject ill-typed/missing-required kwargs BEFORE the skill body
+        # runs. A SLM passing `"42"` for an int gets `42`; a SLM forgetting
+        # a required arg gets a clean SkillResult(ok=False) instead of a
+        # TypeError trace from inside the skill.
+        manifest = self._manifests.get(name)
+        if manifest is not None and manifest.args_schema:
+            normalized, errors, unknowns = validate_args(
+                manifest.args_schema, kwargs
+            )
+            if errors:
+                log.warning(
+                    "SKILL invoke name=%s status=argspec_invalid errors=%s",
+                    name, errors,
+                )
+                meta: dict[str, Any] = {"argspec_errors": errors}
+                if unknowns:
+                    meta["argspec_unknowns"] = unknowns
+                result = SkillResult(
+                    ok=False,
+                    error=f"argspec: {'; '.join(errors)}",
+                    meta=meta,
+                )
+                await self._audit(
+                    name, result, kwargs_keys=sorted(kwargs.keys()),
+                )
+                return result
+            kwargs = normalized
 
         t0 = time.perf_counter()
         try:
@@ -364,26 +551,118 @@ class SkillRegistry:
         """
         cap = _COST_ORDER.get(cost_tier_cap, 99)
         out: list[PlanMenuEntry] = []
-        for s in self._skills.values():
-            verb = getattr(s, "plan_verb", None)
+        for name, s in self._skills.items():
+            # Prefer the resolved manifest (single source of truth) but
+            # fall back to scattered class attrs if for some reason the
+            # manifest map is out of sync (e.g. a test that injected a
+            # raw skill via `self._skills[...] = ...`).
+            m = self._manifests.get(name)
+            if m is not None:
+                verb = m.plan_verb
+                arg_hint = m.plan_arg_hint or ""
+                description = m.description
+                tier = m.cost_tier
+                requires_net = m.requires_network
+            else:
+                verb = getattr(s, "plan_verb", None)
+                arg_hint = str(getattr(s, "plan_arg_hint", "") or "")
+                description = str(getattr(s, "description", "") or "").strip()
+                tier = getattr(s, "cost_tier", "expensive")
+                requires_net = bool(getattr(s, "requires_network", False))
             if not verb or not isinstance(verb, str):
                 continue
-            tier: CostTier = getattr(s, "cost_tier", "expensive")
             if _COST_ORDER.get(tier, 99) > cap:
                 continue
-            requires_net = bool(getattr(s, "requires_network", False))
             if exclude_network and requires_net:
                 continue
             out.append(PlanMenuEntry(
                 verb=verb,
-                skill_name=s.name,
-                arg_hint=str(getattr(s, "plan_arg_hint", "") or ""),
-                description=str(getattr(s, "description", "") or "").strip(),
+                skill_name=name,
+                arg_hint=arg_hint,
+                description=description.strip(),
                 cost_tier=tier,
                 requires_network=requires_net,
             ))
         out.sort(key=lambda e: (_COST_ORDER.get(e.cost_tier, 99), e.verb))
         return out
+
+    # ---------- PLAN-stage prompt composition --------------------------------
+    #
+    # The CognitiveLoop used to hardcode a "VERB SELECTION RULES" block
+    # and a "Format examples" block listing SEARCH/RECALL/ANSWER
+    # verbatim. That made dynamic PLAN menus a half-truth: the menu line
+    # was registry-derived but the *guidance text* still encoded which
+    # verbs the SLM should prefer. Third-party Skills that wanted the
+    # SLM to actually pick their verb had to convince a maintainer to
+    # edit cognition.py.
+    #
+    # These two methods replace those hardcoded blocks with text
+    # composed from each Skill's manifest (``plan_guidance`` /
+    # ``plan_example``). A Skill that doesn't contribute either field
+    # is omitted from the rendered block — falling back to its
+    # ``description`` line in the menu, which is the prior behaviour
+    # for legacy Skills.
+
+    def plan_guidance_block(
+        self,
+        entries: list[PlanMenuEntry],
+        *,
+        tail: str = (
+            "When in doubt, prefer a SEARCH-style verb over an ANSWER-style "
+            "verb. The local model is small."
+        ),
+    ) -> str:
+        """Compose the "VERB SELECTION RULES" block from manifests.
+
+        Each entry's Skill manifest contributes one bullet (its
+        ``plan_guidance`` string). Skills with no guidance are skipped
+        so the block stays scannable. A meta-rule ``tail`` is appended
+        last — operators can override it (or pass ``tail=""``) to
+        customize the "when in doubt" framing.
+
+        Returns an empty string when no entry contributes guidance —
+        cognition.py omits the whole block in that case so the prompt
+        doesn't carry an empty section header.
+        """
+        lines: list[str] = []
+        for e in entries:
+            m = self._manifests.get(e.skill_name)
+            if m is None or not m.plan_guidance.strip():
+                continue
+            # Wrap multi-line guidance under a single bullet to keep
+            # SLM eye-tracking aligned with the bullet structure.
+            first, *rest = m.plan_guidance.strip().splitlines()
+            lines.append(f"  - {first.strip()}")
+            for cont in rest:
+                lines.append(f"    {cont.strip()}")
+        if not lines:
+            return ""
+        if tail:
+            lines.append(f"  - {tail.strip()}")
+        return "\n".join(lines)
+
+    def plan_examples_block(
+        self,
+        entries: list[PlanMenuEntry],
+    ) -> str:
+        """Compose the "Format examples" block from manifests.
+
+        Each entry contributes one example line from its manifest's
+        ``plan_example`` field. Skills with no example are skipped
+        (typically background-only Skills that won't appear in the
+        PLAN menu anyway). Returns an empty string when no example is
+        available.
+
+        The block is rendered with two-space indentation so it lines
+        up with the menu block formatting in cognition.py.
+        """
+        lines: list[str] = []
+        for e in entries:
+            m = self._manifests.get(e.skill_name)
+            if m is None or not m.plan_example.strip():
+                continue
+            lines.append(f"  {m.plan_example.strip()}")
+        return "\n".join(lines)
 
     # ---------- lifecycle -----------------------------------------------------
 

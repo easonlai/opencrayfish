@@ -1,9 +1,11 @@
 # 🦐 OpenCrayFish
 
 > **An edge-native, biologically-inspired AI companion that lives on a single Raspberry Pi 5 — fully offline, powered by a 1.5B-parameter local SLM, with a heart that beats, a brain that sleeps, and a soul you can read.**
+>
+> **v3 also ships a fully pluggable framework**: Skills, Tools, Connectors, and Provider Backends are four symmetric plug-in surfaces — every one auto-discoverable via Python entry-points, every one declared by a frozen `*Manifest`, every one validated at boot. A third-party `pip install opencrayfish-skill-translate` (or `-tool-weather`, or `-connector-discord`, or `-backend-vllm-cuda`) extends the agent with **zero edits to `main.py` and zero fork of OpenCrayFish itself**.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-1f8a4f.svg)](#roadmap)
+[![Version](https://img.shields.io/badge/version-3.0.0-1f8a4f.svg)](#roadmap)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Code of Conduct](https://img.shields.io/badge/code%20of%20conduct-Contributor%20Covenant%202.1-blueviolet.svg)](CODE_OF_CONDUCT.md)
@@ -17,6 +19,12 @@
 - [60-Second Mental Model (The Crayfish in Its Burrow)](#60-second-mental-model-the-crayfish-in-its-burrow)
 - [Why This Project Exists](#why-this-project-exists)
 - [Design Pillars](#design-pillars)
+- [Framework & Design Principles (v3)](#framework--design-principles-v3)
+  - [The Four Plug-in Surfaces](#the-four-plug-in-surfaces)
+  - [The Manifest + Registry + Discovery Doctrine](#the-manifest--registry--discovery-doctrine)
+  - [How the System Auto-Adapts](#how-the-system-auto-adapts)
+  - [Configuration Injection (`cfg.plugins.*` + `bind_context`)](#configuration-injection-cfgplugins--bind_context)
+  - [Protocol Versioning & Fail-Loud Boot](#protocol-versioning--fail-loud-boot)
 - [System Architecture at a Glance](#system-architecture-at-a-glance)
 - [A Day in the Life of a Message](#a-day-in-the-life-of-a-message)
 - [Hardware & Software Stack](#hardware--software-stack)
@@ -38,6 +46,19 @@
   - [11. Recurring Tasks — The Background Worker](#11-recurring-tasks--the-background-worker)
   - [12. Skills & Tools — The Two-Tier Capability Stack](#12-skills--tools--the-two-tier-capability-stack)
     - [Hello-World Skill — Step by Step](#hello-world-skill--step-by-step)
+    - [The `SkillManifest` Contract](#the-skillmanifest-contract)
+    - [Third-Party Skill Packages (`pip install`)](#third-party-skill-packages-pip-install)
+    - [The `opencrayfish` CLI](#the-opencrayfish-cli)
+    - [`bootstrap_validate` — Fail Loud at Boot](#bootstrap_validate--fail-loud-at-boot)
+    - [The `ToolManifest` Contract](#the-toolmanifest-contract)
+    - [Third-Party Tool Packages (`pip install`)](#third-party-tool-packages-pip-install)
+    - [Hello-World Tool — Step by Step (v3 `bind_context`)](#hello-world-tool--step-by-step-v3-bind_context)
+    - [Argspec Runtime Validation](#argspec-runtime-validation)
+    - [Plugin Config Namespace (`cfg.plugins.*`)](#plugin-config-namespace-cfgplugins)
+    - [The `ConnectorManifest` Contract](#the-connectormanifest-contract)
+    - [Third-Party Connector Packages (`pip install`)](#third-party-connector-packages-pip-install)
+    - [Provider Backends — `BackendManifest` & Discovery](#provider-backends--backendmanifest--discovery)
+    - [Protocol Surface Stability](#protocol-surface-stability)
   - [13. Connectors — Telegram & Web Chat](#13-connectors--telegram--web-chat)
   - [14. Observability — Dashboard & State Files](#14-observability--dashboard--state-files)
 - [Cross-Cutting Concerns](#cross-cutting-concerns)
@@ -154,6 +175,121 @@ The agent does not stop between user turns. Driven entirely from `config.yaml`:
 - **Idle past `system.idle_journal_flush_seconds`** (default `30` s) — flush the STM pending buffer to disk.
 - **Idle past `system.idle_proactive_minutes`** (config ships at `5` min) — launch a **Proactive Research** cycle.
 - **Cross `system.sleep_start`** (default `02:00`) — run **Sleep Metabolism** (distill the day into long-term memory), then wake at `duty_start` (default `06:00`) subtly different.
+
+---
+
+## Framework & Design Principles (v3)
+
+OpenCrayFish v3 promotes the project from "biological agent with some hooks" to **a real plug-in framework**. Everything that talks to the outside world — every reflex the SLM can pick, every device the agent can poke, every channel a human can chat through, every model the brain can run on — is a third-party-replaceable plug-in. The core stays small, opinionated, and biologically-grounded; the periphery is yours.
+
+### The Four Plug-in Surfaces
+
+| Surface | What it is | What ships in-tree | Entry-point group |
+|---|---|---|---|
+| **Skills** ([core/skills/](core/skills/)) | Agent-facing capabilities — verbs the SLM picks at PLAN. `identity`, `recall`, `direct_answer`, `research`, `self_reflect`, `proactive_learning`, `recurring_research`. | 7 first-party skills | `opencrayfish.skills` |
+| **Tools** ([tools/](tools/)) | Mechanical I/O primitives — HTTP calls, file reads. Composed by Skills; invisible to the SLM. `web_search` (SearXNG), `archive_read`. | 2 first-party tools | `opencrayfish.tools` |
+| **Connectors** ([connectors/](connectors/)) | Inbound/outbound transports — how a human reaches the agent. `TelegramConnector`, `WebChatConnector`. | 2 first-party connectors | `opencrayfish.connectors` |
+| **Provider Backends** ([core/provider.py](core/provider.py)) | SLM inference endpoints — what runs the model. `HailoOllamaBackend` (NPU), `OllamaBackend` (CPU fallback). | 2 first-party backends | `opencrayfish.provider_backends` |
+
+**The symmetry doctrine.** Every surface follows the **same** three-piece pattern: a frozen **`*Manifest`** dataclass declares everything the core needs to know about the plug-in; a **`*Registry`** owns lifecycle + lookup + audit + opt-in context injection; a **`*/discovery.py`** module walks the matching entry-point group at boot with fail-isolated import. Learn one surface and you've learned all four.
+
+The point of the symmetry isn't elegance — it's that **a third-party package author writes the same `pyproject.toml` block, scaffolds with the same CLI verb, validates with the same CLI verb, and pip-installs the same way**, whether they're shipping a new chat reflex, a new sensor, a new transport, or a new inference engine.
+
+### The Manifest + Registry + Discovery Doctrine
+
+Every plug-in surface is built from three pieces. They are intentionally identical across Skills / Tools / Connectors / Backends:
+
+```text
+┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
+│      *Manifest       │    │      *Registry       │    │  */discovery.py      │
+│  (frozen dataclass)  │    │  (lifecycle + audit) │    │  (entry-points walk) │
+├──────────────────────┤    ├──────────────────────┤    ├──────────────────────┤
+│ name, description    │    │ register(instance)   │    │ scan entry-point     │
+│ compat_version       │ ◄──┤ bootstrap_validate() │◄───┤   group, import,     │
+│ args_schema          │    │ invoke / call /      │    │   fail-isolated,     │
+│ cost_tier, caps...   │    │   start / generate   │    │   register into reg  │
+│ config_key           │    │ aclose_all()         │    │                      │
+│ plan_verb (Skills)   │    │ bind_context() opt   │    │                      │
+└──────────────────────┘    └──────────────────────┘    └──────────────────────┘
+```
+
+| Piece | Job | Why frozen / fail-isolated |
+|---|---|---|
+| **`*Manifest`** | Single source of truth for "what this plug-in is, what it needs, how it should be called". Read by the registry, the PLAN-stage prompt builder (Skills), the dashboard, and `bootstrap_validate`. | `@dataclass(frozen=True, slots=True)` so a misbehaving plug-in can't mutate its own metadata at runtime to escape gating. |
+| **`*Registry`** | Owns the live set of registered instances. Issues a unique name. Wraps every dispatch with timing + crash isolation + audit JSONL append. Tears down cleanly at shutdown. Optionally delivers a shared context object (see [§ bind_context](#configuration-injection-cfgplugins--bind_context)). | A buggy third-party plug-in can never crash the agent — exceptions are caught at the registry boundary and surfaced as `ok=False` results. |
+| **`*/discovery.py`** | Walks `importlib.metadata.entry_points(group="opencrayfish.<surface>")` at boot. For each entry, imports it, calls it if it's a factory, registers the result. **Each entry is wrapped in its own `try/except`** — one broken third-party package is logged and skipped, the agent keeps booting. | The agent must always boot. A typo in someone else's package can't take down your Pi. |
+
+### How the System Auto-Adapts
+
+The autodiscovery + manifest contracts mean **adding a plug-in requires zero edits to OpenCrayFish itself**. Concretely:
+
+| If you `pip install` a third-party package that declares… | …then on the very next boot the agent will: |
+|---|---|
+| `opencrayfish.skills` → `translate = "...:TranslateSkill"` | Discover it, validate its manifest, register it. **The PLAN-stage SLM prompt automatically grows a `TRANSLATE` line with the manifest's `plan_guidance` snippet**, so the SLM learns *when* to use it without any prompt rewrite. The Skill's metadata appears in `state/skills.json` and the dashboard's Skill panel. Every invocation is appended to `state/skills-YYYY-MM-DD.jsonl`. |
+| `opencrayfish.tools` → `weather = "...:WeatherTool"` | Discover it, validate that `cfg.plugins.weather` exists, register it. If the Tool implements `bind_context(ctx)` it receives operator config + handles automatically. The Tool's metadata appears in `state/tools.json`. Any Skill can compose it via `ctx.tools.call("weather", ...)`. |
+| `opencrayfish.connectors` → `discord = "...:DiscordConnector"` | Discover it, validate manifest, register it, **`await connector.start()` after the first-party connectors come up**, and `await connector.stop()` on shutdown in isolation. Inbound messages route through the same Brain + Cognitive Loop pipeline as Telegram. |
+| `opencrayfish.provider_backends` → `vllm = "...:VllmBackend"` | Discover it, validate manifest, log presence. The operator points `cfg.hardware.primary_backend: "vllm"` (or `fallback_backend:`) and the **Provider singleton routes the matching slot through the discovered backend** instead of the built-in Pi 5 wiring. Unknown name → boot aborts with a clear error. |
+
+What the operator does NOT need to do:
+
+- ❌ Edit `main.py` — no `from opencrayfish_skill_translate import TranslateSkill` line, no `skill_registry.register(...)` line.
+- ❌ Edit `core/cognition.py` — the PLAN menu is built fresh per turn from whatever skills are registered.
+- ❌ Edit `core/config.py` — third-party config lives in `cfg.plugins.<key>.*` and the core never reads inside it.
+- ❌ Fork OpenCrayFish — every extension point is `pip install`-shaped.
+
+What the operator DOES do:
+
+- ✅ `pip install <third-party-package>` inside the OpenCrayFish venv.
+- ✅ Optionally add a `plugins.<key>: { ... }` block to `config.yaml` for that plug-in's configuration.
+- ✅ Restart the agent. Done.
+
+### Configuration Injection (`cfg.plugins.*` + `bind_context`)
+
+Third-party plug-ins need operator-supplied configuration (API keys, endpoint URLs, units, thresholds…) **without** patching [core/config.py](core/config.py). The `cfg.plugins.*` namespace is that seam, plus a symmetric **`bind_context`** hook on every registry:
+
+```yaml
+# config.yaml — operator-side
+plugins:
+  weather:
+    api_key: "${WEATHER_API_KEY}"   # consumed by WeatherTool
+    units: "metric"
+  translate:
+    backend: "deepl"                 # consumed by TranslateSkill
+    glossary_path: "memory/glossary.yaml"
+```
+
+The core never reads inside these sub-dicts. They flow into plug-ins via two symmetric paths:
+
+| Surface | How it receives `cfg.plugins.<key>` |
+|---|---|
+| **Skills** | Every `execute(ctx, **kwargs)` call receives a `SkillContext` carrying `plugins_config: Mapping[str, Mapping[str, Any]]` (wrapped in `MappingProxyType` — read-only). Skill code: `cfg = ctx.plugins_config.get(self.manifest.config_key or self.manifest.name, {})`. |
+| **Tools** | Optional `bind_context(ctx: ToolContext)` method. If the Tool implements it, `ToolRegistry` calls it exactly once at boot (and once per future registration) with a `ToolContext` carrying the same `plugins_config` + `soul` / `stm` / `monitor` / `provider` / `archive_path` / `designation` / `architect_name` / `architect_honorific`. Tools that don't implement `bind_context` (e.g. first-party `SearXNG` + `ArchiveRead`) are simply skipped — fully backward-compatible. |
+| **Connectors** | Constructed explicitly in `main.py` with operator-supplied arguments (they need brain/heartbeat/intent_router references that entry-points can't supply). Discovered connectors via entry-points use the same constructor convention; the `ConnectorManifest.config_key` is validated at boot. |
+| **Provider Backends** | Operator picks discovered backends by name (`cfg.hardware.primary_backend`, `cfg.hardware.fallback_backend`). Backends are entry-point factories — they read their own config from any source they choose (env vars are conventional). |
+
+The key insight: **`plugins_config` is the only edit a third-party plug-in needs to take configuration**. Declare `config_key` in your manifest (optional but recommended — `bootstrap_validate` will then fail loud if the operator forgot the YAML block), then read from your context object at call time.
+
+### Protocol Versioning & Fail-Loud Boot
+
+Each plug-in surface carries an explicit **protocol version** string that lets the core evolve without breaking already-installed third-party packages:
+
+| Surface | Constant | Current version |
+|---|---|---|
+| Skills | `SUPPORTED_PROTOCOL_VERSIONS` in [core/skills/manifest.py](core/skills/manifest.py) | `skill-protocol/1` |
+| Tools | `SUPPORTED_TOOL_PROTOCOL_VERSIONS` in [tools/manifest.py](tools/manifest.py) | `tool-protocol/1` |
+| Connectors | `SUPPORTED_CONNECTOR_PROTOCOL_VERSIONS` in [connectors/manifest.py](connectors/manifest.py) | `connector-protocol/1` |
+| Backends | `SUPPORTED_BACKEND_PROTOCOL_VERSIONS` in [core/provider_manifest.py](core/provider_manifest.py) | `backend-protocol/1` |
+
+A plug-in's `manifest.compat_version` must be in the supported set or `bootstrap_validate` refuses to start. When the core makes a breaking change, the doctrine is: add `"<surface>-protocol/2"` to the supported set, leave `"...1"` in for at least one release with a deprecation log line, document the migration in the README's [Protocol Surface Stability](#protocol-surface-stability) section. Third-party authors upgrade at their own pace.
+
+`bootstrap_validate` is the **fail-loud boot gate** — it runs once per registry after all entry-point discovery is done, and on the first failure raises `RuntimeError` so the agent never half-starts:
+
+- `compat_version` in supported set?
+- For Skills: every `requires_tools` name actually registered? Every `plan_verb` unique?
+- For Tools / Connectors: `config_key` namespace present in `cfg.plugins`?
+- `requires_caps` tokens in `WELL_KNOWN_*_CAPABILITIES`? (Warning, not fatal — caps are advisory metadata.)
+
+The combination of frozen manifests, version gates, and fail-loud bootstrap means a plug-in problem **always surfaces at boot, never three hours into a session**.
 
 ---
 
@@ -498,7 +634,7 @@ streamlit run ui/web_chat.py --server.port 8502
 
 # 7. (Optional) Run the test suite
 pip install -e ".[dev]"                    # adds pytest + pytest-asyncio + ruff
-python -m pytest -q                        # 113 tests, runs in <1s
+python -m pytest -q                        # 218 tests, runs in <2s
 ```
 
 Now talk to it on Telegram or in the browser. The agent will reply, remember, decay its mood, get curious during idle time, and once the clock crosses 02:00, it will sleep and consolidate the day.
@@ -728,7 +864,7 @@ That's the whole agent in one trace. Every other deep-dive section below zooms i
 
 #### How to extend each layer (the one-line guide)
 
-- **Add a new Skill** → drop a file in [core/skills/](core/skills/) that satisfies the Skill Protocol, register it in [main.py](main.py). See [§ 12 Hello-World Skill — Step by Step](#hello-world-skill--step-by-step).
+- **Add a new Skill** → either (a) drop a file in [core/skills/](core/skills/) satisfying the Skill Protocol and register it in [main.py](main.py) ([§ 12 Hello-World Skill](#hello-world-skill--step-by-step)), or (b) ship it as a standalone `pip`-installable package with an `opencrayfish.skills` entry-point — no fork of OpenCrayFish required ([§ 12 Third-Party Skill Packages](#third-party-skill-packages-pip-install)).
 - **Add a new Tool** → drop a file in [tools/](tools/) that satisfies the Tool Protocol, register it in [main.py](main.py). See [§ Adding a new tool](#adding-a-new-tool).
 - **Add a new memory shelf** → don't, usually. Promote facts to `soul.md [CORE_MEMORIES]` via Sleep Metabolism instead.
 - **Add a new connector** → wrap `Brain.think(…)` and stream the `ThoughtTrace` back. See [§ Adding a new connector](#adding-a-new-connector).
@@ -1407,7 +1543,7 @@ OpenCrayFish separates *what the agent can decide to do* from *what the agent ca
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-This split is the single most important architectural change between v1 and v2.0, because it makes **the PLAN-stage menu pluggable** — adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from, without touching `cognition.py`.
+This split is the single most important architectural change between v1 and v2.0 (the PLAN-stage menu became pluggable), and v3 closes the symmetry by giving Tools the same **`bind_context`** seam Skills have always had — so a third-party Tool can take its operator config and shared subsystem handles without any factory-closure dance. Adding a new Skill with a `plan_verb` automatically extends what the SLM can pick from; adding a new Tool with a `config_key` automatically wires it into operator config — neither requires touching `cognition.py` or `main.py`.
 
 #### Tier A — Skills (the registry)
 
@@ -1556,6 +1692,436 @@ And in `state/deliberation-YYYY-MM-DD.jsonl` you'll see `GREET` appear in the PL
 - Make it actuator-style: set `side_effects=True, requires_confirmation=True` for a Skill that, say, toggles a smart bulb — the Loop will refuse to run it without explicit ack scaffolding (a planned actuator hook lives in [core/cognition.py](core/cognition.py)).
 
 See [CONTRIBUTING.md § Ways to Contribute](CONTRIBUTING.md#ways-to-contribute) for the equivalent walkthrough for both layers.
+
+#### The `SkillManifest` Contract
+
+The Hello-World example above uses scattered class attributes (`name`, `description`, `plan_verb`, …). That style still works — the registry's `resolve_manifest()` helper rolls them up into a single `SkillManifest` for back-compat. But for any **new** skill (and especially for **third-party** skills shipped as a separate `pip` package), the recommended style is to declare an **explicit** [`SkillManifest`](core/skills/manifest.py) class attribute. It's a frozen, slotted dataclass that becomes the **single source of truth** for everything the OpenCrayFish core needs to know about your skill at boot time:
+
+```python
+from core.skills import SkillContext, SkillManifest, SkillResult
+
+class TranslateSkill:
+    manifest = SkillManifest(
+        # Identity (required) ─────────────────────────────────────────────
+        name="translate",
+        description="Translate a phrase between supported languages.",
+        compat_version="skill-protocol/1",   # see SUPPORTED_PROTOCOL_VERSIONS
+
+        # PLAN-menu wiring (optional — omit / set None to hide from PLAN) ─
+        plan_verb="TRANSLATE",
+        plan_arg_hint='"<phrase>" lang="<iso-code>"',
+        plan_guidance=(
+            "TRANSLATE when the Architect asks for a translation; prefer "
+            "this over a freeform ANSWER even when the SLM could guess."
+        ),
+        plan_example='Q1: TRANSLATE "Bonjour le monde" lang="en"',
+
+        # Discovery hints + arg schema ────────────────────────────────────
+        trigger_hints=("user asks 'translate X to Y'",),
+        args_schema={
+            "query": {"type": "string", "required": True, "desc": "..."},
+            "lang":  {"type": "string", "required": True, "desc": "..."},
+        },
+
+        # Cost + safety ───────────────────────────────────────────────────
+        cost_tier="cheap",          # "free" | "cheap" | "expensive"
+        requires_network=False,
+        side_effects=False,
+        requires_confirmation=False,
+
+        # Resource contract — bootstrap_validate enforces these at boot ─
+        requires_tools=("translate_api",),  # must exist in ToolRegistry
+        requires_caps=("network",),         # well-known capability tokens
+    )
+
+    async def execute(self, ctx: SkillContext, **kwargs) -> SkillResult: ...
+    async def aclose(self) -> None: return None
+```
+
+Two things the manifest unlocks that the scattered-attribute style cannot:
+
+1. **`plan_guidance` is now a per-skill responsibility.** The PLAN-stage SLM prompt no longer contains any hardcoded "When to SEARCH vs. RECALL vs. ANSWER" block — `core.cognition._stage_plan` collects each registered skill's own `plan_guidance` snippet and glues them together. **A new skill teaches the SLM about itself**, without any edit to `cognition.py`.
+2. **`requires_tools` + `requires_caps` become enforceable.** Boot-time validation (see [bootstrap_validate](#bootstrap_validate--fail-loud-at-boot) below) refuses to start the agent if a Skill declares a tool that nobody registered. No silent runtime "tool 'translate_api' not found" errors three hours into a session.
+
+`compat_version` lets us bump the protocol later without breaking installed third-party packages. The current value is `"skill-protocol/1"`; older / unknown versions will be rejected by `bootstrap_validate`.
+
+#### Third-Party Skill Packages (`pip install`)
+
+Editing `main.py` to register each new skill works fine in the monorepo, but it doesn't scale to **a community of plug-in authors**. v2 added a standard Python plug-in mechanism: the **`opencrayfish.skills` entry-point group**. Any installed package that declares an entry in this group is auto-discovered at boot via `importlib.metadata.entry_points(group="opencrayfish.skills")`.
+
+To ship a third-party skill, the author publishes a normal Python package whose `pyproject.toml` looks like this:
+
+```toml
+[project]
+name = "opencrayfish-skill-translate"
+version = "0.1.0"
+requires-python = ">=3.13"
+
+[project.entry-points."opencrayfish.skills"]
+translate = "opencrayfish_skill_translate:TranslateSkill"
+```
+
+The agent operator then runs `pip install opencrayfish-skill-translate` (or `pip install -e ./local-checkout`) inside the OpenCrayFish virtualenv and restarts. At boot they'll see:
+
+```
+INFO  SKILL registered name=translate protocol=skill-protocol/1 cost=cheap ...
+INFO  Discovered N external skill(s) via entry-points
+```
+
+The PLAN menu, the `state/skills.json` inventory, and the dashboard's **🎯 Skill registry** panel all pick up the new skill automatically. **Zero edits to `main.py`, zero forks of OpenCrayFish itself.**
+
+Discovery is implemented in [core/skills/discovery.py](core/skills/discovery.py) and is intentionally fail-soft: a single broken entry-point logs an error and is skipped, never crashing the agent. The list of successfully-registered names is returned so `main.py` can log a one-line summary.
+
+#### The `opencrayfish` CLI
+
+After `pip install -e .` of OpenCrayFish itself, an `opencrayfish` script is on PATH. It exposes two scaffolding commands for skill authors:
+
+```bash
+# Scaffold a new third-party skill package in the current directory.
+opencrayfish skill new translate
+
+# The scaffold is fully self-contained — pip-install it and it works.
+cd opencrayfish-skill-translate
+pip install -e .
+
+# Sanity-check a skill before publishing (imports it + validates the manifest).
+opencrayfish skill validate opencrayfish_skill_translate:TranslateSkill
+```
+
+`skill new` writes a starter package containing a `pyproject.toml` with the entry-point already declared, an `__init__.py` with a `SkillManifest` stub showing every available field, a `README.md`, and a minimal pytest. The author edits four `# TODO` blocks and ships.
+
+`skill validate` is the inverse of bootstrap validation: import a skill by `module:attr`, resolve its manifest, dry-register it into a throw-away `SkillRegistry`, and print any problems. Use it in your own CI before publishing.
+
+The CLI lives in [core/cli.py](core/cli.py) — stdlib `argparse`, no extra dependencies, ~300 lines. It's *intentionally* separate from `main.py`: scaffolding a skill should not require booting the runtime stack (provider, monitor, connectors).
+
+#### `bootstrap_validate` — Fail Loud at Boot
+
+`SkillRegistry.bootstrap_validate(tool_registry=...)` runs once during `main.py` startup, **after** every first-party and entry-point-discovered skill has been registered. It checks four invariants and raises `RuntimeError` on the first failure (no half-started agent):
+
+| Check | What it catches |
+|---|---|
+| `compat_version ∈ SUPPORTED_PROTOCOL_VERSIONS` | A skill written against a future / removed protocol revision. |
+| Every name in `requires_tools` exists in `ToolRegistry` | A skill declares it calls `searxng` but the operator hasn't configured SearXNG. |
+| `plan_verb` is unique across registered skills | Two skills both claim `SEARCH` — silent shadowing in the PLAN menu would otherwise hide one of them. |
+| `requires_caps` tokens are in `WELL_KNOWN_CAPABILITIES` | Logged as a warning (not fatal) — caps are advisory metadata. |
+
+The agent now refuses to run with a misconfigured skill set. This is the **only** way to give third-party plug-ins predictable failure modes: a broken install dies at boot with a clear error, instead of silently degrading the PLAN-stage three hours later when the SLM finally picks the verb that fails.
+
+#### The `ToolManifest` Contract
+
+The Skill layer above has a twin on the Tool side: every Tool registered into [`ToolRegistry`](tools/registry.py) is summarized by a [`ToolManifest`](tools/manifest.py) — a frozen, slotted dataclass that the core inspects at boot. First-party tools ([SearXNG](tools/searxng.py), [ArchiveRead](tools/archive_read.py)) ship explicit manifests; third-party tools are expected to do the same. Anything that doesn't gets a manifest **synthesized** from scattered class attributes (`name`, `description`, `args_schema`, …) by `resolve_tool_manifest()` for one-version back-compat — same pattern as `resolve_manifest()` on the Skill side.
+
+```python
+from tools import ToolManifest, ToolResult
+
+class WeatherTool:
+    manifest = ToolManifest(
+        name="weather",
+        description="Current conditions + 3-day forecast for a given lat/lon.",
+        compat_version="tool-protocol/1",
+        args_schema={
+            "lat": {"type": "float", "required": True, "desc": "Latitude"},
+            "lon": {"type": "float", "required": True, "desc": "Longitude"},
+        },
+        side_effects=False,
+        requires_confirmation=False,
+        requires_caps=("network.outbound",),   # operator-auditable
+        config_key="weather",                   # reads cfg.plugins.weather.*
+    )
+
+    name = "weather"
+    description = "Current conditions + 3-day forecast for a given lat/lon."
+
+    async def call(self, **kwargs) -> ToolResult:
+        ...
+```
+
+Two fields deserve special attention:
+
+- **`requires_caps`** — capability tokens that document the runtime surface area the tool touches. The well-known set is `network.outbound`, `filesystem.read`, `filesystem.write`, `gpio`, `actuator`, `subprocess` (see `WELL_KNOWN_TOOL_CAPABILITIES`). Unknown tokens log a warning but don't fail boot, so third-party packages can ship their own conventions.
+- **`config_key`** — when set, the [`ToolRegistry.bootstrap_validate()`](tools/registry.py) call in [main.py](main.py) cross-checks that `cfg.plugins.<key>` exists in the operator's `config.yaml`. A typo there (`weatehr:` instead of `weather:`) is caught at boot, not at first invocation.
+
+Mirroring the Skill side, `ToolRegistry.bootstrap_validate(plugins_config=cfg.plugins)` runs once after every first-party and entry-point-discovered tool is registered. It checks `compat_version` membership in `SUPPORTED_TOOL_PROTOCOL_VERSIONS`, `config_key` namespace presence, and logs unknown capability tokens. Strict mode (the default) raises `RuntimeError` on any problem — the agent refuses to start.
+
+#### Third-Party Tool Packages (`pip install`)
+
+The Tool layer mirrors the Skill layer's discovery contract:
+
+```toml
+# Third-party tool author's pyproject.toml
+[project.entry-points."opencrayfish.tools"]
+weather = "opencrayfish_tool_weather:WeatherTool"
+```
+
+`pip install -e .` registers the entry-point; OpenCrayFish picks it up at next boot via [`tools/discovery.py`](tools/discovery.py). The scaffolder is symmetric with `skill new`:
+
+```bash
+opencrayfish tool new weather
+cd opencrayfish-tool-weather
+pip install -e .
+
+opencrayfish tool validate opencrayfish_tool_weather:WeatherTool
+```
+
+`tool new` writes the same four-file shape as `skill new` (pyproject.toml + package + README + pytest), but the generated class exposes `async def call(self, **kwargs) -> ToolResult` (the Tool Protocol verb) instead of `execute()` (the Skill Protocol verb). The entry-point group is `opencrayfish.tools`. Everything else is the same — same fail-isolated discovery, same dry-register validation, same `bootstrap_validate` failure modes.
+
+The reference implementation lives at [`examples/opencrayfish-skill-echo/`](examples/opencrayfish-skill-echo/) for the Skill side; copy-paste-adapt it as the canonical "hello world" for new plugins.
+
+#### Hello-World Tool — Step by Step (v3 `bind_context`)
+
+The Skill side has a full hello-world walkthrough above. The Tool side is the same shape with one important addition: **`bind_context`**. v3 makes Tools symmetric with Skills for config injection — instead of the v2 factory-closure dance (where you'd write a `make_weather_tool(api_key)` factory and stuff it into the entry-point), a v3 Tool simply implements `bind_context(ctx: ToolContext)` and the `ToolRegistry` delivers operator config + shared subsystem handles automatically.
+
+**Step 1. Create the Tool class** (e.g. inside your `opencrayfish_tool_weather` package):
+
+```python
+"""Hello-World Tool — minimal example of the v3 Tool plug-in contract."""
+
+from __future__ import annotations
+
+from typing import Any
+import httpx
+
+from tools import ToolContext, ToolManifest, ToolResult
+
+
+class WeatherTool:
+    manifest = ToolManifest(
+        name="weather",
+        description="Current conditions for a city (open-meteo, no key needed).",
+        compat_version="tool-protocol/1",
+        args_schema={
+            "city": {"type": "string", "required": True, "desc": "City name"},
+        },
+        side_effects=False,
+        requires_confirmation=False,
+        requires_caps=("network.outbound",),
+        config_key="weather",                 # cfg.plugins.weather.*
+    )
+
+    # Mirror manifest fields for back-compat / dashboard scrapers
+    name = "weather"
+    description = "Current conditions for a city."
+    args_schema = {"city": {"type": "string", "required": True}}
+    side_effects = False
+    requires_confirmation = False
+
+    def __init__(self) -> None:
+        self._client: httpx.AsyncClient | None = None
+        self._units = "metric"  # default until bind_context overrides it
+
+    # ── v3 opt-in: receive operator config + shared handles at boot ─────────
+    def bind_context(self, ctx: ToolContext) -> None:
+        cfg = ctx.plugins_config.get(self.manifest.config_key or self.name, {})
+        self._units = cfg.get("units", "metric")
+        # You can also stash ctx.monitor / ctx.provider / ctx.archive_path
+        # if you need to participate in stress gating or read the long-term
+        # archive. ToolContext is frozen — never mutate it.
+
+    # ── Tool Protocol verb ──────────────────────────────────────────────────
+    async def call(self, **kwargs: Any) -> ToolResult:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=10.0)
+        city = kwargs["city"]
+        # ... call the API, build a payload ...
+        return ToolResult(ok=True, data={"city": city, "units": self._units})
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+```
+
+**Step 2. Declare the entry-point** in your package's `pyproject.toml`:
+
+```toml
+[project.entry-points."opencrayfish.tools"]
+weather = "opencrayfish_tool_weather:WeatherTool"
+```
+
+**Step 3. Add an operator config slice** to OpenCrayFish's `config.yaml`:
+
+```yaml
+plugins:
+  weather:
+    units: "metric"
+```
+
+**Step 4. Install + restart.** `pip install -e ./opencrayfish-tool-weather` inside the OpenCrayFish venv, restart the agent. At boot you'll see:
+
+```
+INFO  TOOL registered name=weather protocol=tool-protocol/1 caps=(network.outbound,) ...
+INFO  Discovered 1 external tool(s) via entry-points: weather
+INFO  TOOL bind_context delivered to weather (cfg.plugins.weather: 1 keys)
+```
+
+`state/tools.json` now lists `weather`; any Skill can compose it via `await ctx.tools.call("weather", city="Hong Kong")`. If you forget the `plugins.weather:` block in `config.yaml`, `bootstrap_validate` aborts boot with:
+
+```
+RuntimeError: ToolRegistry.bootstrap_validate: tool 'weather' declares
+config_key='weather' but cfg.plugins.weather is missing.
+```
+
+That's the v3 Tool contract end-to-end: **one Manifest, one optional `bind_context`, one `call`, one entry-point line, one YAML block**.
+
+#### Argspec Runtime Validation
+
+Both `SkillRegistry.invoke()` and `ToolRegistry.call()` run a **boundary-time argspec check** against `manifest.args_schema` BEFORE dispatching. The check lives in [`core/skills/argspec.py`](core/skills/argspec.py) and is shared by both layers — one place to fix bugs, one place to extend types.
+
+What it does, in order:
+
+1. **Inject defaults** — any schema entry with `default` whose key is absent from `kwargs` gets the default written in.
+2. **Enforce `required`** — entries with `required: True` and no provided value (after defaults) produce an `argspec:` error before the skill/tool ever runs.
+3. **Safe coercions** — `str → int / float / bool` (e.g. `"42" → 42`, `"true" → True`), and numeric → `str`. Rejects ambiguous cases loudly (a Python `bool` is never silently passed where `int` was declared).
+4. **Track unknown kwargs** — anything not described in the schema is returned in `meta["argspec_unknowns"]` for audit (warned, not fatal — so additive schemas don't break older callers).
+
+On failure the skill/tool returns `SkillResult(ok=False, error="argspec: ...")` / `ToolResult(ok=False, error="argspec: ...")` with structured details under `meta["argspec_errors"]` and `meta["argspec_unknowns"]`. The dispatcher records the failure in the audit log the same way as any other failed call — there's no separate path for "validation failed", so a flaky LLM call site can't accidentally bypass the check by catching a different exception type.
+
+The test suite for this layer is [`tests/test_argspec.py`](tests/test_argspec.py) — 17 tests covering coercion, defaults, missing-required, unknown-kwarg handling, and end-to-end integration through both registries.
+
+#### Plugin Config Namespace (`cfg.plugins.*`)
+
+Third-party Skills and Tools need a way to take operator configuration **without** patching [core/config.py](core/config.py). The `cfg.plugins.*` namespace is that seam:
+
+```yaml
+# config.yaml
+plugins:
+  weather:
+    api_key: "${WEATHER_API_KEY}"   # consumed by WeatherTool
+    units: "metric"
+  translate:
+    backend: "deepl"                 # consumed by TranslateSkill
+    glossary_path: "memory/glossary.yaml"
+```
+
+The core never reads inside these sub-dicts. They're forwarded verbatim to two sites:
+
+- **Tools** — two symmetric paths. (1) `ToolRegistry.bootstrap_validate(plugins_config=cfg.plugins)` fails boot if a Tool declares `config_key="weather"` but `cfg.plugins.weather` is missing. (2) `ToolRegistry.bind_context(ctx)` delivers a frozen `ToolContext` (carrying `plugins_config` + `soul` / `stm` / `monitor` / `provider` / `archive_path` / `designation` / `architect_name` / `architect_honorific`) to every registered Tool that **opts in** by implementing `bind_context(ctx)`. First-party Tools (`SearXNG`, `ArchiveRead`) don't need it — they're constructed with their config in `main.py` — but it's the documented seam by which a v3 third-party Tool reads its `cfg.plugins.<key>` slice without any factory-closure dance. See the [Hello-World Tool walkthrough](#hello-world-tool--step-by-step-v3-bind_context) above.
+- **Skills** — via [`SkillContext.plugins_config`](core/skills/base.py) (`Mapping[str, Mapping[str, Any]]`, wrapped in `MappingProxyType` so Skills can't mutate the operator's config). A Skill retrieves its slice at call time:
+
+```python
+async def execute(self, ctx: SkillContext, **kwargs) -> SkillResult:
+    cfg = ctx.plugins_config.get(self.manifest.name, {})  # or .config_key
+    backend = cfg.get("backend", "default")
+    ...
+```
+
+This is the only edit a third-party plugin needs to take configuration: declare `config_key` in your manifest (optional but recommended for bootstrap-time validation), and read from `ctx.plugins_config[key]` at call time. **No edits to `core/config.py`, no edits to `main.py`, no fork of OpenCrayFish.**
+
+#### The `ConnectorManifest` Contract
+
+Connectors are the agent's I/O surface — Telegram, Web Chat, and any third-party transport (Discord, Matrix, MQTT, voice loops, webhooks, …). They are the **third layer** in the plug-in stack and follow the same Manifest + Registry + Discovery pattern as Skills and Tools.
+
+The contract ([`connectors/manifest.py`](connectors/manifest.py)):
+
+```python
+@dataclass(frozen=True, slots=True)
+class ConnectorManifest:
+    name: str
+    description: str
+    compat_version: str = "connector-protocol/1"
+    requires_caps: tuple[str, ...] = ()      # e.g. ("network.outbound", "network.inbound")
+    config_key: str | None = None             # cfg.plugins.<key> namespace
+```
+
+A Connector is duck-typed: it MUST expose `name: str`, `manifest: ConnectorManifest`, and at minimum one of `async def start()` / `async def stop()`. Both in-tree connectors ([`TelegramConnector`](connectors/telegram.py), [`WebChatConnector`](connectors/web_chat.py)) now ship explicit manifests; any third-party connector that doesn't gets one **synthesized** from class attributes via `resolve_connector_manifest()` for one-version back-compat (same pattern as Skill/Tool sides).
+
+`ConnectorRegistry` ([`connectors/registry.py`](connectors/registry.py)) owns connector lifecycle:
+
+- `register(connector)` — rejects duplicate names, validates `compat_version` against `SUPPORTED_CONNECTOR_PROTOCOL_VERSIONS`.
+- `bootstrap_validate(plugins_config, strict)` — fails loud at boot if any connector declares a `config_key` that's missing from `cfg.plugins.*` (when `plugins_config` is provided).
+- `aclose_all()` — invokes every connector's `stop()` in **isolation**: a buggy connector's `stop()` exception is logged, the others still get cleanly torn down.
+
+#### Third-Party Connector Packages (`pip install`)
+
+Same shape as third-party Skills/Tools — a normal Python package whose `pyproject.toml` declares an `opencrayfish.connectors` entry-point:
+
+```toml
+[project.entry-points."opencrayfish.connectors"]
+discord = "opencrayfish_connector_discord:DiscordConnector"
+```
+
+[`connectors/discovery.py`](connectors/discovery.py) scans this group at boot, importing each entry **fail-isolated** — a broken or missing third-party connector logs an error and is skipped; the boot continues with whatever else is healthy.
+
+Scaffold one with the CLI:
+
+```bash
+opencrayfish connector new discord
+opencrayfish connector validate opencrayfish_connector_discord:DiscordConnector
+```
+
+`connector new` writes the same four-file shape (pyproject.toml + package + README + pytest) as `skill new` / `tool new`, but the generated class exposes `async def start()` + `async def stop()` (the Connector lifecycle verbs) instead of `execute()` / `call()`. Everything else mirrors the Skill/Tool flow: same fail-isolated discovery, same dry-register validation in `validate`, same `bootstrap_validate` failure modes.
+
+The first-party `TelegramConnector` and `WebChatConnector` are still constructed explicitly in `main.py` — they take subsystem references (brain, heartbeat, intent_router) that entry-points can't supply. The discovery layer is purely for **additive** third-party transports.
+
+#### Provider Backends — `BackendManifest` & Discovery
+
+The Provider layer (`core/provider.py`) is the **lightest** plug-in surface today: there is no central `BackendRegistry` because the `Provider` singleton itself owns the live primary/fallback backends (the constructor is built around the Pi 5 + AI HAT+ deployment target). v3 closes the gap by making the primary/fallback slots **operator-routable** — when `cfg.hardware.primary_backend` or `cfg.hardware.fallback_backend` names a discovered backend, the `Provider.from_config()` factory swaps that slot to the discovered instance.
+
+The contract ([`core/provider_manifest.py`](core/provider_manifest.py)):
+
+```python
+@dataclass(frozen=True, slots=True)
+class BackendManifest:
+    name: str
+    description: str
+    compat_version: str = "backend-protocol/1"
+    requires_caps: tuple[str, ...] = ()      # e.g. ("network.outbound", "gpu", "npu")
+    config_key: str | None = None
+```
+
+Both in-tree backends ([`HailoOllamaBackend`](core/provider.py), [`OllamaBackend`](core/provider.py)) carry explicit manifests with appropriate capability tokens (`npu` for the Hailo path, `network.outbound` for both).
+
+`discover_external_backends()` walks `opencrayfish.provider_backends` at boot with the same fail-isolated contract as the other discovery layers. The result is logged AND — when the operator asks — routed straight into a Provider slot:
+
+```yaml
+# config.yaml — operator points the primary slot at a discovered backend
+hardware:
+  npu_acceleration: false             # (built-in Hailo path off)
+  cpu_fallback_url: "http://localhost:11434"
+  cpu_fallback_model: "qwen2:1.5b"
+  primary_backend: "vllm-cuda"        # ← name from a third-party manifest
+  # fallback_backend: null            # leave None to keep built-in OllamaBackend
+```
+
+On boot the `main.py` startup flow becomes:
+
+```text
+1. Build a baseline Provider from cfg.hardware (Hailo or CPU per npu_acceleration).
+2. discover_external_backends() — log "BACKEND Discovered N: vllm-cuda, ..."
+3. If cfg.hardware.primary_backend or fallback_backend is set:
+     - await baseline.aclose()         (close the httpx client cleanly)
+     - rebuild Provider.from_config(cfg.hardware, discovered_backends=[...])
+     - log "BACKEND Provider rerouted: primary=vllm-cuda fallback=<built-in>"
+```
+
+An unknown name raises `ValueError("hardware.primary_backend='typo' is not a discovered backend. Available: ['vllm-cuda']")` — fail loud at boot, with the list of names that ARE available so the operator can fix the typo. Tested in [`tests/test_provider_backend_routing.py`](tests/test_provider_backend_routing.py).
+
+Scaffold a backend with the CLI:
+
+```bash
+opencrayfish provider new vllm-cuda
+opencrayfish provider validate opencrayfish_backend_vllm_cuda:VllmCudaBackend
+```
+
+Backend names accept hyphens (convention: `hailo-ollama-npu`); the scaffolder normalizes to snake_case for Python identifiers. The generated class implements the minimal Provider contract — `name`, `manifest`, `async def generate(system_prompt, messages) -> str`, `async def aclose()` — and the `cfg.hardware.primary_backend` / `cfg.hardware.fallback_backend` knobs do the rest.
+
+#### Protocol Surface Stability
+
+The published Skill + Tool Protocol surface (`SkillResult` / `SkillContext` / `SkillManifest` / `Skill` Protocol annotations + `ToolManifest`) is **frozen by snapshot test**: [`tests/test_skill_protocol_surface_v1.py`](tests/test_skill_protocol_surface_v1.py) carries an explicit `EXPECTED_*` set for every dataclass-field and Protocol-annotation that third parties write against. Any addition, removal, or rename fails the test — forcing the change author to either restore the surface, or **deliberately** bump `SUPPORTED_PROTOCOL_VERSIONS` / `SUPPORTED_TOOL_PROTOCOL_VERSIONS` with a migration note.
+
+Paired with the [`examples/opencrayfish-skill-echo`](examples/opencrayfish-skill-echo/) integration test (which exercises the *behavior* end-to-end), this gives third-party authors a two-axis guarantee:
+
+| Test | Catches |
+|---|---|
+| `test_skill_protocol_surface_v1.py` | Syntactic drift — new/renamed/removed fields on the published types. |
+| `test_example_echo_integration.py`  | Semantic drift — the reference plugin (representative of every third-party plugin) keeps importing, registering, validating, and executing. |
+
+If you're changing one of these published types and the surface test fails, the right move is almost always to revert the change. The exceptions are:
+
+1. **Adding** a new field with a default (backward-compatible) — just append it to the corresponding `EXPECTED_*` set. Document briefly in the dataclass docstring.
+2. **Renaming** or **removing** a field, or changing a default that already-shipped plugins relied on — this is a v2 break. Bump `SUPPORTED_*_PROTOCOL_VERSIONS` to add `"skill-protocol/2"` / `"tool-protocol/2"` / `"connector-protocol/2"` / `"backend-protocol/2"`, leave `"...1"` in the supported set for at least one release with a deprecation log line, and document the migration in this section.
+
+The four protocol-version constants live in [`core/skills/manifest.py`](core/skills/manifest.py), [`tools/manifest.py`](tools/manifest.py), [`connectors/manifest.py`](connectors/manifest.py), and [`core/provider_manifest.py`](core/provider_manifest.py) respectively.
 
 ---
 
@@ -1752,6 +2318,10 @@ Each subsystem is designed to **degrade, not crash**, when its dependency is bro
 | **STM journal corrupted** | `STM.recover()` skips malformed lines and continues. Worst case: zero turns rehydrated. | None required — the journal is truncated to zero on the next Sleep Metabolism `purge()`. |
 | **soul.md mutation rejected** | `SoulProtectionError` raised inside `metabolism()` is caught and logged. No partial write occurs (atomic swap). | Architect inspects the proposed Core Memory in `state/proactive.jsonl`; nothing else is required. |
 | **Cognitive Loop fails to parse THINK output** | Loop bails with `engaged=False`, `bypass_reason="think_unparseable"`. Brain falls through to legacy single-shot path. Trace still appended to `state/deliberation-YYYY-MM-DD.jsonl` for forensics. | None — every cycle is independent. |
+| **Misconfigured Skill at boot** (unknown `compat_version`, missing `requires_tools` entry, duplicate `plan_verb`) | `SkillRegistry.bootstrap_validate()` raises `RuntimeError` **before** the connectors start, with a precise listing of every offending Skill + problem. The process exits non-zero. **Fail loud, not slow.** | Operator inspects the error, fixes the third-party package (or removes it with `pip uninstall`), restarts. See [§ `bootstrap_validate` — Fail Loud at Boot](#bootstrap_validate--fail-loud-at-boot). |
+| **Misconfigured Tool at boot** (unknown `compat_version`, declared `config_key` missing from `cfg.plugins`) | `ToolRegistry.bootstrap_validate(plugins_config=cfg.plugins)` raises `RuntimeError` **before** the Skill registry is built, with the offending tool + problem listed. The process exits non-zero — same "fail loud, not slow" contract as the Skill side. | Operator either adds the missing `cfg.plugins.<key>` section to `config.yaml`, or `pip uninstall`s the offending third-party tool, then restarts. See [§ The `ToolManifest` Contract](#the-toolmanifest-contract). |
+| **Argspec validation failure at call time** (missing required arg, uncoercible type, schema mismatch) | `SkillRegistry.invoke()` / `ToolRegistry.call()` returns `SkillResult(ok=False, error="argspec: ...")` / `ToolResult(ok=False, error="argspec: ...")` with structured details under `meta["argspec_errors"]`. The skill/tool body is **never** invoked; the failure is audit-logged like any other failed call. | Cognition treats this like any other failed Skill — the cycle continues, the synth prompt gets the error string as evidence, the SLM apologizes naturally. See [§ Argspec Runtime Validation](#argspec-runtime-validation). |
+| **Misconfigured Connector at boot** (unknown `compat_version`, declared `config_key` missing from `cfg.plugins`) | `ConnectorRegistry.bootstrap_validate(plugins_config=cfg.plugins, strict=True)` raises `RuntimeError` **before** the connectors are started — same fail-loud contract as the Skill / Tool sides. A broken third-party connector loaded via entry-points is fail-isolated at the discovery layer (logged + skipped), so only its OWN transport is missing, not the whole agent. | Operator either fixes the missing `cfg.plugins.<key>` section, or `pip uninstall`s the offending connector. See [§ The `ConnectorManifest` Contract](#the-connectormanifest-contract). |
 | **Connector outage (Telegram API rate-limit or transient `NetworkError`)** | Inbound `python-telegram-bot` polling retries internally. Outbound scheduled-task deliveries (`_deliver_report`) self-retry up to 3× with exponential backoff on `NetworkError` / `TimedOut`, and honour `RetryAfter` cooldowns. Agent state untouched; replies queue and drain when the API recovers. | None — wait for the rate-limit window. |
 | **Heartbeat coroutine raises** | Exception propagates; Heartbeat task dies; `await pulse_task` in `main.amain()` raises and the process exits non-zero. | Restart the agent (systemd unit recommended). STM rehydrates from journal at boot. |
 | **Architect speaks while autonomous proactive research is mid-cycle** | The cycle yields at the next milestone (≤1 SLM call latency, ~1 s ceiling); no state mutation occurs because nothing was persisted yet. Live `think()` proceeds with normal latency. `PROACTIVE yield_to_foreground` line lands in `state/logs/agent.log`. | Automatic — the next idle window (after `idle_proactive_minutes` of silence) restarts the cycle from scratch. Manual `/research [topic]` bypasses the yield entirely. |
@@ -1814,6 +2384,8 @@ hardware:
   thermal_release_celsius: 0.0            # 0 = auto-derive (limit - 5)
   ram_release_pct: 0.0
   vitals_cache_ttl_seconds: 5.0
+  primary_backend: null                   # v3: name a discovered backend to take the primary slot
+  fallback_backend: null                  # v3: name a discovered backend to take the fallback slot
 
 api_keys:
   telegram_token: "..."
@@ -1847,6 +2419,7 @@ cognition:
   max_act_rounds: 2                       # 2 = REFINE allowed; 1 = no refine
   refine_enabled: true
   dispatch_answer_via_skill: false        # route PLAN ANSWER through DirectAnswerSkill
+  web_search_skill: "research"           # v3: name of the Skill used for web triage + SEARCH verb + REFINE gap closure. A third-party package can ship a replacement (e.g. "perplexity_research") and the operator points this knob at it — no code change.
 
 skills:
   default_cost_tier_cap: "expensive"      # free | cheap | expensive
@@ -1953,7 +2526,19 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 ## Roadmap
 
-The current codebase is **v2.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (113 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean. v2.0 consolidates the pluggable Skill layer, the date-rotated JSONL audit feeds, the Architect-priority cooperative yield between live `think()` and autonomous proactive research, and the atomic-swap write path for `soul.md`. The natural next directions:
+The current codebase is **v3.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (218 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean.
+
+**What v3 added on top of v2** (the framework release):
+
+- **Four symmetric plug-in surfaces** — Skills, Tools, Connectors, Provider Backends — every one with its own frozen `*Manifest`, its own `*Registry` with lifecycle + audit + opt-in `bind_context`, and its own fail-isolated `*/discovery.py` walking the matching `opencrayfish.*` entry-point group. Adding any plug-in is now `pip install` + (optional) `cfg.plugins.<key>:` block + restart, with zero edits to OpenCrayFish itself.
+- **`ToolContext` + `bind_context`** ([tools/base.py](tools/base.py), [tools/registry.py](tools/registry.py)) — Tools now have the same opt-in config injection seam Skills always had. A v3 third-party Tool reads `cfg.plugins.<key>` from a frozen, shared context object instead of a factory-closure dance. First-party Tools (`SearXNG`, `ArchiveRead`) are untouched — `bind_context` is purely additive.
+- **Operator-routable Provider backends** ([core/provider.py](core/provider.py)) — `cfg.hardware.primary_backend` and `cfg.hardware.fallback_backend` accept the name of any discovered backend manifest and the `Provider.from_config()` factory swaps the matching slot. Unknown name → fail-loud boot with the list of available names.
+- **Operator-configurable web-search Skill** — `cfg.cognition.web_search_skill` (default `"research"`) decides which Skill the Brain's web triage + the Cognitive Loop's `SEARCH` verb + the REFINE gap closure dispatch to. A third-party `perplexity_research` (or similar) replacement now drops in without core edits.
+- **Tested protocol surface** — `tests/test_skill_protocol_surface_v1.py` + the four `SUPPORTED_*_PROTOCOL_VERSIONS` constants are snapshot-frozen. Any breaking edit to a published `*Manifest` / `*Context` / `*Result` either restores the surface or deliberately bumps the protocol version with a migration note in [§ Protocol Surface Stability](#protocol-surface-stability).
+
+**v2 consolidated** the pluggable Skill layer, the date-rotated JSONL audit feeds, the Architect-priority cooperative yield between live `think()` and autonomous proactive research, and the atomic-swap write path for `soul.md` — all still present in v3.
+
+The natural next directions:
 
 - **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs), `mcp_bridge` (turn any MCP server into a Skill).
 - **GPIO / I²C sensor library** — temperature/humidity (BME680), motion (PIR), light (TSL2591), gas (CCS811/MQ-2), heart rate (MAX30102), motion (MPU6050) feeding straight into `VitalSigns` and `MoodTuning`.
@@ -1962,7 +2547,7 @@ The current codebase is **v2.0**: every subsystem in this README is implemented,
 - **Output actuators** — WS2812 LED strip for mood visualization, OLED for facial expression, servos for embodied motion — these are `side_effects=True, requires_confirmation=False` Skills with policy.
 - **Sleep-time soul evolution v2** — SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve, replacing the current rule-based `_consolidate_reflections`.
 - **Encrypted state at rest** — for deployments in regulated environments (clinical, legal, financial).
-- **Pytest suite expansion** — the project now ships a real `tests/` directory (113 tests covering `IntentRouter`, `RotatingJsonlWriter` schema + STM rotation, `PositiveFilter`, `prompt_assembly`, `SkillContext`, and the task-parsing pre-filters). The next coverage gaps worth filling: `Emotions` decay/nudge math, `CognitiveLoop` THINK/PLAN/REFINE parsing edge cases, `SkillRegistry.plan_menu` filtering under stressed vitals + offline brain, and `Provider`'s circuit-breaker trip / half-open / recover lifecycle. See [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
+- **Pytest suite expansion** — coverage gaps worth filling: `Emotions` decay/nudge math, `CognitiveLoop` THINK/PLAN/REFINE parsing edge cases, `SkillRegistry.plan_menu` filtering under stressed vitals + offline brain, and `Provider`'s circuit-breaker trip / half-open / recover lifecycle. See [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
 
 ---
 
@@ -1986,7 +2571,7 @@ OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passi
 
 Look for the [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue) label. Concrete areas where help is especially appreciated:
 
-- **Pytest suite expansion** — the `tests/` directory ships with 113 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
+- **Pytest suite expansion** — the `tests/` directory ships with 218 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, tool context, provider backend routing, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
 - **Hardware port reports** — try OpenCrayFish on a Pi 4, an Orange Pi, a Jetson Nano, or an x86 mini-PC and file an Issue tagged `hardware-port` with your `state/vitals.json` and notable latency numbers.
 - **New `Tool` plugins** — implement the `Tool` protocol from [tools/base.py](tools/base.py) for local file ops, GPIO control, sensor reads, MCP servers, etc.
 - **New `Connector`s** — Discord, Slack, Matrix, IRC, MCP server. Use [connectors/web_chat.py](connectors/web_chat.py) as a template.

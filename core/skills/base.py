@@ -168,6 +168,19 @@ class SkillContext:
         default_factory=lambda: MappingProxyType({}),
     )
 
+    # Per-plugin configuration namespace. Mirrors ``cfg.plugins`` from
+    # ``core/config.py``: each top-level key matches a Skill or Tool's
+    # ``manifest.config_key`` (or its ``name`` when ``config_key`` is
+    # unset). A Skill retrieves ITS slice via
+    # ``ctx.plugins_config.get(self.manifest.config_key or self.manifest.name, {})``.
+    # This is the seam that lets third-party authors take operator
+    # config without ever touching ``core/config.py``. Same MappingProxy
+    # discipline as ``extras`` \u2014 the default is an empty read-only map
+    # so unit tests don't need to wire config to construct a context.
+    plugins_config: Mapping[str, Mapping[str, Any]] = field(
+        default_factory=lambda: MappingProxyType({}),
+    )
+
 
 @runtime_checkable
 class Skill(Protocol):

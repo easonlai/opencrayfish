@@ -17,9 +17,51 @@ from __future__ import annotations
 from typing import Any
 
 from .base import SkillContext, SkillResult
+from .manifest import SkillManifest
 
 
 class RecallSkill:
+    # Declarative manifest (see ResearchSkill for the rationale). The
+    # ``plan_guidance`` block teaches the PLAN-stage SLM when to pick
+    # RECALL vs the alternatives — this used to be hardcoded in
+    # ``core/cognition.py`` and is now skill-owned.
+    manifest = SkillManifest(
+        name="recall",
+        description=(
+            "Look up relevant facts in the agent's LTM (archive.md) by "
+            "keyword overlap. Use when the answer might already be in memory."
+        ),
+        plan_verb="RECALL",
+        plan_arg_hint="",
+        plan_guidance=(
+            "RECALL for: anything the operator has discussed before, their "
+            "personal preferences, prior conversation context."
+        ),
+        plan_example="Q2: RECALL",
+        trigger_hints=(
+            "the user references a topic discussed before",
+            "the agent should check what it already knows",
+            "the question is timeless / not freshness-sensitive",
+        ),
+        args_schema={
+            "query": {
+                "type": "string",
+                "required": True,
+                "desc": "Query whose terms are matched against archive lines.",
+            },
+            "limit": {
+                "type": "int",
+                "required": False,
+                "default": 5,
+                "desc": "Maximum number of archive lines to return.",
+            },
+        },
+        cost_tier="cheap",
+        requires_network=False,
+        requires_tools=("archive_read",),
+        requires_caps=("filesystem.read",),
+    )
+
     name: str = "recall"
     description: str = (
         "Look up relevant facts in the agent's LTM (archive.md) by "

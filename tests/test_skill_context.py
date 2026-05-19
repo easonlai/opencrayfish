@@ -125,6 +125,6 @@ def test_skill_context_other_fields_still_present():
     expected = {
         "tools", "soul", "stm", "monitor", "provider",
         "archive_path", "designation", "architect_name",
-        "architect_honorific", "extras",
+        "architect_honorific", "extras", "plugins_config",
     }
     assert field_names == expected

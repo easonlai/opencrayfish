@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from .base import ToolResult
+from .manifest import ToolManifest
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,36 @@ class SearchResult:
 
 class SearXNG:
     # --- Tool plugin contract (satisfies tools.base.Tool by shape) -----------
+    # Explicit manifest is the new source of truth (Tool Protocol v1).
+    # The legacy scattered class attributes BELOW are kept verbatim for
+    # any caller still reading them via getattr (e.g. test fixtures);
+    # the registry's ``resolve_tool_manifest`` will prefer the explicit
+    # ``manifest`` field.
+    manifest = ToolManifest(
+        name="web_search",
+        description=(
+            "Live web search via a self-hosted SearXNG instance. "
+            "Use for time-sensitive, niche, or post-training-cutoff facts."
+        ),
+        compat_version="tool-protocol/1",
+        args_schema={
+            "query": {
+                "type": "string",
+                "required": True,
+                "desc": "3-8 keywords (NOT a full sentence) to search the web for.",
+            },
+            "limit": {
+                "type": "int",
+                "required": False,
+                "default": 5,
+                "desc": "Maximum number of results to return (1-10).",
+            },
+        },
+        side_effects=False,
+        requires_confirmation=False,
+        requires_caps=("network.outbound",),
+    )
+
     # Stable identifier used by the registry. PLAN-stage SLM prompts will
     # reference this name verbatim, so do not rename it without grep'ing
     # for prompt strings first.

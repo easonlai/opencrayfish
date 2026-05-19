@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from core.scheduler import TaskScheduler
     from core.stm import ShortTermMemory
 
+from .manifest import ConnectorManifest
+
 log = logging.getLogger(__name__)
 
 _HISTORY_HARD_CAP = 200
@@ -63,6 +65,23 @@ _ORIGIN: str = "web_chat"
 
 class WebChatConnector:
     """In-process aiohttp bridge that exposes the live agent over HTTP."""
+
+    # Plug-in manifest — what the ConnectorRegistry reads at boot.
+    # This Connector binds a local TCP port and serves chat / state /
+    # history endpoints, so it declares the network.inbound capability
+    # and the ``web_chat`` config namespace (cfg.plugins.web_chat in
+    # the new layout; main.py still wires the WebChatCfg explicitly
+    # for the in-tree case).
+    manifest = ConnectorManifest(
+        name="web_chat",
+        description="Local in-process aiohttp chat bridge (browser UI).",
+        requires_caps=("network.inbound",),
+        config_key="web_chat",
+    )
+
+    # Exposed for legacy callers and the registry's name-vs-manifest
+    # consistency check. Must match ``manifest.name``.
+    name = "web_chat"
 
     def __init__(
         self,

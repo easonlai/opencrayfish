@@ -271,6 +271,7 @@ class CognitiveLoop:
         cost_tier_cap: CostTier = "expensive",
         auto_offline_filter: bool = True,
         dispatch_answer_via_skill: bool = False,
+        web_search_skill: str = "research",
         feed_path: Path | str = DELIBERATION_FEED,
         feed_retain_days: int = 14,
         timezone: str = "UTC",
@@ -308,6 +309,13 @@ class CognitiveLoop:
         # as evidence. When False (legacy), ANSWER is a marker that
         # tells synth "no retrieval needed" — no extra SLM call.
         self._dispatch_answer_via_skill = bool(dispatch_answer_via_skill)
+        # Configurable name of the Skill that satisfies the SEARCH
+        # verb / REFINE gap closure. Defaults to the in-tree
+        # "research" Skill but operators (or a third-party plug-in)
+        # can override via cfg.cognition.web_search_skill. Every
+        # `_skill_registry.has(...)` / `.invoke(...)` web-search call
+        # in this module routes through this name — no other hardcode.
+        self._web_search_skill = (web_search_skill or "research").strip() or "research"
         self._feed_path = Path(feed_path)
         self._feed_path.parent.mkdir(parents=True, exist_ok=True)
         # Deliberation traces rotate by local date with bounded
@@ -436,12 +444,12 @@ class CognitiveLoop:
                 )
                 if decision.upper().startswith("GAP"):
                     gap_q = self._extract_gap_query(decision)
-                    if gap_q and self._skill_registry.has("research"):
+                    if gap_q and self._skill_registry.has(self._web_search_skill):
                         gap_step = PlanStep(
                             sub_q=f"(refine) {gap_q}",
                             verb="SEARCH",
                             query=gap_q,
-                            skill_name="research",
+                            skill_name=self._web_search_skill,
                         )
                         trace.plan.append(gap_step)
                         more = await self._stage_act([gap_step])
@@ -610,7 +618,7 @@ class CognitiveLoop:
         # research/SEARCH-style verb (network-aware) when present,
         # else the first available verb in the menu, else legacy "SEARCH".
         fallback_verb: str = "SEARCH"
-        fallback_skill: str = "research"
+        fallback_skill: str = self._web_search_skill
         for e in entries:
             if e.has_query_arg:
                 fallback_verb = e.verb
@@ -630,30 +638,46 @@ class CognitiveLoop:
             "prose, no explanation, no preface):\n"
             "  Q1: <VERB> [\"<query>\" if the verb takes one]\n"
             "  Q2: <VERB> [\"<query>\" if the verb takes one]\n"
-            "\n"
-            "Format examples (study the FORMAT only — these are abstract\n"
-            "patterns with placeholders, NOT topics to copy):\n"
-            "  Q1: SEARCH \"<noun phrase from user, 3-8 keywords>\"\n"
-            "  Q2: RECALL\n"
-            "  Q3: ANSWER\n"
-            "\n"
-            "VERB SELECTION RULES:\n"
-            "  - SEARCH for: time-sensitive facts, named entities, version\n"
-            "    numbers, proper nouns you are not 100% sure of, any\n"
-            "    'latest/recent/current' question.\n"
-            "  - RECALL for: anything the operator has discussed before, their\n"
-            "    personal preferences, prior conversation context.\n"
-            "  - ANSWER ONLY for: stable textbook facts (arithmetic, basic\n"
-            "    definitions, mainstream programming syntax) that DO NOT\n"
-            "    depend on dates or versions.\n"
-            "  - When in doubt, prefer SEARCH over ANSWER. The local model\n"
-            "    is small.\n"
-            "\n"
-            "QUERY CONSTRUCTION (for SEARCH):\n"
-            "  - 3-8 keywords, NOT a full sentence.\n"
-            "  - EXTRACT the user's actual nouns, numbers, and version tags\n"
-            "    from the sub-question. Do NOT paraphrase.\n"
-            "  - Drop filler words: 'what', 'is', 'the', 'a', 'how', '?'.\n"
+        )
+        # Format-examples block: composed from each Skill manifest's
+        # ``plan_example`` field. A Skill author teaches the PLAN-stage
+        # SLM the on-wire shape of their verb without anyone editing
+        # this file. Empty string when no Skill contributes — we then
+        # omit the section header rather than emit a stub.
+        examples_block = self._skill_registry.plan_examples_block(entries)
+        if examples_block:
+            system += (
+                "\n"
+                "Format examples (study the FORMAT only — these are abstract\n"
+                "patterns with placeholders, NOT topics to copy):\n"
+                f"{examples_block}\n"
+            )
+        # Verb-selection rules block: composed from each Skill manifest's
+        # ``plan_guidance`` field, with a meta-rule tail nudging the SLM
+        # away from over-picking ANSWER. Same omit-when-empty rule.
+        guidance_block = self._skill_registry.plan_guidance_block(entries)
+        if guidance_block:
+            system += (
+                "\n"
+                "VERB SELECTION RULES:\n"
+                f"{guidance_block}\n"
+            )
+        # Query construction is a property of any query-taking verb,
+        # not specific to SEARCH; rendered when at least one menu entry
+        # advertises a `<query>` placeholder. Kept verbatim from the
+        # prior hardcoded prompt because the rules (3-8 keywords,
+        # extract nouns, drop fillers) generalize across web/archive/
+        # MCP-style query verbs.
+        if any(e.has_query_arg for e in entries):
+            system += (
+                "\n"
+                "QUERY CONSTRUCTION (for verbs that take a query):\n"
+                "  - 3-8 keywords, NOT a full sentence.\n"
+                "  - EXTRACT the user's actual nouns, numbers, and version tags\n"
+                "    from the sub-question. Do NOT paraphrase.\n"
+                "  - Drop filler words: 'what', 'is', 'the', 'a', 'how', '?'.\n"
+            )
+        system += (
             "\n"
             f"Output limit: roughly {_MAX_PLAN_TOKENS} tokens. Output ONLY\n"
             "the Q-lines. Any other text will be rejected."
@@ -768,7 +792,7 @@ class CognitiveLoop:
         """
         t0 = time.perf_counter()
         skill_name = step.skill_name
-        if skill_name == "research":
+        if skill_name == self._web_search_skill:
             content, hits = await self._do_search(step.query or step.sub_q)
         elif skill_name == "recall":
             content, hits = await self._do_recall(step.sub_q)
@@ -869,13 +893,13 @@ class CognitiveLoop:
         dicts) is iterated here so the formatted block stays byte-identical
         to the legacy `- title (url)\n  snippet` shape the SLM expects.
         """
-        if not self._skill_registry.has("research"):
+        if not self._skill_registry.has(self._web_search_skill):
             return ("(no SearXNG configured)", 0)
         q = (query or "").strip()
         if not q:
             return ("(empty query)", 0)
         result = await self._skill_registry.invoke(
-            "research", self._skill_ctx, query=q, limit=5,
+            self._web_search_skill, self._skill_ctx, query=q, limit=5,
         )
         if not result.ok:
             log.warning(

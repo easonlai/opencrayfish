@@ -16,14 +16,29 @@ zero changes to the orchestrators.
 from __future__ import annotations
 
 from .base import CostTier, Skill, SkillContext, SkillResult
+from .discovery import SKILL_ENTRY_POINT_GROUP, discover_external_skills
+from .manifest import (
+    DEFAULT_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    WELL_KNOWN_CAPABILITIES,
+    SkillManifest,
+    resolve_manifest,
+)
 from .registry import SKILLS_AUDIT_FEED, PlanMenuEntry, SkillRegistry
 
 __all__ = [
     "CostTier",
+    "DEFAULT_PROTOCOL_VERSION",
     "PlanMenuEntry",
+    "SKILLS_AUDIT_FEED",
+    "SKILL_ENTRY_POINT_GROUP",
+    "SUPPORTED_PROTOCOL_VERSIONS",
     "Skill",
     "SkillContext",
-    "SkillResult",
+    "SkillManifest",
     "SkillRegistry",
-    "SKILLS_AUDIT_FEED",
+    "SkillResult",
+    "WELL_KNOWN_CAPABILITIES",
+    "discover_external_skills",
+    "resolve_manifest",
 ]

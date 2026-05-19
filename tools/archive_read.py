@@ -24,12 +24,40 @@ from pathlib import Path
 from typing import Any
 
 from .base import ToolResult
+from .manifest import ToolManifest
 
 log = logging.getLogger(__name__)
 
 
 class ArchiveRead:
     # --- Tool plugin contract (satisfies tools.base.Tool by shape) -----------
+    # Explicit manifest is the new source of truth (Tool Protocol v1).
+    # Legacy scattered attributes BELOW are preserved for back-compat.
+    manifest = ToolManifest(
+        name="archive_read",
+        description=(
+            "Keyword-overlap lookup over the agent's LTM (memory/archive.md). "
+            "Returns the top-N matching archive lines for a query."
+        ),
+        compat_version="tool-protocol/1",
+        args_schema={
+            "query": {
+                "type": "string",
+                "required": True,
+                "desc": "Free-form query. Terms ≤3 chars are ignored.",
+            },
+            "limit": {
+                "type": "int",
+                "required": False,
+                "default": 5,
+                "desc": "Maximum number of archive lines to return (1-20).",
+            },
+        },
+        side_effects=False,
+        requires_confirmation=False,
+        requires_caps=("filesystem.read",),
+    )
+
     name: str = "archive_read"
     description: str = (
         "Keyword-overlap lookup over the agent's LTM (memory/archive.md). "

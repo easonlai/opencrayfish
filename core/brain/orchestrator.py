@@ -241,6 +241,7 @@ class Brain:
         architect_name: str = "Architect",
         architect_honorific: str = "Boss",
         web_search_triage_enabled: bool = True,
+        web_search_skill: str = "research",
         ltm_short_circuit_enabled: bool = True,
         ltm_short_circuit_min_score: int = 2,
         reflection_enabled: bool = True,
@@ -276,6 +277,14 @@ class Brain:
         # the SLM provider. See ``core/brain/task_parsing.py``.
         self._task_parser = TaskIntentParser(provider=self._provider)
         self._triage_enabled = web_search_triage_enabled
+        # Configurable name of the registered Skill that satisfies
+        # Brain's web-triage fallback. Defaults to the in-tree
+        # "research" Skill; a third-party package can ship a
+        # replacement (e.g. "perplexity_research") and the operator
+        # points cfg.cognition.web_search_skill at it. Both call sites
+        # (``_maybe_web_search`` gating + ``_do_search`` dispatch)
+        # route through this name — no other hardcode.
+        self._web_search_skill = (web_search_skill or "research").strip() or "research"
         self._ltm_short_circuit_enabled = bool(ltm_short_circuit_enabled)
         self._ltm_short_circuit_min_score = max(1, int(ltm_short_circuit_min_score))
         self._reflection_enabled = bool(reflection_enabled)
@@ -1089,7 +1098,7 @@ class Brain:
         is bypassed — only an EXPLICIT user request will still trigger a
         search.
         """
-        if user_input is None or not self._skill_registry.has("research"):
+        if user_input is None or not self._skill_registry.has(self._web_search_skill):
             return ""
 
         text = user_input.strip()
@@ -1160,7 +1169,7 @@ class Brain:
         """
         search_t0 = time.perf_counter()
         result = await self._skill_registry.invoke(
-            "research", self._skill_ctx, query=query, limit=5,
+            self._web_search_skill, self._skill_ctx, query=query, limit=5,
         )
         search_ms = int((time.perf_counter() - search_t0) * 1000)
         if not result.ok:

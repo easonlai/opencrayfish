@@ -143,12 +143,33 @@ class _OllamaCompatibleBackend:
 class HailoOllamaBackend(_OllamaCompatibleBackend):
     """NPU-accelerated path: Hailo-Ollama REST service on the Pi 5 AI HAT+."""
 
+    # Plug-in manifest \u2014 read by the discovery layer + future
+    # registry. Declares the NPU + outbound-network capabilities so
+    # operators auditing capability tokens see the full picture.
+    from core.provider_manifest import BackendManifest as _BM
+    manifest = _BM(
+        name="hailo-ollama-npu",
+        description="NPU-accelerated Ollama-compatible backend "
+                    "(Pi 5 AI HAT+ / Hailo).",
+        requires_caps=("network.outbound", "npu"),
+    )
+    del _BM
+
     def __init__(self, base_url: str, model: str) -> None:
         super().__init__(name="hailo-ollama-npu", base_url=base_url, model=model)
 
 
 class OllamaBackend(_OllamaCompatibleBackend):
     """CPU fallback: upstream Ollama daemon on `hardware.cpu_fallback_url`."""
+
+    # Plug-in manifest \u2014 see HailoOllamaBackend above.
+    from core.provider_manifest import BackendManifest as _BM
+    manifest = _BM(
+        name="ollama-cpu",
+        description="CPU Ollama backend (upstream daemon).",
+        requires_caps=("network.outbound",),
+    )
+    del _BM
 
     def __init__(self, base_url: str, model: str) -> None:
         super().__init__(name="ollama-cpu", base_url=base_url, model=model)
@@ -276,13 +297,52 @@ class Provider:
         )
 
     @classmethod
-    def from_config(cls, hardware_cfg: Any) -> Provider:
-        fallback = OllamaBackend(
-            base_url=hardware_cfg.cpu_fallback_url,
-            model=hardware_cfg.cpu_fallback_model,
-        )
-        if hardware_cfg.npu_acceleration:
-            primary: _Backend = HailoOllamaBackend(
+    def from_config(
+        cls,
+        hardware_cfg: Any,
+        *,
+        discovered_backends: list[tuple[Any, Any]] | None = None,
+    ) -> Provider:
+        """Build a Provider, optionally routing third-party backends.
+
+        ``discovered_backends`` is the list returned by
+        ``core.provider_manifest.discover_external_backends()`` —
+        ``[(manifest, instance), ...]``. When ``hardware_cfg.primary_backend``
+        or ``hardware_cfg.fallback_backend`` names one of those manifests,
+        that instance takes the slot instead of the built-in Pi 5 backend.
+        Fail-loud on unknown names so a typo can't silently degrade to CPU.
+        """
+        by_name: dict[str, Any] = {}
+        if discovered_backends:
+            for manifest, instance in discovered_backends:
+                by_name[manifest.name] = instance
+
+        primary_override = getattr(hardware_cfg, "primary_backend", None)
+        fallback_override = getattr(hardware_cfg, "fallback_backend", None)
+
+        if primary_override and primary_override not in by_name:
+            raise ValueError(
+                f"hardware.primary_backend={primary_override!r} is not a "
+                f"discovered backend. Available: {sorted(by_name) or 'none'}."
+            )
+        if fallback_override and fallback_override not in by_name:
+            raise ValueError(
+                f"hardware.fallback_backend={fallback_override!r} is not a "
+                f"discovered backend. Available: {sorted(by_name) or 'none'}."
+            )
+
+        if fallback_override:
+            fallback: _Backend = by_name[fallback_override]
+        else:
+            fallback = OllamaBackend(
+                base_url=hardware_cfg.cpu_fallback_url,
+                model=hardware_cfg.cpu_fallback_model,
+            )
+
+        if primary_override:
+            primary: _Backend = by_name[primary_override]
+        elif hardware_cfg.npu_acceleration:
+            primary = HailoOllamaBackend(
                 base_url=hardware_cfg.hailo_ollama_url,
                 model=hardware_cfg.hailo_model,
             )
