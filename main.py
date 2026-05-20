@@ -51,7 +51,13 @@ from core.skills.research import ResearchSkill
 from core.skills.self_reflect import SelfReflectSkill
 from core.soul_handler import SoulHandler
 from core.stm import ShortTermMemory
-from tools import ToolContext, discover_dropin_tools, discover_external_tools
+from tools import (
+    McpBridge,
+    ToolContext,
+    discover_dropin_tools,
+    discover_external_tools,
+    make_mcp_bridge,
+)
 from tools.archive_read import ArchiveRead
 from tools.registry import ToolRegistry
 from tools.searxng import SearXNG
@@ -347,6 +353,28 @@ async def amain() -> None:
             "TOOL Discovered %d drop-in tool(s) via plugins/tools/: %s",
             len(dropin_tools), ", ".join(dropin_tools),
         )
+
+    # MCP bridge — connect to every server listed in
+    # cfg.plugins.mcp_bridge.servers, list its tools, and register
+    # each as an OpenCrayFish Tool under the name
+    # ``mcp__<prefix>__<remote>``. Per-server failures are logged and
+    # isolated by McpBridge.connect_all so a single unreachable MCP
+    # server only loses ITS tools — the rest of the agent still
+    # boots. Returns ``None`` when no servers are configured.
+    # Runs BEFORE bootstrap_validate so the cross-validator sees the
+    # dynamically-registered MCP tools alongside pip/drop-in ones.
+    mcp_bridge: McpBridge | None = make_mcp_bridge(cfg.plugins)
+    if mcp_bridge is not None:
+        registered = await mcp_bridge.connect_all(tool_registry)
+        if registered:
+            log.info(
+                "MCP bridge: registered %d remote tool(s): %s",
+                len(registered), ", ".join(registered),
+            )
+        else:
+            log.info(
+                "MCP bridge: no remote tools registered (check server logs)",
+            )
 
     # Fail-loud cross-validation of every registered Tool: protocol
     # version, declared cfg.plugins.<key> namespace presence, and
@@ -738,6 +766,14 @@ async def amain() -> None:
         # skills → tools.
         await brain.aclose()
         await skill_registry.aclose_all()
+        # MCP bridge owns the long-lived Streamable HTTP sessions
+        # shared by every registered McpRemoteTool. Close it BEFORE
+        # the tool registry so the registry's per-tool aclose (a
+        # no-op for MCP tools) runs against an already-closed
+        # transport rather than racing it. Safe to call when no
+        # bridge was configured (None branch).
+        if mcp_bridge is not None:
+            await mcp_bridge.aclose()
         # Tool registry owns the SearXNG client lifecycle now — closing
         # via the registry isolates per-tool failures and will close any
         # additional tools registered in the future without touching this

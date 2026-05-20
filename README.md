@@ -11,8 +11,6 @@
 [![Code of Conduct](https://img.shields.io/badge/code%20of%20conduct-Contributor%20Covenant%202.1-blueviolet.svg)](CODE_OF_CONDUCT.md)
 [![Platform: Raspberry Pi 5](https://img.shields.io/badge/platform-Raspberry%20Pi%205%20%2B%20AI%20HAT%2B%202-c51a4a.svg)](https://www.raspberrypi.com/news/introducing-the-raspberry-pi-ai-hat-plus-2-generative-ai-on-raspberry-pi-5/)
 
-> 🌐 **Language / 語言**: English (this document) · [繁體中文 (Traditional Chinese)](README_CHT.md)
-
 ---
 
 ## Table of Contents
@@ -58,6 +56,7 @@
     - [Hello-World Tool — Step by Step (`bind_context`)](#hello-world-tool--step-by-step-bind_context)
     - [Argspec Runtime Validation](#argspec-runtime-validation)
     - [Plugin Config Namespace (`cfg.plugins.*`)](#plugin-config-namespace-cfgplugins)
+    - [MCP Bridge — Remote Model Context Protocol Tools](#mcp-bridge--remote-model-context-protocol-tools)
     - [The `ConnectorManifest` Contract](#the-connectormanifest-contract)
     - [Third-Party Connector Packages (`pip install`)](#third-party-connector-packages-pip-install)
     - [Provider Backends — `BackendManifest` & Discovery](#provider-backends--backendmanifest--discovery)
@@ -646,7 +645,8 @@ OpenCrayFish/
 │   ├── base.py               ← Tool plugin contract
 │   ├── registry.py           ← named tool registry
 │   ├── searxng.py            ← self-hosted web search (SearXNG client)
-│   └── archive_read.py       ← long-term memory keyword reader
+│   ├── archive_read.py       ← long-term memory keyword reader
+│   └── mcp_bridge.py         ← MCP client bridge (remote MCP servers → Tools)
 │
 ├── connectors/               ← external I/O channels
 │   ├── telegram.py           ← Telegram Bot API connector
@@ -2093,6 +2093,48 @@ async def execute(self, ctx: SkillContext, **kwargs) -> SkillResult:
 
 This is the only edit a third-party plugin needs to take configuration: declare `config_key` in your manifest (optional but recommended for bootstrap-time validation), and read from `ctx.plugins_config[key]` at call time. **No edits to `core/config.py`, no edits to `main.py`, no fork of OpenCrayFish.**
 
+#### MCP Bridge — Remote Model Context Protocol Tools
+
+OpenCrayFish ships a built-in **MCP client bridge** ([`tools/mcp_bridge.py`](tools/mcp_bridge.py)) that connects to any remote [Model Context Protocol](https://modelcontextprotocol.io/) server and exposes each upstream tool as a first-class OpenCrayFish Tool — individually named, individually described, individually callable by Skills and the PLAN dispatcher.
+
+**How it works:**
+
+1. The operator lists one or more MCP servers under `cfg.plugins.mcp_bridge.servers` in `config.yaml`.
+2. At boot, `make_mcp_bridge()` parses the config and returns an `McpBridge` instance.
+3. `McpBridge.connect_all(tool_registry)` opens a persistent [Streamable HTTP](https://spec.modelcontextprotocol.io/specification/basic/transports/#streamable-http) session per server, calls `list_tools()`, and registers one `McpRemoteTool` per upstream tool into the `ToolRegistry`.
+4. Each registered tool has the name `mcp__<prefix>__<upstream_name>` (e.g. `mcp__mslearn__microsoft_docs_search`) and a full `ToolManifest` with `args_schema` translated from the upstream JSON Schema, `side_effects=True` (conservative), and `requires_caps=("network.outbound",)`.
+5. Skills call these tools the same way they call any other Tool — `await ctx.tools.call("mcp__mslearn__microsoft_docs_search", question="...")`. The bridge forwards the call to the remote server and wraps the response into a `ToolResult`.
+6. On shutdown, `McpBridge.aclose()` releases all Streamable HTTP sessions cleanly.
+
+**Configuration example** (`config.yaml`):
+
+```yaml
+plugins:
+  mcp_bridge:
+    servers:
+      - name: mslearn
+        url: "https://learn.microsoft.com/api/mcp"
+        # tool_prefix: mslearn       # optional, defaults to name
+        # timeout_seconds: 30         # optional, per-server
+        # headers:                    # optional, e.g. for auth
+        #   Authorization: "Bearer ${MCP_TOKEN}"
+```
+
+Multiple servers are supported — each gets its own session and prefix namespace. Per-server failures are isolated: if one server is unreachable, the others still register normally.
+
+**Design decisions:**
+
+- **One Tool per upstream tool** (not one bridge Tool with a `tool=` arg) — so the SLM PLAN menu sees concrete, individually-described capabilities.
+- **Lazy `mcp` import** — the `mcp` SDK is only imported when `cfg.plugins.mcp_bridge` is configured. Operators who never use MCP are unaffected if the SDK is not installed.
+- **`side_effects=True` for all MCP tools** — conservative default because MCP's per-tool `annotations.destructive_hint` / `read_only_hint` are optional and rarely populated.
+- **`AsyncExitStack` for session reuse** — sessions stay open for the agent's entire lifecycle, avoiding per-call connection overhead.
+
+**Dependency:** `mcp>=1.27.0` (listed in `requirements.txt` and `pyproject.toml`). Install via `pip install "mcp>=1.27.0"`. The import is lazy — missing SDK is a no-op when no MCP servers are configured.
+
+**Worked example (Microsoft Learn MCP Server):**
+
+The [Microsoft Learn MCP server](https://learn.microsoft.com/en-us/training/support/mcp) (`https://learn.microsoft.com/api/mcp`) requires no authentication and exposes three tools: `microsoft_docs_search`, `microsoft_code_sample_search`, and `microsoft_docs_fetch`. With the config above, OpenCrayFish registers them as `mcp__mslearn__microsoft_docs_search`, `mcp__mslearn__microsoft_code_sample_search`, and `mcp__mslearn__microsoft_docs_fetch`.
+
 #### The `ConnectorManifest` Contract
 
 Connectors are the agent's I/O surface — Telegram, Web Chat, and any third-party transport (Discord, Matrix, MQTT, voice loops, webhooks, …). They are the **third layer** in the plug-in stack and follow the same Manifest + Registry + Discovery pattern as Skills and Tools.
@@ -2625,7 +2667,8 @@ The current codebase is **v3.0**: every subsystem in this README is implemented,
 
 The natural next directions:
 
-- **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs), `mcp_bridge` (turn any MCP server into a Skill).
+- ~~**MCP bridge**~~ — **shipped in v3.0** ([`tools/mcp_bridge.py`](tools/mcp_bridge.py)). Any remote MCP server configured under `cfg.plugins.mcp_bridge.servers` is auto-registered as first-class Tools. See [§ MCP Bridge](#mcp-bridge--remote-model-context-protocol-tools).
+- **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs).
 - **GPIO / I²C sensor library** — temperature/humidity (BME680), motion (PIR), light (TSL2591), gas (CCS811/MQ-2), heart rate (MAX30102), motion (MPU6050) feeding straight into `VitalSigns` and `MoodTuning`.
 - **Local vision** — small VLM on the NPU + CSI camera, exposed as a `see` Skill.
 - **Local voice** — Whisper.cpp for in + Piper TTS for out, registered as bidirectional connectors.

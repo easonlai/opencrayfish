@@ -225,3 +225,31 @@ skills:
   # enabled:
   #   self_reflect: false
   #   research: true
+
+plugins:
+  # Plug-in configuration namespace. Each top-level key matches a
+  # plug-in's ``manifest.config_key`` and the sub-dict is forwarded
+  # verbatim to that plug-in via ``ToolContext.plugins_config`` /
+  # ``SkillContext.plugins_config``. The core never reads inside
+  # these blocks — add as many as your plug-ins need.
+  #
+  # `mcp_bridge` connects to one or more remote Model Context Protocol
+  # servers (https://modelcontextprotocol.io) over Streamable HTTP and
+  # registers every advertised upstream tool as a first-class
+  # OpenCrayFish Tool. Tool names are formed as
+  # `mcp__<prefix>__<remote_tool>` so the Cognitive Loop's PLAN menu
+  # and the dashboard see them like any in-tree Tool.
+  #
+  # The example below talks to the public Microsoft Learn MCP server
+  # (no authentication required). Remove the entry or set
+  # `servers: []` to disable the bridge entirely — the rest of the
+  # agent is unaffected.
+  mcp_bridge:
+    servers:
+      - name: mslearn
+        url: https://learn.microsoft.com/api/mcp
+        # Optional knobs (defaults shown):
+        # transport: streamable_http   # only one supported today
+        # tool_prefix: mslearn         # overrides the registered-name prefix
+        # timeout_seconds: 30
+        # headers: { Authorization: "Bearer <token>" }

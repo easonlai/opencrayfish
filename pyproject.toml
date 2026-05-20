@@ -45,6 +45,7 @@ dependencies = [
     "aiohttp>=3.9.0",      # connectors/web_chat.py in-process REST bridge
     "python-telegram-bot>=21.0",  # connectors/telegram.py
     "streamlit>=1.32.0",   # ui/dashboard.py + ui/web_chat.py
+    "mcp>=1.27.0",         # tools/mcp_bridge.py (Model Context Protocol client)
 ]
 
 # Dev-only extras. Installed by CI and by contributors but NEVER required

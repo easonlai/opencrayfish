@@ -4,6 +4,12 @@ psutil>=5.9.8
 httpx>=0.27.0
 python-telegram-bot>=21.0
 streamlit>=1.32.0
+# Model Context Protocol client SDK — powers tools/mcp_bridge.py. Optional
+# at runtime: the bridge lazy-imports it and falls back to a no-op when
+# `cfg.plugins.mcp_bridge` is not configured, so a Pi 5 deployment that
+# doesn't talk to any MCP server can skip this dependency without
+# touching the rest of the agent.
+mcp>=1.27.0
 # NPU access is via the hailo-ollama REST service (port 8000) — pure HTTP, no
 # native bindings required on the application side. hailo-ollama itself must
 # be installed/running on the Raspberry Pi 5 with the Raspberry Pi AI HAT+ 2
