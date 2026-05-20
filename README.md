@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-1f8a4f.svg)](#roadmap)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/downloads/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Code of Conduct](https://img.shields.io/badge/code%20of%20conduct-Contributor%20Covenant%202.1-blueviolet.svg)](CODE_OF_CONDUCT.md)
 [![Platform: Raspberry Pi 5](https://img.shields.io/badge/platform-Raspberry%20Pi%205%20%2B%20AI%20HAT%2B%202-c51a4a.svg)](https://www.raspberrypi.com/news/introducing-the-raspberry-pi-ai-hat-plus-2-generative-ai-on-raspberry-pi-5/)
@@ -73,6 +73,9 @@
 - [Operational Commands](#operational-commands)
 - [Development Notes](#development-notes)
 - [Roadmap](#roadmap)
+  - [Short-Term (v3.1 — Foundation Hardening)](#short-term-v31--foundation-hardening)
+  - [Medium-Term (v3.2–v3.3 — Sensory Expansion)](#medium-term-v32v33--sensory-expansion)
+  - [Long-Term (v4.0+ — Evolutionary Leap)](#long-term-v40--evolutionary-leap)
 - [Community & Contributing](#community--contributing)
 - [License & Attribution](#license--attribution)
 
@@ -584,11 +587,12 @@ OpenCrayFish also runs fine on **any Linux/macOS dev box** for development — w
 
 ### Software dependencies (`requirements.txt`)
 
-- Python **3.11+** (developed on 3.13)
+- Python **3.13+** (the runtime target — `pyproject.toml` requires `>=3.13` because `soul_handler.py` relies on `os.replace` fsync guarantees tightened in 3.13, and the AI HAT+ 2 Pi 5 image ships 3.13)
 - `PyYAML`, `psutil`, `httpx`
 - `python-telegram-bot` (Telegram connector)
 - `streamlit` (dashboard + browser chat UI)
-- `aiohttp` (web-chat HTTP bridge — already brought in as a transitive dep)
+- `aiohttp` (web-chat HTTP bridge)
+- `mcp` (Model Context Protocol client SDK — powers `tools/mcp_bridge.py`; lazy-imported, so deployments that don't use MCP can skip it)
 
 External services on the device:
 
@@ -606,7 +610,9 @@ OpenCrayFish/
 ├── soul.md                   ← the agent's constitution + dynamic growth
 ├── config.yaml               ← every tunable knob in the system (gitignored — holds secrets)
 ├── config_sample.yaml        ← committed template; `cp` it to config.yaml and fill in your keys
-├── requirements.txt
+├── pyproject.toml            ← canonical dependency list, entry-points, dev extras
+├── requirements.txt          ← convenience copy of runtime deps for Pi 5 operators
+├── conftest.py               ← shared pytest fixtures (async event loop, tmp paths)
 ├── main.py                   ← wires every subsystem and starts the loops
 │
 ├── core/                     ← all the cognitive/biological subsystems
@@ -617,6 +623,7 @@ OpenCrayFish/
 │   ├── empathy.py            ← user sentiment + urgency analyzer
 │   ├── positive_filter.py    ← Pillar 2 hard output filter
 │   ├── provider.py           ← Ollama/Hailo backends + circuit breaker
+│   ├── provider_manifest.py  ← BackendManifest + SUPPORTED_BACKEND_PROTOCOL_VERSIONS
 │   ├── stm.py                ← short-term memory (RAM + journal)
 │   ├── cognition.py          ← THINK → PLAN → ACT → REFINE loop (dispatches via SkillRegistry)
 │   ├── brain/                ← prompt-assembly + orchestration package
@@ -630,9 +637,13 @@ OpenCrayFish/
 │   ├── dropin.py             ← shared drop-in folder loader (plugins/<surface>/ → PLUGIN / PLUGINS)
 │   ├── heartbeat.py          ← pulse_loop + metabolism + proactive_thought
 │   ├── scheduler.py          ← recurring research-task scheduler
+│   ├── cli.py                ← `opencrayfish` CLI (skill/tool/connector/backend scaffolding + validation)
 │   └── skills/               ← capability layer above Tools (pluggable Skills)
 │       ├── base.py           ← Skill protocol + SkillContext + SkillResult
+│       ├── manifest.py       ← SkillManifest + SUPPORTED_PROTOCOL_VERSIONS
 │       ├── registry.py       ← SkillRegistry + dynamic PLAN menu + audit feed
+│       ├── discovery.py      ← entry-point + drop-in Skill discovery
+│       ├── argspec.py        ← runtime arg-schema validation + type coercion
 │       ├── identity.py       ← soul-templated identity replies (free, no-net)
 │       ├── recall.py         ← LTM keyword retrieval (cheap, no-net)
 │       ├── direct_answer.py  ← SLM-only answer (cheap, no-net)
@@ -643,18 +654,66 @@ OpenCrayFish/
 │
 ├── tools/                    ← low-level I/O primitives (called BY Skills)
 │   ├── base.py               ← Tool plugin contract
-│   ├── registry.py           ← named tool registry
+│   ├── manifest.py           ← ToolManifest + SUPPORTED_TOOL_PROTOCOL_VERSIONS
+│   ├── registry.py           ← named tool registry + bind_context + audit
+│   ├── discovery.py          ← entry-point + drop-in Tool discovery
 │   ├── searxng.py            ← self-hosted web search (SearXNG client)
 │   ├── archive_read.py       ← long-term memory keyword reader
 │   └── mcp_bridge.py         ← MCP client bridge (remote MCP servers → Tools)
 │
 ├── connectors/               ← external I/O channels
+│   ├── manifest.py           ← ConnectorManifest + SUPPORTED_CONNECTOR_PROTOCOL_VERSIONS
+│   ├── registry.py           ← ConnectorRegistry + lifecycle + bootstrap_validate
+│   ├── discovery.py          ← entry-point + drop-in Connector discovery
 │   ├── telegram.py           ← Telegram Bot API connector
 │   └── web_chat.py           ← in-process aiohttp HTTP bridge for Streamlit
 │
 ├── ui/                       ← Streamlit apps
 │   ├── dashboard.py          ← live vital signs + proactive feed + tools
-│   └── web_chat.py           ← browser-based chat UI for the live agent
+│   ├── web_chat.py           ← browser-based chat UI for the live agent
+│   └── panels/               ← dashboard sub-panels (header, vitals, mood, skills, tools,
+│       ├── header.py             reflection, deliberation, tasks, proactive, footer)
+│       ├── vitals.py
+│       ├── mood.py
+│       ├── skills.py
+│       ├── tools.py
+│       ├── reflection.py
+│       ├── deliberation.py
+│       ├── tasks.py
+│       ├── proactive.py
+│       └── footer.py
+│
+├── examples/                 ← reference third-party plug-in packages
+│   └── opencrayfish-skill-echo/  ← canonical hello-world Skill (pip-installable, with tests)
+│
+├── scripts/                  ← standalone smoke-test + diagnostic runners
+│   ├── smoke_cognition_dispatch.py
+│   ├── smoke_dashboard_rotation.py
+│   ├── smoke_foreground_priority.py
+│   ├── smoke_mcp_bridge.py
+│   ├── smoke_rotation_reflection_identity.py
+│   ├── smoke_skill_menu.py
+│   └── smoke_soul_atomic.py
+│
+├── tests/                    ← pytest suite (≈240 tests incl. parametrize expansions)
+│   ├── test_argspec.py
+│   ├── test_cli.py
+│   ├── test_connector_registry.py
+│   ├── test_dropin_discovery.py
+│   ├── test_example_echo_integration.py
+│   ├── test_intent_router.py
+│   ├── test_jsonl_writer_schema.py
+│   ├── test_mcp_bridge.py
+│   ├── test_positive_filter.py
+│   ├── test_prompt_assembly.py
+│   ├── test_provider_backend_routing.py
+│   ├── test_provider_manifest.py
+│   ├── test_skill_context.py
+│   ├── test_skill_discovery.py
+│   ├── test_skill_protocol_surface_v1.py
+│   ├── test_stm_rotation.py
+│   ├── test_task_parsing.py
+│   └── test_tool_context.py
 │
 ├── plugins/                  ← OPTIONAL drop-in folder for local/private plug-ins (gitignored by convention)
 │   ├── skills/               ← each `*.py` (or sub-package) declares `PLUGIN = MySkill` or `PLUGINS = [...]`
@@ -720,7 +779,7 @@ streamlit run ui/web_chat.py --server.port 8502
 
 # 7. (Optional) Run the test suite
 pip install -e ".[dev]"                    # adds pytest + pytest-asyncio + ruff
-python -m pytest -q                        # 239 tests, runs in <2s
+python -m pytest -q                        # ~240 tests, runs in <2s
 ```
 
 Now talk to it on Telegram or in the browser. The agent will reply, remember, decay its mood, get curious during idle time, and once the clock crosses 02:00, it will sleep and consolidate the day.
@@ -2654,7 +2713,7 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 ## Roadmap
 
-The current codebase is **v3.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (239 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean.
+The current codebase is **v3.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (≈240 tests today including parametrize expansions) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean.
 
 **The framework surface** (what plug-in authors build against):
 
@@ -2665,17 +2724,47 @@ The current codebase is **v3.0**: every subsystem in this README is implemented,
 - **Operator-configurable web-search Skill** — `cfg.cognition.web_search_skill` (default `"research"`) decides which Skill the Brain's web triage + the Cognitive Loop's `SEARCH` verb + the REFINE gap closure dispatch to. A third-party `perplexity_research` (or similar) replacement drops in without core edits.
 - **Tested protocol surface** — `tests/test_skill_protocol_surface_v1.py` + the four `SUPPORTED_*_PROTOCOL_VERSIONS` constants are snapshot-frozen. Any breaking edit to a published `*Manifest` / `*Context` / `*Result` either restores the surface or deliberately bumps the protocol version with a migration note in [§ Protocol Surface Stability](#protocol-surface-stability).
 
-The natural next directions:
+### Short-Term (v3.1 — Foundation Hardening)
 
-- ~~**MCP bridge**~~ — **shipped in v3.0** ([`tools/mcp_bridge.py`](tools/mcp_bridge.py)). Any remote MCP server configured under `cfg.plugins.mcp_bridge.servers` is auto-registered as first-class Tools. See [§ MCP Bridge](#mcp-bridge--remote-model-context-protocol-tools).
-- **More built-in Skills** — `home_control` (Home Assistant), `calendar` (CalDAV), `local_rag` (FAISS over user docs).
-- **GPIO / I²C sensor library** — temperature/humidity (BME680), motion (PIR), light (TSL2591), gas (CCS811/MQ-2), heart rate (MAX30102), motion (MPU6050) feeding straight into `VitalSigns` and `MoodTuning`.
-- **Local vision** — small VLM on the NPU + CSI camera, exposed as a `see` Skill.
-- **Local voice** — Whisper.cpp for in + Piper TTS for out, registered as bidirectional connectors.
-- **Output actuators** — WS2812 LED strip for mood visualization, OLED for facial expression, servos for embodied motion — these are `side_effects=True, requires_confirmation=False` Skills with policy.
-- **Sleep-time soul evolution** — SLM critique pass that proposes (but cannot apply) Soul mutations for the Architect to approve, replacing the current rule-based `_consolidate_reflections`.
-- **Encrypted state at rest** — for deployments in regulated environments (clinical, legal, financial).
-- **Pytest suite expansion** — coverage gaps worth filling: `Emotions` decay/nudge math, `CognitiveLoop` THINK/PLAN/REFINE parsing edge cases, `SkillRegistry.plan_menu` filtering under stressed vitals + offline brain, and `Provider`'s circuit-breaker trip / half-open / recover lifecycle. See [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue).
+Immediate priorities that harden operational reliability and developer experience without changing the architecture.
+
+| Initiative | Impact | Effort |
+|---|---|---|
+| **CI/CD pipeline** — GitHub Actions workflow: `pytest -q` + `ruff check` + `ruff format --check` on every PR. Badge in README. | Catches regressions before merge; unblocks external contributors. | Low |
+| **Docker Compose for the local stack** — single `docker compose up` that brings up Ollama (CPU) + SearXNG + the agent + the dashboard. Dev-box onboarding drops from "read 3 sections" to one command. | Dramatically lowers barrier to entry for contributors. | Low |
+| **Systemd unit files** — `opencrayfish.service` + `opencrayfish-dashboard.service` templates for the Pi 5 reference deployment. `WatchdogSec=` ties into the heartbeat's existing pulse. | Production-grade supervisor for 24/7 edge deployment. | Low |
+| **Pytest suite expansion** — fill the acknowledged coverage gaps: `Emotions` decay/nudge math, `CognitiveLoop` THINK/PLAN/REFINE parsing edge cases, `SkillRegistry.plan_menu` under stressed vitals + offline brain, `Provider` circuit-breaker trip / half-open / recover lifecycle. | Higher confidence in refactoring; unblocks community PRs. | Medium |
+| **Conversation summarization before STM eviction** — when the deque is full and the oldest turn is about to be silently dropped, run a lightweight SLM summary of it and keep the compressed version in a "fading context" slot. Keeps the SLM aware of earlier topic threads without breaking the 12-turn window. | Addresses the biggest quality gap: multi-turn coherence drops sharply after 12 exchanges. | Medium |
+| **Token-aware context management** — replace the fixed 12-turn `maxlen` with a token counter that dynamically fits as many turns as possible into the SLM's effective attention window. Older turns get summarized or trimmed first. | Better utilization of the 4K context; avoids wasting context on short turns and truncating long ones. | Medium |
+
+### Medium-Term (v3.2–v3.3 — Sensory Expansion)
+
+Expand the agent's perceptual and communicative reach while keeping the edge-native / offline mandate.
+
+| Initiative | Impact | Effort |
+|---|---|---|
+| **Local RAG** — FAISS or ChromaDB vector index over user-provided documents (`memory/docs/`). Exposed as a `local_rag` Tool; the existing `recall` Skill composes it alongside `archive_read` for a hybrid keyword + semantic retrieval path. | Transforms recall quality from keyword-matching to semantic; enables the agent to serve as a knowledge base over PDFs, notes, code. | Medium |
+| **GPIO / I²C sensor library** — BME680 (temp/humidity/air quality), PIR (motion), TSL2591 (light), CCS811 (gas). Each sensor registers as a Tool; readings feed into `VitalSigns` + `MoodTuning` so the agent literally *feels* the room. | Fulfills the "embodied AI" promise — the agent's mood shifts when the room gets hot or someone walks in. | Medium |
+| **Voice connector** — Whisper.cpp for STT + Piper TTS for out, registered as a bidirectional Connector. Wake-word detection via openWakeWord. All local, no cloud. | Natural interaction for hands-free / accessibility scenarios. Makes the Pi 5 feel like a real companion. | High |
+| **Multi-language EmpathyEngine** — expand the sentiment/urgency lexicon beyond English + Chinese. Japanese, Korean, Spanish, French, German, Hindi, Arabic. Community-contributed YAML lexicon files loaded at boot. | Broadens the user base without changing the heuristic engine architecture. | Low |
+| **Home automation Skills** — `home_control` (Home Assistant REST API), `calendar` (CalDAV read/write). Both wrap third-party Tools and register as PLAN verbs. | The most-requested integration: "turn off the lights", "what's on my calendar tomorrow". | Medium |
+| **Structured JSON logging** — replace the current `logging.info("CHAT ...")` convention with structured JSON log records. The dashboard and `agent.log` still work (the dashboard parses the JSON); but external log aggregators (Loki, Fluent Bit) can now ingest without regex. | Better observability for multi-device fleets. | Low |
+| **A2A (Agent-to-Agent) protocol** — implement the [Google A2A protocol](https://google.github.io/A2A/) as a Connector, allowing OpenCrayFish instances (or heterogeneous agents) to discover, negotiate capabilities, and delegate sub-tasks to each other. | Enables multi-agent collaboration: a fleet of Pi-based agents each with different sensors/skills can federate work. | High |
+
+### Long-Term (v4.0+ — Evolutionary Leap)
+
+Structural changes that may touch the core architecture. Each is a standalone initiative that can be pursued independently.
+
+| Initiative | Impact | Effort |
+|---|---|---|
+| **Local vision** — small VLM (e.g. moondream, LLaVA-Phi) on the NPU + CSI camera, exposed as a `see` Skill. The SLM can ask "what do you see?" and fold visual context into reasoning. | Gives the agent eyes — visual question answering, scene description, object detection, all on-device. | High |
+| **Output actuators** — WS2812 LED strip for mood visualization, SSD1306 OLED for facial expression, micro-servos for embodied motion. Each is a `side_effects=True` Skill with policy. | Physical embodiment — the agent's emotional state becomes visible in the room. | Medium |
+| **Sleep-time soul evolution** — replace the rule-based `_consolidate_reflections()` with an SLM critique pass that *proposes* Soul mutations for the Architect to approve (a PR-like diff shown in the dashboard). The agent grows, but the human retains veto. | Currently, reflection consolidation is keyword-frequency-based. An SLM-driven version could surface deeper behavioral patterns and propose nuanced identity evolution. | Medium |
+| **Encrypted state at rest** — AES-256-GCM encryption for all `state/` and `memory/` files, key derived from an operator passphrase entered at boot. For regulated environments (clinical, legal, financial). | Data sovereignty with defense-in-depth. The Pi is already offline, but physical theft shouldn't leak conversation history. | Medium |
+| **Model hot-swap** — allow the operator to switch SLM models (e.g. qwen2.5 → phi-3-mini) at runtime via a dashboard control or config reload, without restarting the agent. Requires Provider abstraction to negotiate different tokenizer windows. | Lets operators experiment with new models without downtime. | Medium |
+| **Web UI for configuration** — a dashboard panel (or standalone Streamlit page) that reads/writes `config.yaml` with validation, live preview, and a diff view. Replaces `$EDITOR config.yaml` for non-technical operators. | Lowers the barrier for non-developer Architects who want to tune behavior. | Medium |
+| **Plugin marketplace / registry** — a curated list (GitHub-hosted JSON index) of community Skills, Tools, Connectors, and Backends with one-click `pip install` from the dashboard. | Ecosystem growth — makes it trivial to discover and install community extensions. | High |
+| **Federated learning** — optional opt-in for multiple OpenCrayFish instances to share anonymized `LEARNED_PREFERENCES` and `EMOTIONAL_EVOLUTION` entries via a lightweight sync protocol. Each instance stays sovereign; shared knowledge is additive. | Collective intelligence across a fleet of edge agents, each with different Architects and sensor suites. | Very High |
 
 ---
 
@@ -2699,7 +2788,7 @@ OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passi
 
 Look for the [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue) label. Concrete areas where help is especially appreciated:
 
-- **Pytest suite expansion** — the `tests/` directory ships with 239 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, tool context, provider backend routing, drop-in discovery, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
+- **Pytest suite expansion** — the `tests/` directory ships with ≈240 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, tool context, provider backend routing, drop-in discovery, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
 - **Hardware port reports** — try OpenCrayFish on a Pi 4, an Orange Pi, a Jetson Nano, or an x86 mini-PC and file an Issue tagged `hardware-port` with your `state/vitals.json` and notable latency numbers.
 - **New `Tool` plugins** — implement the `Tool` protocol from [tools/base.py](tools/base.py) for local file ops, GPIO control, sensor reads, MCP servers, etc.
 - **New `Connector`s** — Discord, Slack, Matrix, IRC, MCP server. Use [connectors/web_chat.py](connectors/web_chat.py) as a template.

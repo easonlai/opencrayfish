@@ -338,7 +338,7 @@ class McpRemoteTool:
     def __init__(
         self,
         *,
-        bridge: "McpBridge",
+        bridge: McpBridge,
         server_name: str,
         remote_name: str,
         registered_name: str,

@@ -27,7 +27,6 @@ import sys
 
 from tools import ToolRegistry, make_mcp_bridge
 
-
 PLUGINS_CFG = {
     "mcp_bridge": {
         "servers": [

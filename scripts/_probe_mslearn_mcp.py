@@ -10,7 +10,6 @@ import json
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-
 URL = "https://learn.microsoft.com/api/mcp"
 
 
