@@ -12,6 +12,7 @@ entry-points loader.
 
 from .discovery import (
     CONNECTOR_ENTRY_POINT_GROUP,
+    discover_dropin_connectors,
     discover_external_connectors,
 )
 from .manifest import (
@@ -30,6 +31,7 @@ __all__ = [
     "DEFAULT_CONNECTOR_PROTOCOL_VERSION",
     "SUPPORTED_CONNECTOR_PROTOCOL_VERSIONS",
     "WELL_KNOWN_CONNECTOR_CAPABILITIES",
+    "discover_dropin_connectors",
     "discover_external_connectors",
     "resolve_connector_manifest",
 ]

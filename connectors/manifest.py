@@ -68,7 +68,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # Connector Protocol revisions the running core knows how to host.
 # Bump this set AND add a migration note in CONTRIBUTING.md whenever
 # a breaking change ships in the Connector surface. Convention mirrors

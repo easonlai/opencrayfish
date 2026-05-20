@@ -13,7 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
-from connectors import ConnectorRegistry, discover_external_connectors
+from connectors import (
+    ConnectorRegistry,
+    discover_dropin_connectors,
+    discover_external_connectors,
+)
 from connectors.telegram import TelegramConnector
 from connectors.web_chat import WebChatConnector
 from core.brain import Brain
@@ -25,10 +29,19 @@ from core.heartbeat import Heartbeat
 from core.monitor import Monitor
 from core.positive_filter import PositiveFilter
 from core.provider import Provider
-from core.provider_manifest import discover_external_backends
+from core.provider_manifest import (
+    discover_dropin_backends,
+    discover_external_backends,
+)
 from core.reflection import ReflectionEngine
 from core.scheduler import TaskScheduler
-from core.skills import CostTier, SkillContext, SkillRegistry, discover_external_skills
+from core.skills import (
+    CostTier,
+    SkillContext,
+    SkillRegistry,
+    discover_dropin_skills,
+    discover_external_skills,
+)
 from core.skills.direct_answer import DirectAnswerSkill
 from core.skills.identity import IdentitySkill
 from core.skills.proactive_learning import ProactiveLearningSkill
@@ -38,10 +51,10 @@ from core.skills.research import ResearchSkill
 from core.skills.self_reflect import SelfReflectSkill
 from core.soul_handler import SoulHandler
 from core.stm import ShortTermMemory
+from tools import ToolContext, discover_dropin_tools, discover_external_tools
 from tools.archive_read import ArchiveRead
 from tools.registry import ToolRegistry
 from tools.searxng import SearXNG
-from tools import ToolContext, discover_external_tools
 
 # --- Logging setup -----------------------------------------------------------
 # Console (stdout) keeps the operator's live view; a rotating file handler
@@ -246,6 +259,14 @@ async def amain() -> None:
     # operator-named override takes effect BEFORE provider.health() or
     # the heartbeat first touches the backend.
     discovered_backends = discover_external_backends()
+    # Drop-in folder fallback: any backend modules dropped into
+    # plugins/backends/ get the same (manifest, instance) treatment.
+    # Order matters — entry-points come first so a pip-installed
+    # backend's name wins; a drop-in attempting to shadow it would
+    # only be considered if the entry-points list didn't already
+    # contain it (the Provider.from_config name lookup uses the
+    # first hit in the combined list).
+    discovered_backends.extend(discover_dropin_backends())
     if discovered_backends:
         log.info(
             "BACKEND Discovered %d external backend(s) via entry-points: %s",
@@ -315,6 +336,16 @@ async def amain() -> None:
         log.info(
             "TOOL Discovered %d external tool(s) via entry-points: %s",
             len(discovered_tools), ", ".join(discovered_tools),
+        )
+    # Drop-in folder fallback (plugins/tools/). Same registry, same
+    # bootstrap_validate downstream — see core.dropin for the module
+    # contract. Runs AFTER entry-points so duplicate-name collisions
+    # fail loud at the drop-in side (correct blast radius).
+    dropin_tools = discover_dropin_tools(tool_registry)
+    if dropin_tools:
+        log.info(
+            "TOOL Discovered %d drop-in tool(s) via plugins/tools/: %s",
+            len(dropin_tools), ", ".join(dropin_tools),
         )
 
     # Fail-loud cross-validation of every registered Tool: protocol
@@ -444,6 +475,16 @@ async def amain() -> None:
             "SKILL Discovered %d external skill(s) via entry-points: %s",
             len(discovered), ", ".join(discovered),
         )
+    # Drop-in folder fallback (plugins/skills/). Same registry, same
+    # bootstrap_validate downstream — see core.dropin for the module
+    # contract. Runs AFTER entry-points so duplicate-name collisions
+    # fail loud at the drop-in side.
+    dropin_skills = discover_dropin_skills(skill_registry)
+    if dropin_skills:
+        log.info(
+            "SKILL Discovered %d drop-in skill(s) via plugins/skills/: %s",
+            len(dropin_skills), ", ".join(dropin_skills),
+        )
 
     # Fail-loud cross-validation: every Skill's declared dependencies
     # (requires_tools, plan_verb uniqueness, compat_version) are
@@ -568,6 +609,17 @@ async def amain() -> None:
             "CONNECTOR Discovered %d external connector(s) via "
             "entry-points: %s",
             len(discovered_connectors), ", ".join(discovered_connectors),
+        )
+    # Drop-in folder fallback (plugins/connectors/). Same registry,
+    # same bootstrap_validate downstream — see core.dropin for the
+    # module contract. Runs AFTER entry-points so duplicate-name
+    # collisions fail loud at the drop-in side.
+    dropin_connectors = discover_dropin_connectors(connector_registry)
+    if dropin_connectors:
+        log.info(
+            "CONNECTOR Discovered %d drop-in connector(s) via "
+            "plugins/connectors/: %s",
+            len(dropin_connectors), ", ".join(dropin_connectors),
         )
 
     # Fail-loud cross-validation of every registered Connector: protocol

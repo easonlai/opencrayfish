@@ -58,8 +58,10 @@ informational only.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from .base import Tool
 from .registry import ToolRegistry
@@ -176,10 +178,64 @@ def discover_external_tools(
             registry.register(tool)
         except Exception:
             log.exception(
-                "TOOL discovery ep=%s register failed \u2014 skipping",
+                "TOOL discovery ep=%s register failed — skipping",
                 ep.name,
             )
             continue
         registered.append(getattr(tool, "name", ep.name))
 
     return registered
+
+
+def discover_dropin_tools(
+    registry: ToolRegistry,
+    *,
+    root: Path | None = None,
+) -> list[str]:
+    """Walk the drop-in folder for Tools and register them.
+
+    No-pip-install path: each ``.py`` file or sub-package under
+    ``plugins/tools/`` is loaded; its module-level ``PLUGIN`` /
+    ``PLUGINS`` attribute is fed through the same ``_instantiate``
+    + ``registry.register`` pipeline as the entry-points path.
+    See ``core.dropin`` for the folder layout + module contract.
+
+    Should run AFTER both first-party Tools and
+    ``discover_external_tools`` — a drop-in attempting to shadow an
+    existing name fails loud at the registry's duplicate-name check.
+
+    Args:
+        registry: The live ToolRegistry instance to register into.
+        root: Override the drop-in folder root. ``None`` resolves to
+            ``OPENCRAYFISH_PLUGINS_DIR`` env-var or
+            ``<cwd>/plugins/tools/``. Override only in tests.
+
+    Returns:
+        List of registered Tool names. Tools that failed to load are
+        NOT in this list.
+    """
+    from core.dropin import iter_dropin_plugins, surface_root
+
+    registered: list[str] = []
+    target = root if root is not None else surface_root("tools")
+
+    for source_label, raw in iter_dropin_plugins("tools", root=target):
+        tool = _instantiate(raw, source_label)
+        if tool is None:
+            continue
+        try:
+            registry.register(tool)
+        except Exception:
+            log.exception(
+                "TOOL dropin %s register failed — skipping", source_label,
+            )
+            continue
+        registered.append(getattr(tool, "name", source_label))
+
+    if registered:
+        log.info(
+            "TOOL dropin root=%s registered %d tool(s): %s",
+            target, len(registered), ", ".join(registered),
+        )
+    return registered
+

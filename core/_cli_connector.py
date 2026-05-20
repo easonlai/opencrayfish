@@ -27,7 +27,6 @@ from connectors import (
     resolve_connector_manifest,
 )
 
-
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 

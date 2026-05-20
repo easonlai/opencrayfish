@@ -7,9 +7,10 @@ Mirrors the SkillContext contract for Tools: an opt-in
 from __future__ import annotations
 
 import dataclasses
-import pytest
 from types import MappingProxyType
 from typing import Any
+
+import pytest
 
 from tools import ToolContext, ToolRegistry
 from tools.base import ToolResult

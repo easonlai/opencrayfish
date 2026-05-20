@@ -8,8 +8,9 @@ takes the matching Provider slot in place of the built-in
 """
 from __future__ import annotations
 
-import pytest
 from dataclasses import dataclass
+
+import pytest
 
 from core.provider import Provider
 from core.provider_manifest import BackendManifest

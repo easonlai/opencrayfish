@@ -16,7 +16,11 @@ zero changes to the orchestrators.
 from __future__ import annotations
 
 from .base import CostTier, Skill, SkillContext, SkillResult
-from .discovery import SKILL_ENTRY_POINT_GROUP, discover_external_skills
+from .discovery import (
+    SKILL_ENTRY_POINT_GROUP,
+    discover_dropin_skills,
+    discover_external_skills,
+)
 from .manifest import (
     DEFAULT_PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -39,6 +43,7 @@ __all__ = [
     "SkillRegistry",
     "SkillResult",
     "WELL_KNOWN_CAPABILITIES",
+    "discover_dropin_skills",
     "discover_external_skills",
     "resolve_manifest",
 ]

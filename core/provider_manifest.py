@@ -46,9 +46,11 @@ these manifests + the entry-points group.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -282,10 +284,61 @@ def discover_external_backends(
         except Exception:
             log.exception(
                 "BACKEND discovery ep=%s manifest resolution failed "
-                "\u2014 skipping",
+                "— skipping",
                 ep.name,
             )
             continue
         discovered.append((manifest, backend))
 
+    return discovered
+
+
+def discover_dropin_backends(
+    *,
+    root: Path | None = None,
+) -> list[tuple[BackendManifest, Any]]:
+    """Walk the drop-in folder for backends and return them.
+
+    No-pip-install path mirroring ``discover_external_backends``:
+    each ``.py`` file or sub-package under ``plugins/backends/`` is
+    loaded; its module-level ``PLUGIN`` / ``PLUGINS`` attribute is
+    fed through the same ``_instantiate`` + ``resolve_backend_manifest``
+    pipeline as the entry-points path. See ``core.dropin`` for the
+    folder layout + module contract.
+
+    Returns the same ``(manifest, instance)`` list shape as
+    ``discover_external_backends`` so ``main.py`` can concatenate
+    the two lists and pass the union to ``Provider.from_config``.
+
+    Args:
+        root: Override the drop-in folder root. ``None`` resolves to
+            ``OPENCRAYFISH_PLUGINS_DIR`` env-var or
+            ``<cwd>/plugins/backends/``. Override only in tests.
+    """
+    from core.dropin import iter_dropin_plugins, surface_root
+
+    discovered: list[tuple[BackendManifest, Any]] = []
+    target = root if root is not None else surface_root("backends")
+
+    for source_label, raw in iter_dropin_plugins("backends", root=target):
+        backend = _instantiate(raw, source_label)
+        if backend is None:
+            continue
+        try:
+            manifest = resolve_backend_manifest(backend)
+        except Exception:
+            log.exception(
+                "BACKEND dropin %s manifest resolution failed — "
+                "skipping",
+                source_label,
+            )
+            continue
+        discovered.append((manifest, backend))
+
+    if discovered:
+        log.info(
+            "BACKEND dropin root=%s discovered %d backend(s): %s",
+            target, len(discovered),
+            ", ".join(m.name for m, _ in discovered),
+        )
     return discovered

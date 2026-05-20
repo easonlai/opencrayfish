@@ -49,9 +49,9 @@ def _add_example_to_syspath():
 
 
 def test_example_echo_manifest_resolves() -> None:
-    from core.skills import resolve_manifest
-
     from opencrayfish_skill_echo import EchoSkill
+
+    from core.skills import resolve_manifest
 
     m = resolve_manifest(EchoSkill())
     assert m.name == "echo"
@@ -60,9 +60,9 @@ def test_example_echo_manifest_resolves() -> None:
 
 
 def test_example_echo_registers_and_validates() -> None:
-    from core.skills import SkillRegistry
-
     from opencrayfish_skill_echo import EchoSkill
+
+    from core.skills import SkillRegistry
 
     reg = SkillRegistry()
     reg.register(EchoSkill())

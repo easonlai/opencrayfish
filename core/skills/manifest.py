@@ -62,10 +62,9 @@ silently breaking third-party plug-ins.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any
 
 from .base import CostTier
-
 
 # Skill Protocol revisions the running core knows how to load. Bump the
 # tuple AND add a migration note in CONTRIBUTING.md whenever a

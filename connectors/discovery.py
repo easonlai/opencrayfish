@@ -44,8 +44,10 @@ field is informational only.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from .registry import ConnectorRegistry
 
@@ -181,3 +183,60 @@ def discover_external_connectors(
         registered.append(getattr(connector, "name", ep.name))
 
     return registered
+
+
+def discover_dropin_connectors(
+    registry: ConnectorRegistry,
+    *,
+    root: Path | None = None,
+) -> list[str]:
+    """Walk the drop-in folder for Connectors and register them.
+
+    No-pip-install path: each ``.py`` file or sub-package under
+    ``plugins/connectors/`` is loaded; its module-level ``PLUGIN`` /
+    ``PLUGINS`` attribute is fed through the same ``_instantiate``
+    + ``registry.register`` pipeline as the entry-points path.
+    See ``core.dropin`` for the folder layout + module contract.
+
+    Should run AFTER both first-party Connectors and
+    ``discover_external_connectors`` — a drop-in attempting to
+    shadow an existing name fails loud at the registry's
+    duplicate-name check.
+
+    Args:
+        registry: The live ConnectorRegistry instance to register
+            into.
+        root: Override the drop-in folder root. ``None`` resolves to
+            ``OPENCRAYFISH_PLUGINS_DIR`` env-var or
+            ``<cwd>/plugins/connectors/``. Override only in tests.
+
+    Returns:
+        List of registered Connector names. Connectors that failed
+        to load are NOT in this list.
+    """
+    from core.dropin import iter_dropin_plugins, surface_root
+
+    registered: list[str] = []
+    target = root if root is not None else surface_root("connectors")
+
+    for source_label, raw in iter_dropin_plugins("connectors", root=target):
+        connector = _instantiate(raw, source_label)
+        if connector is None:
+            continue
+        try:
+            registry.register(connector)
+        except Exception:
+            log.exception(
+                "CONNECTOR dropin %s register failed — skipping",
+                source_label,
+            )
+            continue
+        registered.append(getattr(connector, "name", source_label))
+
+    if registered:
+        log.info(
+            "CONNECTOR dropin root=%s registered %d connector(s): %s",
+            target, len(registered), ", ".join(registered),
+        )
+    return registered
+

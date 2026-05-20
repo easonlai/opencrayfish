@@ -2,7 +2,7 @@
 
 > **An edge-native, biologically-inspired AI companion that lives on a single Raspberry Pi 5 — fully offline, powered by a 1.5B-parameter local SLM, with a heart that beats, a brain that sleeps, and a soul you can read.**
 >
-> **OpenCrayFish is a fully pluggable framework**: Skills, Tools, Connectors, and Provider Backends are four symmetric plug-in surfaces — every one auto-discoverable via Python entry-points, every one declared by a frozen `*Manifest`, every one validated at boot. A third-party `pip install opencrayfish-skill-translate` (or `-tool-weather`, or `-connector-discord`, or `-backend-vllm-cuda`) extends the agent with **zero edits to `main.py` and zero fork of OpenCrayFish itself**.
+> **OpenCrayFish is a fully pluggable framework**: Skills, Tools, Connectors, and Provider Backends are four symmetric plug-in surfaces — every one auto-discoverable via **Python entry-points OR a `plugins/<surface>/` drop-in folder**, every one declared by a frozen `*Manifest`, every one validated at boot. A third-party `pip install opencrayfish-skill-translate` (or `-tool-weather`, or `-connector-discord`, or `-backend-vllm-cuda`) — or a single `.py` file dropped into `plugins/skills/` — extends the agent with **zero edits to `main.py` and zero fork of OpenCrayFish itself**.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-3.0.0-1f8a4f.svg)](#roadmap)
@@ -23,6 +23,7 @@
   - [The Four Plug-in Surfaces](#the-four-plug-in-surfaces)
   - [The Manifest + Registry + Discovery Doctrine](#the-manifest--registry--discovery-doctrine)
   - [How the System Auto-Adapts](#how-the-system-auto-adapts)
+  - [Hybrid Discovery — pip OR drop-in folder](#hybrid-discovery--pip-or-drop-in-folder)
   - [Configuration Injection (`cfg.plugins.*` + `bind_context`)](#configuration-injection-cfgplugins--bind_context)
   - [Protocol Versioning & Fail-Loud Boot](#protocol-versioning--fail-loud-boot)
 - [System Architecture at a Glance](#system-architecture-at-a-glance)
@@ -191,7 +192,7 @@ OpenCrayFish is built as **a real plug-in framework**. Everything that talks to 
 | **Connectors** ([connectors/](connectors/)) | Inbound/outbound transports — how a human reaches the agent. `TelegramConnector`, `WebChatConnector`. | 2 first-party connectors | `opencrayfish.connectors` |
 | **Provider Backends** ([core/provider.py](core/provider.py)) | SLM inference endpoints — what runs the model. `HailoOllamaBackend` (NPU), `OllamaBackend` (CPU fallback). | 2 first-party backends | `opencrayfish.provider_backends` |
 
-**The symmetry doctrine.** Every surface follows the **same** three-piece pattern: a frozen **`*Manifest`** dataclass declares everything the core needs to know about the plug-in; a **`*Registry`** owns lifecycle + lookup + audit + opt-in context injection; a **`*/discovery.py`** module walks the matching entry-point group at boot with fail-isolated import. Learn one surface and you've learned all four.
+**The symmetry doctrine.** Every surface follows the **same** three-piece pattern: a frozen **`*Manifest`** dataclass declares everything the core needs to know about the plug-in; a **`*Registry`** owns lifecycle + lookup + audit + opt-in context injection; a **`*/discovery.py`** module walks the matching entry-point group at boot with fail-isolated import, **and the shared [core/dropin.py](core/dropin.py) loader walks the `plugins/<surface>/` folder under the same fail-isolated contract**. Learn one surface and you've learned all four.
 
 The point of the symmetry isn't elegance — it's that **a third-party package author writes the same `pyproject.toml` block, scaffolds with the same CLI verb, validates with the same CLI verb, and pip-installs the same way**, whether they're shipping a new chat reflex, a new sensor, a new transport, or a new inference engine.
 
@@ -202,14 +203,16 @@ Every plug-in surface is built from three pieces. They are intentionally identic
 ```text
 ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
 │      *Manifest       │    │      *Registry       │    │  */discovery.py      │
-│  (frozen dataclass)  │    │  (lifecycle + audit) │    │  (entry-points walk) │
+│  (frozen dataclass)  │    │  (lifecycle + audit) │    │  (entry-points walk  │
+│                      │    │                      │    │   + drop-in folder)  │
 ├──────────────────────┤    ├──────────────────────┤    ├──────────────────────┤
 │ name, description    │    │ register(instance)   │    │ scan entry-point     │
 │ compat_version       │ ◄──┤ bootstrap_validate() │◄───┤   group, import,     │
 │ args_schema          │    │ invoke / call /      │    │   fail-isolated,     │
 │ cost_tier, caps...   │    │   start / generate   │    │   register into reg  │
-│ config_key           │    │ aclose_all()         │    │                      │
-│ plan_verb (Skills)   │    │ bind_context() opt   │    │                      │
+│ config_key           │    │ aclose_all()         │    │ + walk plugins/      │
+│ plan_verb (Skills)   │    │ bind_context() opt   │    │   <surface>/ via     │
+│                      │    │                      │    │   core/dropin.py     │
 └──────────────────────┘    └──────────────────────┘    └──────────────────────┘
 ```
 
@@ -217,7 +220,7 @@ Every plug-in surface is built from three pieces. They are intentionally identic
 |---|---|---|
 | **`*Manifest`** | Single source of truth for "what this plug-in is, what it needs, how it should be called". Read by the registry, the PLAN-stage prompt builder (Skills), the dashboard, and `bootstrap_validate`. | `@dataclass(frozen=True, slots=True)` so a misbehaving plug-in can't mutate its own metadata at runtime to escape gating. |
 | **`*Registry`** | Owns the live set of registered instances. Issues a unique name. Wraps every dispatch with timing + crash isolation + audit JSONL append. Tears down cleanly at shutdown. Optionally delivers a shared context object (see [§ bind_context](#configuration-injection-cfgplugins--bind_context)). | A buggy third-party plug-in can never crash the agent — exceptions are caught at the registry boundary and surfaced as `ok=False` results. |
-| **`*/discovery.py`** | Walks `importlib.metadata.entry_points(group="opencrayfish.<surface>")` at boot. For each entry, imports it, calls it if it's a factory, registers the result. **Each entry is wrapped in its own `try/except`** — one broken third-party package is logged and skipped, the agent keeps booting. | The agent must always boot. A typo in someone else's package can't take down your Pi. |
+| **`*/discovery.py`** | Walks `importlib.metadata.entry_points(group="opencrayfish.<surface>")` at boot, **then defers to [core/dropin.py](core/dropin.py) to walk `plugins/<surface>/`** for any `.py` files or sub-packages declaring a `PLUGIN` / `PLUGINS` attribute. For each candidate, imports it, calls it if it's a factory, registers the result. **Each entry is wrapped in its own `try/except`** — one broken third-party package or drop-in file is logged and skipped, the agent keeps booting. | The agent must always boot. A typo in someone else's package — or in a half-finished local drop-in — can't take down your Pi. |
 
 ### How the System Auto-Adapts
 
@@ -242,6 +245,80 @@ What the operator DOES do:
 - ✅ `pip install <third-party-package>` inside the OpenCrayFish venv.
 - ✅ Optionally add a `plugins.<key>: { ... }` block to `config.yaml` for that plug-in's configuration.
 - ✅ Restart the agent. Done.
+
+### Hybrid Discovery — pip OR drop-in folder
+
+Every plug-in surface above is **hybrid**: alongside the standard Python entry-points path, the agent also walks a **drop-in folder** at boot. A new Skill / Tool / Connector / Backend can therefore be added in two ways, and both reach the same registry with the same manifest validation:
+
+| Path | When to use it | Mechanism |
+|---|---|---|
+| **`pip install`** (entry-points) | Shareable packages, versioned releases, dependency-managed plug-ins, anything you want to publish to PyPI or a private index. | `[project.entry-points."opencrayfish.skills"]` (or `.tools` / `.connectors` / `.provider_backends`) in the package's `pyproject.toml`; discovered via `importlib.metadata.entry_points`. |
+| **Drop-in folder** | Local experiments, private one-offs, air-gapped deployments where pip isn't convenient, fast iteration without a `pyproject.toml`. | Copy a `.py` file (or a folder with `__init__.py`) into `plugins/<surface>/`; discovered via [`core/dropin.py`](core/dropin.py). |
+
+**Folder layout** (default: `<project root>/plugins/`; override with the `OPENCRAYFISH_PLUGINS_DIR` env var):
+
+```
+plugins/
+    skills/
+        weather.py              # flat: one Skill per file
+        translate/              # nested: a sub-package
+            __init__.py
+            skill.py
+    tools/
+        home_assistant.py
+    connectors/
+        discord.py
+    backends/
+        vllm_cuda.py
+```
+
+**Module contract** — each drop-in `.py` file (or sub-package `__init__.py`) must expose ONE of:
+
+- `PLUGIN = MySkillClass` — a class, factory callable, or already-instantiated object. Same three shapes the entry-points discovery accepts.
+- `PLUGINS = [PluginA, PluginB, ...]` — an iterable when one file exports multiple plug-ins of the same surface.
+
+A drop-in `weather.py` looks exactly like a third-party Tool package, minus the `pyproject.toml` boilerplate:
+
+```python
+# plugins/tools/weather.py
+from tools.manifest import ToolManifest
+
+class WeatherTool:
+    manifest = ToolManifest(
+        name="weather",
+        description="Hello-world drop-in weather tool.",
+        config_key="weather",
+    )
+    name = "weather"
+
+    def bind_context(self, ctx):
+        cfg = ctx.plugins_config.get("weather", {})
+        self._api_key = cfg.get("api_key", "")
+
+    async def call(self, **kwargs):
+        return {"text": f"sunny (key prefix: {self._api_key[:4]})"}
+
+PLUGIN = WeatherTool
+```
+
+Add a matching `cfg.plugins.weather: {...}` block to `config.yaml`, restart, and the boot log shows:
+
+```
+TOOL Discovered 1 drop-in tool(s) via plugins/tools/: weather
+TOOL bound 1 tool(s) via bind_context (config_key=weather)
+```
+
+**Boot-time order + collision policy**:
+
+1. First-party Skills / Tools / Connectors / Backends register from `main.py`.
+2. Entry-points discovery walks every installed package's `opencrayfish.*` group.
+3. **Drop-in folder discovery runs LAST.** A drop-in attempting to shadow a name already registered (first-party OR entry-points) is rejected by the registry's duplicate-name check; the error is logged and the boot continues. This gives the correct blast radius — operators control which side wins simply by renaming the drop-in or `pip uninstall`-ing the package.
+
+**Isolation** — same fail-loud-but-localized contract as entry-points: a broken file in `plugins/skills/` only loses **its** Skill, never aborts the boot. The exception is logged at ERROR with the file path.
+
+**Security note** — drop-in files run with the same privileges as the agent process. Treat the drop-in root the same way you treat your venv: **only put code you wrote or audited in there**. There is no sandbox.
+
+Tests covering the full drop-in contract live in [`tests/test_dropin_discovery.py`](tests/test_dropin_discovery.py) (21 tests).
 
 ### Configuration Injection (`cfg.plugins.*` + `bind_context`)
 
@@ -549,6 +626,7 @@ OpenCrayFish/
 │   ├── intent_router.py      ← shared NL pre-filter chain for both connectors
 │   ├── reflection.py         ← self-critique engine (reads skills.jsonl for failure flags)
 │   ├── jsonl_writer.py       ← date-rotating, retention-bounded JSONL appender
+│   ├── dropin.py             ← shared drop-in folder loader (plugins/<surface>/ → PLUGIN / PLUGINS)
 │   ├── heartbeat.py          ← pulse_loop + metabolism + proactive_thought
 │   ├── scheduler.py          ← recurring research-task scheduler
 │   └── skills/               ← capability layer above Tools (pluggable Skills)
@@ -575,6 +653,12 @@ OpenCrayFish/
 ├── ui/                       ← Streamlit apps
 │   ├── dashboard.py          ← live vital signs + proactive feed + tools
 │   └── web_chat.py           ← browser-based chat UI for the live agent
+│
+├── plugins/                  ← OPTIONAL drop-in folder for local/private plug-ins (gitignored by convention)
+│   ├── skills/               ← each `*.py` (or sub-package) declares `PLUGIN = MySkill` or `PLUGINS = [...]`
+│   ├── tools/                ← same contract; loaded after entry-points so pip-installed wins on duplicate names
+│   ├── connectors/           ← (override the root location via the `OPENCRAYFISH_PLUGINS_DIR` env var)
+│   └── backends/             ← see [§ Hybrid Discovery](#hybrid-discovery--pip-or-drop-in-folder) for the full contract
 │
 ├── memory/                   ← long-term distilled memory (gitignored)
 │   └── archive.md            ← long-term distilled facts (LTM)
@@ -634,7 +718,7 @@ streamlit run ui/web_chat.py --server.port 8502
 
 # 7. (Optional) Run the test suite
 pip install -e ".[dev]"                    # adds pytest + pytest-asyncio + ruff
-python -m pytest -q                        # 218 tests, runs in <2s
+python -m pytest -q                        # 239 tests, runs in <2s
 ```
 
 Now talk to it on Telegram or in the browser. The agent will reply, remember, decay its mood, get curious during idle time, and once the clock crosses 02:00, it will sleep and consolidate the day.
@@ -864,10 +948,10 @@ That's the whole agent in one trace. Every other deep-dive section below zooms i
 
 #### How to extend each layer (the one-line guide)
 
-- **Add a new Skill** → either (a) drop a file in [core/skills/](core/skills/) satisfying the Skill Protocol and register it in [main.py](main.py) ([§ 12 Hello-World Skill](#hello-world-skill--step-by-step)), or (b) ship it as a standalone `pip`-installable package with an `opencrayfish.skills` entry-point — no fork of OpenCrayFish required ([§ 12 Third-Party Skill Packages](#third-party-skill-packages-pip-install)).
-- **Add a new Tool** → drop a file in [tools/](tools/) that satisfies the Tool Protocol, register it in [main.py](main.py). See [§ Adding a new tool](#adding-a-new-tool).
+- **Add a new Skill** → three options, all zero-fork: (a) drop a file in [core/skills/](core/skills/) satisfying the Skill Protocol and register it in [main.py](main.py) ([§ 12 Hello-World Skill](#hello-world-skill--step-by-step)); (b) ship it as a standalone `pip`-installable package with an `opencrayfish.skills` entry-point ([§ 12 Third-Party Skill Packages](#third-party-skill-packages-pip-install)); or (c) drop a `.py` file into `plugins/skills/` with `PLUGIN = MySkill` at the bottom ([§ Hybrid Discovery](#hybrid-discovery--pip-or-drop-in-folder)).
+- **Add a new Tool** → same three options as Skills: drop into [tools/](tools/) and register in `main.py`, ship as a pip package via `opencrayfish.tools` entry-point, or drop into `plugins/tools/`. See [§ Adding a new tool](#adding-a-new-tool) for the protocol.
 - **Add a new memory shelf** → don't, usually. Promote facts to `soul.md [CORE_MEMORIES]` via Sleep Metabolism instead.
-- **Add a new connector** → wrap `Brain.think(…)` and stream the `ThoughtTrace` back. See [§ Adding a new connector](#adding-a-new-connector).
+- **Add a new connector** → wrap `Brain.think(…)` and stream the `ThoughtTrace` back. Three options: in-tree under [connectors/](connectors/), pip package via `opencrayfish.connectors` entry-point, or drop-in under `plugins/connectors/`. See [§ Adding a new connector](#adding-a-new-connector).
 
 #### What this design buys you
 
@@ -1770,7 +1854,7 @@ INFO  Discovered N external skill(s) via entry-points
 
 The PLAN menu, the `state/skills.json` inventory, and the dashboard's **🎯 Skill registry** panel all pick up the new skill automatically. **Zero edits to `main.py`, zero forks of OpenCrayFish itself.**
 
-Discovery is implemented in [core/skills/discovery.py](core/skills/discovery.py) and is intentionally fail-soft: a single broken entry-point logs an error and is skipped, never crashing the agent. The list of successfully-registered names is returned so `main.py` can log a one-line summary.
+Discovery is implemented in [core/skills/discovery.py](core/skills/discovery.py) and is intentionally fail-soft: a single broken entry-point logs an error and is skipped, never crashing the agent. The list of successfully-registered names is returned so `main.py` can log a one-line summary. The same file also exposes `discover_dropin_skills()` for the `plugins/skills/` folder path \u2014 use it when you want the convenience of a single `.py` file without authoring a `pyproject.toml`; see [\u00a7 Hybrid Discovery](#hybrid-discovery--pip-or-drop-in-folder).
 
 #### The `opencrayfish` CLI
 
@@ -1853,7 +1937,7 @@ The Tool layer mirrors the Skill layer's discovery contract:
 weather = "opencrayfish_tool_weather:WeatherTool"
 ```
 
-`pip install -e .` registers the entry-point; OpenCrayFish picks it up at next boot via [`tools/discovery.py`](tools/discovery.py). The scaffolder is symmetric with `skill new`:
+`pip install -e .` registers the entry-point; OpenCrayFish picks it up at next boot via [`tools/discovery.py`](tools/discovery.py) \u2014 which also walks `plugins/tools/` for `PLUGIN = MyTool` drop-ins under the same fail-isolated contract ([\u00a7 Hybrid Discovery](#hybrid-discovery--pip-or-drop-in-folder)). The scaffolder is symmetric with `skill new`:
 
 ```bash
 opencrayfish tool new weather
@@ -2040,7 +2124,7 @@ Same shape as third-party Skills/Tools — a normal Python package whose `pyproj
 discord = "opencrayfish_connector_discord:DiscordConnector"
 ```
 
-[`connectors/discovery.py`](connectors/discovery.py) scans this group at boot, importing each entry **fail-isolated** — a broken or missing third-party connector logs an error and is skipped; the boot continues with whatever else is healthy.
+[`connectors/discovery.py`](connectors/discovery.py) scans this group at boot, importing each entry **fail-isolated** — a broken or missing third-party connector logs an error and is skipped; the boot continues with whatever else is healthy. The same file then walks `plugins/connectors/` via [core/dropin.py](core/dropin.py) so you can prototype a transport (`PLUGIN = MyConnector` at the bottom of a `.py` file) without packaging it; see [§ Hybrid Discovery](#hybrid-discovery--pip-or-drop-in-folder).
 
 Scaffold one with the CLI:
 
@@ -2071,7 +2155,7 @@ class BackendManifest:
 
 Both in-tree backends ([`HailoOllamaBackend`](core/provider.py), [`OllamaBackend`](core/provider.py)) carry explicit manifests with appropriate capability tokens (`npu` for the Hailo path, `network.outbound` for both).
 
-`discover_external_backends()` walks `opencrayfish.provider_backends` at boot with the same fail-isolated contract as the other discovery layers. The result is logged AND — when the operator asks — routed straight into a Provider slot:
+`discover_external_backends()` walks `opencrayfish.provider_backends` at boot with the same fail-isolated contract as the other discovery layers, then `discover_dropin_backends()` walks `plugins/backends/` ([core/dropin.py](core/dropin.py)) so a local backend can be added without packaging. Both lists are combined before the Provider's primary/fallback routing runs — entry-points take precedence on duplicate names. The result is logged AND — when the operator asks — routed straight into a Provider slot:
 
 ```yaml
 # config.yaml — operator points the primary slot at a discovered backend
@@ -2526,11 +2610,12 @@ The `Monitor.sample()` → `VitalSigns` dataclass is the right extension surface
 
 ## Roadmap
 
-The current codebase is **v3.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (218 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean.
+The current codebase is **v3.0**: every subsystem in this README is implemented, covered by the unit-test suite under `tests/` (239 tests today) and exercised end-to-end by the `scripts/smoke_*.py` runners, and Pylance-clean.
 
 **The framework surface** (what plug-in authors build against):
 
 - **Four symmetric plug-in surfaces** — Skills, Tools, Connectors, Provider Backends — every one with its own frozen `*Manifest`, its own `*Registry` with lifecycle + audit + opt-in `bind_context`, and its own fail-isolated `*/discovery.py` walking the matching `opencrayfish.*` entry-point group. Adding any plug-in is `pip install` + (optional) `cfg.plugins.<key>:` block + restart, with zero edits to OpenCrayFish itself.
+- **Hybrid discovery** ([core/dropin.py](core/dropin.py)) — every surface also walks a `plugins/<surface>/` drop-in folder at boot. Drop a `.py` file exposing a `PLUGIN = MyClass` (or `PLUGINS = [...]`) attribute and it reaches the same registry as a pip-installed package — no `pyproject.toml`, no entry-points, no `pip install`. Ideal for local experiments and air-gapped deployments. Default root `<cwd>/plugins/`, overridable via `OPENCRAYFISH_PLUGINS_DIR`.
 - **`ToolContext` + `bind_context`** ([tools/base.py](tools/base.py), [tools/registry.py](tools/registry.py)) — Tools have an opt-in config-injection seam matching Skills. A third-party Tool reads `cfg.plugins.<key>` from a frozen, shared context object instead of a factory-closure dance. First-party Tools (`SearXNG`, `ArchiveRead`) are untouched — `bind_context` is purely additive.
 - **Operator-routable Provider backends** ([core/provider.py](core/provider.py)) — `cfg.hardware.primary_backend` and `cfg.hardware.fallback_backend` accept the name of any discovered backend manifest and the `Provider.from_config()` factory swaps the matching slot. Unknown name → fail-loud boot with the list of available names.
 - **Operator-configurable web-search Skill** — `cfg.cognition.web_search_skill` (default `"research"`) decides which Skill the Brain's web triage + the Cognitive Loop's `SEARCH` verb + the REFINE gap closure dispatch to. A third-party `perplexity_research` (or similar) replacement drops in without core edits.
@@ -2569,7 +2654,7 @@ OpenCrayFish is **open source under the [MIT License](LICENSE)** and every passi
 
 Look for the [`good-first-issue`](https://github.com/easonlai/opencrayfish/labels/good-first-issue) label. Concrete areas where help is especially appreciated:
 
-- **Pytest suite expansion** — the `tests/` directory ships with 218 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, tool context, provider backend routing, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
+- **Pytest suite expansion** — the `tests/` directory ships with 239 tests today (intent router, JSONL schema, STM rotation, positive filter, prompt assembly, skill context, tool context, provider backend routing, drop-in discovery, task parsing). High-impact gaps still open: `Emotions` decay math, `CognitiveLoop` THINK/PLAN/REFINE parsing, `SkillRegistry.plan_menu` under stress + offline, and `Provider` circuit-breaker state transitions.
 - **Hardware port reports** — try OpenCrayFish on a Pi 4, an Orange Pi, a Jetson Nano, or an x86 mini-PC and file an Issue tagged `hardware-port` with your `state/vitals.json` and notable latency numbers.
 - **New `Tool` plugins** — implement the `Tool` protocol from [tools/base.py](tools/base.py) for local file ops, GPIO control, sensor reads, MCP servers, etc.
 - **New `Connector`s** — Discord, Slack, Matrix, IRC, MCP server. Use [connectors/web_chat.py](connectors/web_chat.py) as a template.

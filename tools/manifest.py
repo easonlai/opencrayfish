@@ -59,7 +59,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # Tool Protocol revisions the running core knows how to load. Bump
 # the set AND add a migration note in CONTRIBUTING.md whenever a
 # breaking change ships in the Tool surface. Convention mirrors

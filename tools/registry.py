@@ -37,6 +37,10 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+# Argspec lives under core.skills because it's the same validator on
+# both layers — kept in one place to avoid drift.
+from core.skills.argspec import validate_args
+
 from .base import Tool, ToolContext, ToolResult
 from .manifest import (
     SUPPORTED_TOOL_PROTOCOL_VERSIONS,
@@ -44,10 +48,6 @@ from .manifest import (
     ToolManifest,
     resolve_tool_manifest,
 )
-
-# Argspec lives under core.skills because it's the same validator on
-# both layers — kept in one place to avoid drift.
-from core.skills.argspec import validate_args
 
 log = logging.getLogger(__name__)
 

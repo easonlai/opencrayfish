@@ -9,7 +9,6 @@ import pytest
 
 from core.cli import _cmd_new, _cmd_validate, _render_template, main
 
-
 # ---------------------------------------------------------------------------
 # `skill new` — scaffolding
 # ---------------------------------------------------------------------------

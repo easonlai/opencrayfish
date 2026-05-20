@@ -32,7 +32,6 @@ from connectors import (
     resolve_connector_manifest,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fake connector classes used as test doubles
 # ---------------------------------------------------------------------------

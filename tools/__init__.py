@@ -6,7 +6,11 @@ know the internal layout. Mirror of ``core/skills/__init__.py``.
 from __future__ import annotations
 
 from .base import Tool, ToolContext, ToolResult
-from .discovery import TOOL_ENTRY_POINT_GROUP, discover_external_tools
+from .discovery import (
+    TOOL_ENTRY_POINT_GROUP,
+    discover_dropin_tools,
+    discover_external_tools,
+)
 from .manifest import (
     DEFAULT_TOOL_PROTOCOL_VERSION,
     SUPPORTED_TOOL_PROTOCOL_VERSIONS,
@@ -26,6 +30,7 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "WELL_KNOWN_TOOL_CAPABILITIES",
+    "discover_dropin_tools",
     "discover_external_tools",
     "resolve_tool_manifest",
 ]

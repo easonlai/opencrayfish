@@ -22,7 +22,6 @@ from core.skills.registry import SkillRegistry
 from tools.base import Tool, ToolResult
 from tools.registry import ToolRegistry
 
-
 # ---------- unit: validate_args -----------------------------------------------
 
 

@@ -25,7 +25,6 @@ from core.provider_manifest import (
     resolve_backend_manifest,
 )
 
-
 # Backend names commonly contain a hyphen-like separator (``hailo-ollama-npu``)
 # but Python package names can't \u2014 we accept both forms on the CLI
 # (``vllm-cuda`` or ``vllm_cuda``) and normalize internally.

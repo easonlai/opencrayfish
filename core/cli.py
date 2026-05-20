@@ -44,15 +44,14 @@ import sys
 from pathlib import Path
 from textwrap import dedent
 
+from core._cli_connector import cmd_connector_new, cmd_connector_validate
+from core._cli_provider import cmd_provider_new, cmd_provider_validate
+from core._cli_tool import cmd_tool_new, cmd_tool_validate
 from core.skills import (
     SUPPORTED_PROTOCOL_VERSIONS,
     SkillRegistry,
     resolve_manifest,
 )
-from core._cli_connector import cmd_connector_new, cmd_connector_validate
-from core._cli_provider import cmd_provider_new, cmd_provider_validate
-from core._cli_tool import cmd_tool_new, cmd_tool_validate
-
 
 # ---------------------------------------------------------------------------
 # `skill new` — scaffold a fresh third-party Skill package

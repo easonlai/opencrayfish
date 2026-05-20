@@ -25,7 +25,6 @@ from core.provider_manifest import (
     resolve_backend_manifest,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fake backend classes used as test doubles
 # ---------------------------------------------------------------------------

@@ -27,7 +27,6 @@ from core.skills.discovery import (
     discover_external_skills,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures: fake Skill classes and a fake EntryPoint shim
 # ---------------------------------------------------------------------------

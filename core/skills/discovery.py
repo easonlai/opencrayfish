@@ -14,6 +14,11 @@ auto-registered the next time the agent boots. No code changes to
     SKILL registered name=translate protocol=skill-protocol/1 ...
     SKILL Registered 8 skill(s): direct_answer, identity, …, translate
 
+OR — drop a ``.py`` file into ``plugins/skills/`` at the workspace
+root for the no-install path. See ``core.dropin`` for the folder
+contract; ``discover_dropin_skills()`` below feeds discovered
+modules through the same instantiation + registration pipeline.
+
 HOW IT WORKS
 ------------
 Python's standard ``importlib.metadata.entry_points`` API lets any
@@ -67,8 +72,10 @@ package names may register Skills.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from .base import Skill
 from .registry import SkillRegistry
@@ -221,3 +228,64 @@ def discover_external_skills(
             group,
         )
     return registered
+
+
+def discover_dropin_skills(
+    registry: SkillRegistry,
+    *,
+    root: Path | None = None,
+) -> list[str]:
+    """Walk the drop-in folder for Skills and register them.
+
+    Mirror of ``discover_external_skills`` for the no-pip-install
+    path. Each ``.py`` file or sub-package under ``plugins/skills/``
+    is loaded; its module-level ``PLUGIN`` / ``PLUGINS`` attribute is
+    fed through the same ``_instantiate`` + ``registry.register``
+    pipeline as the entry-points path. See ``core.dropin`` for the
+    folder layout + module contract.
+
+    Should be called from ``main.py`` AFTER both the first-party
+    Skills and ``discover_external_skills`` have registered, so a
+    drop-in attempting to shadow a built-in or pip-installed Skill
+    fails loud at the registry's duplicate-name check (correct blast
+    radius — the drop-in author can rename, the operator decides
+    which to keep).
+
+    Args:
+        registry: The live SkillRegistry instance to register into.
+        root: Override the drop-in folder root. ``None`` resolves to
+            ``OPENCRAYFISH_PLUGINS_DIR`` env-var or
+            ``<cwd>/plugins/skills/``. Override only in tests.
+
+    Returns:
+        List of registered Skill names. Skills that failed to load
+        are NOT in this list (the failure is logged at WARNING).
+    """
+    # Local import keeps the entry-points path free of any drop-in
+    # state at module-load time.
+    from core.dropin import iter_dropin_plugins, surface_root
+
+    registered: list[str] = []
+    target = root if root is not None else surface_root("skills")
+
+    for source_label, raw in iter_dropin_plugins("skills", root=target):
+        skill = _instantiate(raw, source_label)
+        if skill is None:
+            continue
+        try:
+            registry.register(skill)
+        except ValueError as exc:
+            log.warning(
+                "SKILL dropin %s rejected by registry: %s",
+                source_label, exc,
+            )
+            continue
+        registered.append(getattr(skill, "name", source_label))
+
+    if registered:
+        log.info(
+            "SKILL dropin root=%s registered %d skill(s): %s",
+            target, len(registered), ", ".join(registered),
+        )
+    return registered
+

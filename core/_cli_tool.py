@@ -27,7 +27,6 @@ from tools import (
     resolve_tool_manifest,
 )
 
-
 # Same constraint as skills: directory name must also be a legal
 # Python package identifier.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
